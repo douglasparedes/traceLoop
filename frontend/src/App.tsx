@@ -5,7 +5,7 @@ import LiveMode from "./LiveMode";
 import TutorialMode from "./TutorialMode";
 import LiveTranscribe from "./LiveTranscribe";
 import { extractObjectPhrase, promptVariants } from "./speechPrompt";
-import type { JobEventRec, LocalJob, ProcSummary, Role, Version, View } from "./types";
+import type { JobEventRec, LocalJob, ProcSummary, Role, Step, Version, View } from "./types";
 
 const ISSUE_TYPES = ["Component not found", "Instructions unclear", "Expected result not observed", "Tool unavailable", "Manual mismatch", "Unexpected condition", "Other"];
 
@@ -39,6 +39,16 @@ async function countDevices(kind: "audioinput" | "videoinput"): Promise<number |
 interface Capture { id: string; title: string; status: string; task_description: string; transcript_corrected: string }
 interface JobRow { id: string; procedure_title: string; status: string; outcome: string | null; started_at: string; events: number }
 interface ManualRow { id: string; title: string; model: string | null; chunks: number }
+
+interface PendingReg { job_id: string; procedure_id: string; procedure_version_id: string }
+interface PendingFinish { job_id: string; outcome: string }
+
+async function loadPending<T>(key: string): Promise<T[]> {
+  return (await idb.get<T[]>("meta", key)) || [];
+}
+async function savePending<T>(key: string, items: T[]): Promise<void> {
+  await idb.put("meta", key, items);
+}
 
 export default function App() {
   const [view, setView] = useState<View>("home");
@@ -79,19 +89,42 @@ export default function App() {
   const syncNow = useCallback(async () => {
     setSyncState("syncing");
     try {
-      try { await api.get("/api/health"); } catch { setSyncState("failed"); notify("Server unreachable. Events stay queued on this device.", "error"); return; }
+      try { await api.get("/api/health"); } catch { setSyncState("failed"); notify("Server unreachable. Your work stays queued on this device — nothing is marked synced.", "error"); return; }
+      let problems = 0;
+      // 1) Register offline-created jobs under their stable local ids first,
+      //    so their queued events have a real server session to land on.
+      const regs = await loadPending<PendingReg>("pending-regs");
+      if (regs.length) {
+        const remaining: PendingReg[] = [];
+        for (const reg of regs) {
+          try { await api.post("/api/jobs", { id: reg.job_id, procedure_id: reg.procedure_id, procedure_version_id: reg.procedure_version_id }); }
+          catch { remaining.push(reg); problems++; }
+        }
+        await savePending("pending-regs", remaining);
+      }
+      // 2) Sync queued events (server acknowledges or reports duplicates).
       const evs = (await idb.all<JobEventRec>("events")).filter((e) => e.sync_status === "pending");
-      let failedCount = 0;
       if (evs.length) {
         const res = await api.post<{ acknowledged: string[]; duplicates?: string[]; failed?: unknown[] }>("/api/sync/events", { events: evs });
-        failedCount = res.failed?.length || 0;
+        problems += res.failed?.length || 0;
         for (const id of [...(res.acknowledged || []), ...(res.duplicates || [])]) {
           const row = evs.find((e) => e.event_id === id);
           if (row) await idb.put("events", id, { ...row, sync_status: "synced" });
         }
       }
-      setSyncState(failedCount ? "failed" : "idle");
-      notify(evs.length ? (failedCount ? `Synchronized, but ${failedCount} event(s) were rejected by the server and remain visible as pending.` : "Synchronization complete — server acknowledged all queued events.") : "Nothing pending to synchronize.", failedCount ? "error" : "ok");
+      // 3) Push locally-finished states; the server finish is idempotent.
+      const finishes = await loadPending<PendingFinish>("pending-finishes");
+      if (finishes.length) {
+        const remaining: PendingFinish[] = [];
+        for (const f of finishes) {
+          try { await api.post(`/api/jobs/${f.job_id}/finish`, { outcome: f.outcome, reason: "", summary: "" }); }
+          catch { remaining.push(f); problems++; }
+        }
+        await savePending("pending-finishes", remaining);
+      }
+      setSyncState(problems ? "failed" : "idle");
+      if (problems) notify(`Synchronization incomplete: ${problems} item(s) were rejected or unreachable and remain queued on this device.`, "error");
+      else notify(evs.length || regs.length || finishes.length ? "Synchronization complete — the server confirmed your work." : "Nothing pending to synchronize.");
       await refreshPending(); await loadLists();
     } catch (e) { setSyncState("failed"); notify(e instanceof Error ? e.message : "Sync failed", "error"); }
   }, [loadLists, notify, refreshPending]);
@@ -139,13 +172,23 @@ export default function App() {
     if (!v) { notify("Could not load the approved procedure. Connect once to download it for offline use.", "error"); return; }
     if (!v.steps.length) { notify("This approved version has no steps and cannot start a job.", "error"); return; }
     let jobId = uuid();
+    let registered = true;
     try {
       const j = await api.post<{ id: string }>("/api/jobs", { procedure_id: p.id, procedure_version_id: v.id });
       jobId = j.id;
-    } catch { notify("Offline: job created on this device and will register on sync. (Server job start requires one online start in this build.)", "info"); }
+    } catch {
+      registered = false;
+      const regs = await loadPending<PendingReg>("pending-regs");
+      if (!regs.some((r) => r.job_id === jobId)) {
+        regs.push({ job_id: jobId, procedure_id: p.id, procedure_version_id: v.id });
+        await savePending("pending-regs", regs);
+      }
+      notify("Offline: this job is saved on this device under a stable id and will register with the server on sync.", "info");
+    }
     const local: LocalJob = { id: jobId, procedure_id: p.id, procedure_version_id: v.id, title: p.title, current: 0, stepStates: {}, started_at: new Date().toISOString(), finished: false };
     await idb.put("jobs", "active", local);
     setActiveJob(local); setActiveVersion(v); setView("job");
+    void registered;
   }
 
   const pendingReview = procs.filter((p) => p.has_pending_review).length;
@@ -160,7 +203,17 @@ export default function App() {
 
   async function handleSetJob(j: LocalJob | null) {
     if (!j) { setActiveJob(null); return; }
-    if (j.finished) { setActiveJob(null); await idb.del("jobs", "active"); return; }
+    if (j.finished) {
+      setActiveJob(null);
+      const finishes = await loadPending<PendingFinish>("pending-finishes");
+      if (!finishes.some((f) => f.job_id === j.id)) {
+        finishes.push({ job_id: j.id, outcome: j.finish_outcome || "completed" });
+        await savePending("pending-finishes", finishes);
+        await refreshPending();
+      }
+      await idb.del("jobs", "active");
+      return;
+    }
     setActiveJob(j); await idb.put("jobs", "active", j);
   }
 
@@ -173,11 +226,6 @@ export default function App() {
         <span className="pill">{pending} pending sync</span>
         {syncState === "failed" && <span className="pill error">Sync needs attention</span>}
         <button className="btn small secondary" onClick={() => void syncNow()} disabled={syncState === "syncing"}>{syncState === "syncing" ? "Syncing…" : "Sync now"}</button>
-        <label style={{ margin: 0, color: "#fff" }}>Role
-          <select aria-label="Demo role" value={role} onChange={(e) => setRole(e.target.value as Role)} style={{ marginLeft: 8 }}>
-            <option value="technician">Technician</option><option value="expert">Expert</option><option value="reviewer">Reviewer</option>
-          </select>
-        </label>
       </header>
       <div className="shell">
         <nav className="nav" aria-label="Primary">
@@ -193,10 +241,10 @@ export default function App() {
           {view === "capture" && <CaptureView done={(v) => { setReviewVersion(v); setView("review"); loadLists(); }} />}
           {view === "review" && <ReviewView version={reviewVersion} setVersion={setReviewVersion} procs={procs} openVersion={openVersion} role={role} reload={loadLists} notify={notify} />}
           {view === "job" && <JobView job={activeJob} version={activeVersion} queueEvent={queueEvent} setJob={handleSetJob} notify={notify} reload={loadLists} go={setView} />}
-          {view === "activity" && <Activity jobs={jobs} pending={pending} pendingReview={pendingReview} reload={loadLists} go={setView} syncNow={() => void syncNow()} syncing={syncState === "syncing"} />}
-          {view === "history" && <History jobs={jobs} reload={loadLists} />}
+          {view === "activity" && <Activity jobs={jobs} pending={pending} pendingReview={pendingReview} reload={loadLists} go={setView} syncNow={() => void syncNow()} syncing={syncState === "syncing"} role={role} onProposeRevision={async (vid) => { const v = await openVersion(vid); if (v) { setReviewVersion(v); setView("review"); notify("Opened the job's exact revision. Use “Propose new revision” there — it goes through normal review."); } else notify("That revision is not available offline yet.", "error"); }} />}
+          {view === "history" && <History jobs={jobs} reload={loadLists} role={role} onProposeRevision={async (vid) => { const v = await openVersion(vid); if (v) { setReviewVersion(v); setView("review"); } }} />}
           {view === "manuals" && <Manuals notify={notify} />}
-          {view === "settings" && <Settings pending={pending} role={role} clearCache={async () => { await idb.clear("versions"); await refreshCached(); notify("Offline procedure cache cleared. Downloaded jobs and queued events were kept."); }} />}
+          {view === "settings" && <Settings pending={pending} role={role} setRole={setRole} clearCache={async () => { await idb.clear("versions"); await refreshCached(); notify("Offline procedure cache cleared. Downloaded jobs and queued events were kept."); }} />}
         </main>
       </div>
       {view !== "job" && (
@@ -242,7 +290,7 @@ function Home({ procs, jobs, activeJob, pending, role, go, continueJob }: { proc
   );
 }
 
-function Activity({ jobs, pending, pendingReview, reload, go, syncNow, syncing }: { jobs: JobRow[]; pending: number; pendingReview: number; reload: () => void; go: (v: View) => void; syncNow: () => void; syncing: boolean }) {
+function Activity({ jobs, pending, pendingReview, reload, go, syncNow, syncing, role, onProposeRevision }: { jobs: JobRow[]; pending: number; pendingReview: number; reload: () => void; go: (v: View) => void; syncNow: () => void; syncing: boolean; role: Role; onProposeRevision: (versionId: string) => void }) {
   return (
     <div>
       <div className="card"><h2>Activity</h2>
@@ -254,7 +302,7 @@ function Activity({ jobs, pending, pendingReview, reload, go, syncNow, syncing }
           <button className="btn secondary" onClick={() => go("settings")}>Settings</button>
         </div>
       </div>
-      <History jobs={jobs} reload={reload} />
+      <History jobs={jobs} reload={reload} role={role} onProposeRevision={onProposeRevision} />
     </div>
   );
 }
@@ -279,6 +327,7 @@ function Library({ procs, cachedIds, reload, startJob, openVersion, cache }: { p
         <div key={p.id} className="card">
           <h3>{p.title}</h3>
           <p>{p.versions.map((v) => <span key={v.id} className={`tag ${v.status === "approved" ? "approved" : v.status === "pending_review" ? "warn" : ""}`}>v{v.version_number} · {v.status}</span>)}{offlineReady && <span className="tag approved">Offline ready</span>}</p>
+          {p.updated_at && <p className="muted small-text">Updated {new Date(p.updated_at).toLocaleDateString()}</p>}
           <div className="row">
             <button className="btn" disabled={!p.approved_version_id} onClick={() => startJob(p)}>Start guided job</button>
             {p.approved_version_id && <button className="btn secondary" onClick={() => cache(p.approved_version_id!)}>{offlineReady ? "Update offline copy" : "Save for offline use"}</button>}
@@ -320,6 +369,11 @@ function CaptureView({ done }: { done: (v: Version) => void }) {
   const [detectedPhrase, setDetectedPhrase] = useState<string | null>(null);
   const [recoveryTap, setRecoveryTap] = useState<{ nx: number; ny: number } | null>(null);
   const dismissedPhraseRef = useRef("");
+  const [capStep, setCapStep] = useState(0);
+  // Steps unlock once the session exists; evidence/transcript completeness
+  // is shown per step but never blocks (drafts work without photos).
+  const maxCapStep = capId ? 3 : 0;
+  const goStep = (n: number) => setCapStep(Math.max(0, Math.min(maxCapStep, 3, n)));
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const camStreamRef = useRef<MediaStream | null>(null);
   const photoUrlRef = useRef<string | null>(null);
@@ -349,13 +403,14 @@ function CaptureView({ done }: { done: (v: Version) => void }) {
     if (photoUrlRef.current) URL.revokeObjectURL(photoUrlRef.current);
   }, []);
 
-  async function create() {
-    if (!title.trim()) { say("Give the session a title first.", "error"); return; }
+  async function create(): Promise<string | null> {
+    if (!title.trim()) { say("Give the session a title first.", "error"); return null; }
     setBusy(true); say("Creating capture session…");
     try {
       const c = await api.post<Capture>("/api/capture-sessions", { title, task_description: desc, asset_name: assetName, category: "assembly" });
       setCapId(c.id); say("Session saved on the server. Add evidence, then generate the draft.", "ok");
-    } catch (e) { say(e instanceof Error ? e.message : "Failed to create session", "error"); } finally { setBusy(false); }
+      return c.id;
+    } catch (e) { say(e instanceof Error ? e.message : "Failed to create session", "error"); return null; } finally { setBusy(false); }
   }
 
   async function saveTranscript(): Promise<boolean> {
@@ -499,30 +554,43 @@ function CaptureView({ done }: { done: (v: Version) => void }) {
     <div className="card">
       <h2>Knowledge capture</h2>
       <div className="row" role="group" aria-label="Capture mode" style={{ marginBottom: 12 }}>
-        <button className={`btn small ${mode === "photo" ? "" : "secondary"}`} aria-pressed={mode === "photo"} onClick={() => setMode("photo")}>Photo</button>
+        <button className={`btn small ${mode === "photo" ? "" : "secondary"}`} aria-pressed={mode === "photo"} onClick={() => setMode("photo")}>Quick capture</button>
         <button className={`btn small ${mode === "live" ? "" : "secondary"}`} aria-pressed={mode === "live"} onClick={() => setMode("live")}>Live</button>
-        <button className={`btn small ${mode === "tutorial" ? "" : "secondary"}`} aria-pressed={mode === "tutorial"} onClick={() => setMode("tutorial")}>Tutorial</button>
+        <button className={`btn small ${mode === "tutorial" ? "" : "secondary"}`} aria-pressed={mode === "tutorial"} onClick={() => setMode("tutorial")}>Record a tutorial</button>
       </div>
       {mode === "tutorial" ? <TutorialMode onUseTranscript={(t) => { setTranscript(t); setMode("photo"); }} /> : mode === "live" ? <LiveMode captureId={capId} onTranscript={(t) => setTranscript(t)} onEvidenceSaved={(id) => { setPhotoEvId(id); setMode("photo"); say("Live frame saved as photo evidence — run SAM or generate the draft in Photo mode.", "ok"); }} /> : (<>
       <ol className="steps-indicator" aria-label="Capture progress">
-        <li className={capId ? "done" : "now"}>1 · Session</li>
-        <li className={photoEvId ? "done" : capId ? "now" : ""}>2 · Evidence</li>
-        <li className={capId ? "" : ""}>3 · Draft for review</li>
+        {(["Session", "Evidence", "Transcript", "Review & draft"] as const).map((label, i) => {
+          const done = i === 0 ? !!capId : i === 1 ? !!photoEvId : i === 2 ? transcript.trim().length > 0 : false;
+          const unlocked = i <= maxCapStep;
+          return (
+            <li key={label} className={i === capStep ? "now" : done ? "done" : ""} aria-current={i === capStep ? "step" : undefined}>
+              {unlocked && i !== capStep
+                ? <button className="btn small secondary" style={{ border: 0, background: "transparent", padding: 0, minHeight: "44px", font: "inherit" }} onClick={() => goStep(i)}>{i + 1} · {label}{done ? " ✓" : ""}</button>
+                : <span>{i + 1} · {label}{done ? " ✓" : ""}</span>}
+            </li>
+          );
+        })}
       </ol>
       <p className="muted">Your form is saved on this device as you type. Sessions save on the server before any AI request, so a dropped connection loses nothing.</p>
+      {capStep === 0 && (<>
+      <h3>1 · Session details</h3>
       <label htmlFor="cap-title">Session title</label><input id="cap-title" value={title} onChange={(e) => setTitle(e.target.value)} />
       <label htmlFor="cap-asset">Training asset</label><input id="cap-asset" value={assetName} onChange={(e) => setAssetName(e.target.value)} />
       <label htmlFor="cap-desc">Task description</label><textarea id="cap-desc" rows={2} value={desc} onChange={(e) => setDesc(e.target.value)} />
       <div className="row" style={{ marginTop: 12 }}>
-        <button className="btn" onClick={create} disabled={!!capId || busy}>{capId ? "Session created" : busy ? "Creating…" : "1 · Create capture session"}</button>
+        <button className="btn" onClick={async () => { const id = await create(); if (id) setCapStep(1); }} disabled={!!capId || busy}>{capId ? "Session created" : busy ? "Creating..." : "Create capture session"}</button>
+        {capId && <button className="btn secondary" onClick={() => goStep(1)}>Continue to evidence</button>}
+      </div>
+      </>)}
+      {capStep === 1 && (<>
+      <h3>2 · Photo evidence</h3>
+      <p className="muted small-text">Attach at least one photo. Highlighting it with SAM 3.1 below is optional but helps reviewers verify the procedure.</p>
+      <div className="row" style={{ marginTop: 12 }}>
         <button className="btn secondary" onClick={openCamera}>{cameraOpen ? "Close camera" : camState === "blocked" ? "Retry camera" : "Use camera"}</button>
         <label className="btn secondary">Attach photo<input className="visually-hidden" type="file" accept="image/jpeg,image/png,image/webp" aria-label="Attach photo" onChange={(e) => onPhoto(e.target.files?.[0])} /></label>
       </div>
-      <LiveTranscribe captureId={capId} disabled={!capId}
-        onFinal={(text) => setTranscript(text)}
-        onObjectPhrase={(phrase) => segmentPhrase(phrase)} />
-      {!capId && <p className="muted small-text">Create the session first to enable recording and photo upload. Typing the transcript works at any time and is saved on this device.</p>}
-      <p className="muted">Camera: {camState === "ready" ? "available" : camState === "blocked" ? "blocked/unavailable — details below" : "not tested yet (click Use camera)"}. Media needs http://localhost or HTTPS and browser permission. Say <strong>“this is my flag”</strong> while recording and the flag will be segmented.</p>
+      <p className="muted">Camera: {camState === "ready" ? "available" : camState === "blocked" ? "blocked/unavailable — details below" : "not tested yet (click Use camera)"}. Media needs http://localhost or HTTPS and browser permission.</p>
       {cameraOpen && (
         <div style={{ marginTop: 12 }}>
           <video ref={videoRef} className="camera-preview" autoPlay playsInline muted aria-label="Camera preview" />
@@ -538,6 +606,18 @@ function CaptureView({ done }: { done: (v: Version) => void }) {
           <img className="thumb" src={photoUrl} alt="Captured evidence" />
         </div>
       )}
+      <div className="row" style={{ marginTop: 10 }}>
+        <button className="btn secondary" onClick={() => goStep(0)}>← Back</button>
+        <button className="btn" onClick={() => goStep(2)}>Continue to transcript →</button>
+      </div>
+      </>)}
+      {capStep === 2 && (<>
+      <h3>3 · Transcript</h3>
+      <p className="muted small-text">Record narration or type it. Say <strong>“this is my flag”</strong> while recording and the flag is segmented automatically. Saving stores the corrected transcript as evidence.</p>
+      <LiveTranscribe captureId={capId} disabled={!capId}
+        onFinal={(text) => setTranscript(text)}
+        onObjectPhrase={(phrase) => segmentPhrase(phrase)} />
+      {!capId && <p className="muted small-text">Create the session first to enable recording. Typing the transcript works at any time and is saved on this device.</p>}
       <label htmlFor="cap-transcript">Transcript — correct any errors (original AI output is kept separately)</label>
       <textarea id="cap-transcript" rows={5} value={transcript} onChange={(e) => setTranscript(e.target.value)} />
       {detectedPhrase && (
@@ -551,12 +631,25 @@ function CaptureView({ done }: { done: (v: Version) => void }) {
           {!photoEvId && <p className="muted small-text" style={{ marginTop: 6 }}>Attach or capture a photo first, then segment it.</p>}
         </div>
       )}
-      <label htmlFor="seg-prompt">SAM segmentation prompt</label>
+      <div className="row" style={{ marginTop: 10 }}>
+        <button className="btn secondary" onClick={() => void saveTranscript()} disabled={!capId || busy}>Save corrected transcript</button>
+      </div>
+      <div className="row" style={{ marginTop: 10 }}>
+        <button className="btn secondary" onClick={() => goStep(1)}>← Back</button>
+        <button className="btn" onClick={() => goStep(3)}>Continue to review →</button>
+      </div>
+      </>)}
+      {capStep === 3 && (<>
+      <h3>4 · Review &amp; draft</h3>
+      <p className="muted small-text">{transcript.trim() ? `Transcript ready (${transcript.trim().split(/\s+/).length} words).` : "No transcript yet — one improves the draft, but you can generate without it."} {photoEvId ? "Photo evidence attached." : "No photo attached yet."} {seg ? "Segmentation highlight ready for review." : ""}</p>
+      <label htmlFor="seg-prompt">SAM segmentation prompt (optional)</label>
       <input id="seg-prompt" value={segPrompt} onChange={(e) => setSegPrompt(e.target.value)} placeholder="e.g. blue adjustment knob" />
       <div className="row" style={{ marginTop: 10 }}>
-        <button className="btn secondary" onClick={() => void saveTranscript()} disabled={!capId || busy}>2 · Save corrected transcript</button>
         <button className="btn secondary" onClick={() => void runSegment()} disabled={!photoEvId || busy}>Highlight with SAM 3.1</button>
-        <button className="btn" onClick={generate} disabled={!capId || busy}>{busy ? "Working…" : "3 · Generate procedure draft"}</button>
+        <button className="btn" onClick={generate} disabled={!capId || busy}>{busy ? "Working…" : "Generate procedure draft"}</button>
+      </div>
+      <div className="row" style={{ marginTop: 10 }}>
+        <button className="btn secondary" onClick={() => goStep(2)}>← Back to transcript</button>
       </div>
       {seg && <SegmentOverlay geometry={seg.geometry} simulated={seg.simulated} imageUrl={photoUrl} onConfirm={confirmSegment} />}
       {seg?.status === "no_match" && (
@@ -587,6 +680,7 @@ function CaptureView({ done }: { done: (v: Version) => void }) {
           )}
         </div>
       )}
+      </>)}
       {status && <div className={`notice ${statusKind === "error" ? "error" : statusKind === "ok" ? "ok" : "warn"}`} role={statusKind === "error" ? "alert" : "status"}>{status}</div>}
       </>)}
     </div>
@@ -635,17 +729,42 @@ function SegmentOverlay({ geometry, simulated, imageUrl, onConfirm }: { geometry
   );
 }
 
+function ReviewEvidence({ versionId }: { versionId: string }) {
+  const [items, setItems] = useState<EvidenceItem[]>([]);
+  useEffect(() => {
+    let alive = true;
+    api.get<{ evidence: EvidenceItem[] }>(`/api/procedure-versions/${versionId}/evidence`)
+      .then((r) => { if (alive) setItems(r.evidence || []); })
+      .catch(() => { if (alive) setItems([]); });
+    return () => { alive = false; };
+  }, [versionId]);
+  if (!items.length) return <p className="muted">No linked source evidence was returned for this version. Treat unsupported steps with extra care.</p>;
+  return (
+    <div>
+      <h4>Source evidence</h4>
+      {items.map((e) => (
+        <div key={e.id} className="list-row">
+          <span className="tag">{e.evidence_type}</span> {e.description || e.source_reference}
+          {e.text_content && <p className="muted small-text">“{e.text_content.slice(0, 220)}”</p>}
+          {e.image_url && <img src={e.image_url} alt="Source evidence" style={{ maxWidth: 260, borderRadius: 8, display: "block", marginTop: 6 }} />}
+          {e.segmentation && <p className="muted small-text">Segmentation: {e.segmentation.status} · {e.segmentation.simulated ? "simulated" : e.segmentation.model} · prompt “{e.segmentation.prompt}”</p>}
+        </div>
+      ))}
+    </div>
+  );
+}
+
 function ReviewView({ version, setVersion, procs, openVersion, role, reload, notify }: { version: Version | null; setVersion: (v: Version | null) => void; procs: ProcSummary[]; openVersion: (id: string) => Promise<Version | null>; role: Role; reload: () => void; notify: (s: string, kind?: "ok" | "error" | "info") => void }) {
   const [busy, setBusy] = useState(false);
   const [comment, setComment] = useState("");
+  const [confirmApprove, setConfirmApprove] = useState(false);
   const queue = procs.flatMap((p) => p.versions.filter((v) => v.status === "pending_review" || v.status === "draft" || v.status === "rejected").map((v) => ({ ...v, title: p.title })));
   const canReview = role === "reviewer" || role === "expert";
   async function act(path: string, ok: string) {
     if (!version) return;
     if (path === "reject" && !comment.trim()) { notify("Add a rejection reason first so the author knows what to fix.", "error"); return; }
-    if (path === "approve" && !window.confirm("Approve this version? It becomes immutable and available for jobs.")) return;
     setBusy(true);
-    try { await api.post(`/api/procedure-versions/${version.id}/${path}`, { comment: comment || "Reviewed in FieldGuard" }); notify(ok); setComment(""); reload(); const v = await openVersion(version.id); setVersion(v); }
+    try { await api.post(`/api/procedure-versions/${version.id}/${path}`, { comment: comment || "Reviewed in FieldGuard" }); notify(ok); setComment(""); setConfirmApprove(false); reload(); const v = await openVersion(version.id); setVersion(v); }
     catch (e) { notify(e instanceof Error ? e.message : "Action failed", "error"); }
     setBusy(false);
   }
@@ -658,7 +777,7 @@ function ReviewView({ version, setVersion, procs, openVersion, role, reload, not
   return (
     <div>
       <div className="card"><h2>Review &amp; approvals</h2>
-        <p className="muted">AI drafts are never approved automatically. {canReview ? "You can approve or reject versions pending review." : "Switch the demo role to Reviewer (top bar) to approve or reject — the server enforces this."} Signed-in role: <strong>{role}</strong>.</p>
+        <p className="muted">AI drafts are never approved automatically. {canReview ? "You can approve or reject versions pending review." : "Approval needs the Reviewer demo role (Activity → Settings) — the server enforces this."} Signed-in role: <strong>{role}</strong>.</p>
         <div className="row">{queue.map((v) => <button key={v.id} className="btn small secondary" onClick={async () => { const ver = await openVersion(v.id); if (ver) setVersion(ver); else notify("That version is not available offline yet.", "error"); }}>{v.title} · v{v.version_number} · {v.status}</button>)}
         {queue.length === 0 && <span className="muted">Queue empty — generate a draft in Capture.</span>}</div>
       </div>
@@ -669,6 +788,9 @@ function ReviewView({ version, setVersion, procs, openVersion, role, reload, not
           <label htmlFor="rv-sum">Summary</label><input id="rv-sum" value={version.summary} disabled={version.status === "approved"} onChange={(e) => setVersion({ ...version, summary: e.target.value })} />
           <label htmlFor="rv-pre">Prerequisites</label><textarea id="rv-pre" rows={2} value={version.prerequisites} disabled={version.status === "approved"} onChange={(e) => setVersion({ ...version, prerequisites: e.target.value })} />
           {Array.isArray((version.source_evidence as { uncertainties?: string[] }).uncertainties) && <div className="notice warn"><strong>Uncertainties to resolve:</strong> {((version.source_evidence as { uncertainties?: string[] }).uncertainties || []).join(" ")}</div>}
+          {Array.isArray((version.source_evidence as { missing_information?: string[] }).missing_information) && ((version.source_evidence as { missing_information?: string[] }).missing_information || []).length > 0 && <div className="notice warn"><strong>Missing information:</strong> {((version.source_evidence as { missing_information?: string[] }).missing_information || []).join(" ")}</div>}
+          {Array.isArray((version.source_evidence as { safety_notes?: string[] }).safety_notes) && ((version.source_evidence as { safety_notes?: string[] }).safety_notes || []).length > 0 && <div className="notice info"><strong>Safety notes (from capture):</strong> {((version.source_evidence as { safety_notes?: string[] }).safety_notes || []).join(" ")}</div>}
+          <ReviewEvidence versionId={version.id} />
           {version.steps.map((s, i) => (
             <div key={s.id} className="card">
               <strong>Step {s.step_order}: {s.title}</strong>
@@ -684,13 +806,76 @@ function ReviewView({ version, setVersion, procs, openVersion, role, reload, not
           <div className="row">
             {(version.status === "draft" || version.status === "rejected") && <><button className="btn secondary" disabled={busy} onClick={saveEdits}>Save edits</button><button className="btn" disabled={busy} onClick={() => act("submit-review", version.status === "rejected" ? "Resubmitted for review." : "Submitted for review.")}>{version.status === "rejected" ? "Submit again for review" : "Submit for review"}</button></>}
             {version.status === "pending_review" && (canReview
-              ? <><button className="btn" disabled={busy} onClick={() => act("approve", "Approved. This version is now immutable and available to technicians.")}>Approve</button><button className="btn danger" disabled={busy} onClick={() => act("reject", "Rejected and returned with an audit record.")}>Reject</button></>
+              ? <><button className="btn" disabled={busy || confirmApprove} onClick={() => setConfirmApprove(true)}>Approve</button><button className="btn danger" disabled={busy} onClick={() => act("reject", "Rejected and returned with an audit record.")}>Reject</button></>
               : <span className="tag warn">Reviewer role required to approve or reject</span>)}
+            {confirmApprove && version.status === "pending_review" && canReview && (
+              <div className="notice warn" role="alertdialog" aria-label="Confirm approval" style={{ marginTop: 10 }}>
+                <strong>Approve this version?</strong> It becomes immutable and available for jobs. This cannot be undone — edits afterwards require a new revision.
+                <div className="row" style={{ marginTop: 10 }}>
+                  <button className="btn" disabled={busy} onClick={() => void act("approve", "Approved. This version is now immutable and available to technicians.")}>Yes, approve</button>
+                  <button className="btn secondary" disabled={busy} onClick={() => setConfirmApprove(false)}>Keep reviewing</button>
+                </div>
+              </div>
+            )}
             {version.status === "approved" && <button className="btn secondary" disabled={busy} onClick={async () => { setBusy(true); try { const v = await api.post<Version>(`/api/procedure-versions/${version.id}/new-revision`, {}); setVersion(v); notify("New draft revision created. The approved version is unchanged."); } catch (e) { notify(e instanceof Error ? e.message : "Could not create a revision", "error"); } finally { setBusy(false); } }}>Propose new revision</button>}
           </div>
           {version.reviewed_by && <p className="muted">Reviewed by {version.reviewed_by}: {version.review_comment || ""}</p>}
         </div>
       )}
+    </div>
+  );
+}
+
+interface EvidenceItem {
+  id: string; evidence_type: string; description: string; source_reference: string;
+  text_content?: string | null; image_url: string | null;
+  segmentation: { id: string; geometry: SegGeometry; simulated: boolean; status: string; prompt: string; model?: string } | null;
+}
+
+function StepEvidence({ versionId, step }: { versionId: string; step: Step }) {
+  const [items, setItems] = useState<EvidenceItem[]>([]);
+  const [failed, setFailed] = useState(false);
+  useEffect(() => {
+    let alive = true;
+    api.get<{ evidence: EvidenceItem[] }>(`/api/procedure-versions/${versionId}/evidence`)
+      .then((r) => { if (alive) setItems(r.evidence || []); })
+      .catch(() => { if (alive) setFailed(true); });
+    return () => { alive = false; };
+  }, [versionId]);
+  const refs = new Set([...(step.evidence_refs || []), ...(step.visual_refs || [])]);
+  const mine = items.filter((e) => refs.has(e.id) && e.image_url);
+  if (failed) return <p className="muted small-text">Step reference photo is unavailable offline — the approved instruction above remains fully usable.</p>;
+  if (!mine.length) return null;
+  return (
+    <div style={{ marginTop: 12 }}>
+      {mine.map((e) => {
+        const geo = e.segmentation?.geometry;
+        const objs = geo?.objects?.length ? geo.objects : geo?.bbox_norm?.length === 4 ? [{ object_id: 0, bbox_norm: geo.bbox_norm, mask: geo.mask }] : [];
+        return (
+          <figure key={e.id} style={{ margin: 0 }}>
+            <div className="overlay-wrap" role="img" aria-label={`Step reference photo${geo ? ` with highlight on ${geo.label}` : ""}`}>
+              <img src={e.image_url || ""} alt="" />
+              {objs.map((o) => {
+                const [x1, y1, x2, y2] = o.bbox_norm;
+                return (
+                  <div key={o.object_id} className="bbox" style={{ left: `${x1 * 100}%`, top: `${y1 * 100}%`, width: `${(x2 - x1) * 100}%`, height: `${(y2 - y1) * 100}%` }}>
+                    <span>{geo?.label}</span>
+                    {o.mask?.svg_path && (
+                      <svg className="mask-svg" viewBox={`0 0 ${o.mask.width} ${o.mask.height}`} preserveAspectRatio="none" aria-hidden="true"><path d={o.mask.svg_path} /></svg>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+            <figcaption className="muted small-text">
+              Step reference{e.segmentation
+                ? <> · <span className="tag ai">{e.segmentation.simulated ? "SAM highlight · simulated" : "SAM 3.1 highlight"} · {e.segmentation.status}</span></>
+                : " · Highlighting unavailable for this photo — showing the original image."}
+              {e.description ? <> · {e.description}</> : null}
+            </figcaption>
+          </figure>
+        );
+      })}
     </div>
   );
 }
@@ -721,10 +906,11 @@ function JobView({ job, version, queueEvent, setJob, notify, reload, go }: { job
   }
   async function finish() {
     if (!job) return;
-    await queueEvent({ event_id: uuid(), session_id: job.id, step_id: null, event_type: "job_finished", payload: { outcome: doneCount === steps.length ? "completed" : "finished-with-exceptions" }, occurred_at: new Date().toISOString() });
-    try { await api.post(`/api/jobs/${job.id}/finish`, { outcome: doneCount === steps.length ? "completed" : "finished-with-exceptions", reason: "", summary: "" }); } catch { /* queued event carries the record offline */ }
-    await setJob({ ...job, finished: true }); await idb.del("jobs", "active"); reload();
-    notify("Job finished. Events remain queued until you press Sync now."); go("history");
+    const outcome = doneCount === steps.length ? "completed" : "finished-with-exceptions";
+    await queueEvent({ event_id: uuid(), session_id: job.id, step_id: null, event_type: "job_finished", payload: { outcome }, occurred_at: new Date().toISOString() });
+    try { await api.post(`/api/jobs/${job.id}/finish`, { outcome, reason: "", summary: "" }); } catch { /* pending-finish sync will deliver it */ }
+    await setJob({ ...job, finished: true, finish_outcome: outcome }); await idb.del("jobs", "active"); reload();
+    notify("Job finished and saved on this device. Its finish state syncs with your queued events."); go("history");
   }
   async function ask() {
     if (!version) return;
@@ -741,6 +927,7 @@ function JobView({ job, version, queueEvent, setJob, notify, reload, go }: { job
         {step.required_tools.length > 0 && <p><strong>Tools:</strong> {step.required_tools.join(", ")}</p>}
         <p><strong>Expected result:</strong> {step.expected_result || "Confirm visually before continuing."}</p>
         <p><span className="tag approved">Human-approved instruction</span>{step.evidence_refs.length > 0 && <span className="tag">Evidence: {step.evidence_refs.length} ref(s)</span>}{job.stepStates[step.id] && <span className="tag warn">Status: {job.stepStates[step.id]}</span>}</p>
+        <StepEvidence versionId={version.id} step={step} />
         <div className="big-actions">
           <button className="btn" onClick={() => mark("done")}>Mark complete</button>
           <button className="btn secondary" onClick={() => mark("blocked")}>Mark blocked</button>
@@ -753,6 +940,10 @@ function JobView({ job, version, queueEvent, setJob, notify, reload, go }: { job
             ? <button className="btn danger" onClick={() => setConfirmFinish(true)}>Finish job</button>
             : <><span><strong>Finish with {doneCount}/{steps.length} steps complete?</strong></span><button className="btn danger" onClick={finish}>Confirm finish</button><button className="btn secondary" onClick={() => setConfirmFinish(false)}>Keep working</button></>}
         </div>
+      </div>
+      <div className="card">
+        <h3>Job summary so far</h3>
+        <p>{doneCount} completed · {steps.filter((s) => job.stepStates[s.id] === "blocked").length} blocked · {steps.filter((s) => job.stepStates[s.id] === "skipped").length} skipped of {steps.length} steps. Saved on this device; server confirmation happens on Sync.</p>
       </div>
       <div className="card">
         <h3>Record an issue on this step</h3>
@@ -772,11 +963,47 @@ function JobView({ job, version, queueEvent, setJob, notify, reload, go }: { job
   );
 }
 
-function History({ jobs, reload }: { jobs: JobRow[]; reload: () => void }) {
+interface JobDetail {
+  id: string; status: string; outcome: string | null; procedure_version_id: string;
+  started_at: string; ended_at: string | null;
+  events: { event_id: string; event_type: string; step_id: string | null; payload: Record<string, unknown>; occurred_at: string }[];
+}
+
+function History({ jobs, reload, role, onProposeRevision }: { jobs: JobRow[]; reload: () => void; role: Role; onProposeRevision: (versionId: string) => void }) {
+  const [openId, setOpenId] = useState<string | null>(null);
+  const [detail, setDetail] = useState<JobDetail | null>(null);
+  const [detailError, setDetailError] = useState("");
+  async function toggle(j: JobRow) {
+    if (openId === j.id) { setOpenId(null); setDetail(null); return; }
+    setOpenId(j.id); setDetail(null); setDetailError("");
+    try { setDetail(await api.get<JobDetail>(`/api/jobs/${j.id}`)); }
+    catch { setDetailError("Job detail unavailable offline — the list above is the last server-confirmed state."); }
+  }
   return <div className="card"><h2>Job history</h2><button className="btn small secondary" onClick={reload}>Refresh</button>
     {jobs.length === 0 ? <div className="empty">No jobs yet. Completed work, exceptions, and sync state will appear here.</div>
-      : jobs.map((j) => <p key={j.id}><strong>{j.procedure_title}</strong> — {j.status}{j.outcome ? ` · ${j.outcome}` : ""} · {j.events} event(s) · {new Date(j.started_at).toLocaleString()}</p>)}
-    <p className="muted">Event history is append-only. Corrections create new audit events; approved versions are never rewritten by sync.</p></div>;
+      : jobs.map((j) => (
+        <div key={j.id} className="list-row">
+          <p><strong>{j.procedure_title}</strong> — {j.status}{j.outcome ? ` · ${j.outcome}` : ""} · {j.events} event(s) · {new Date(j.started_at).toLocaleString()}</p>
+          <button className="btn small secondary" aria-expanded={openId === j.id} onClick={() => void toggle(j)}>{openId === j.id ? "Hide details" : "View details"}</button>
+          {openId === j.id && detailError && <p className="muted">{detailError}</p>}
+          {openId === j.id && detail && (
+            <div style={{ marginTop: 8 }}>
+              <p className="muted small-text">Revision {detail.procedure_version_id.slice(0, 8)}… · started {new Date(detail.started_at).toLocaleString()}{detail.ended_at ? ` · ended ${new Date(detail.ended_at).toLocaleString()}` : " · not finished"}. These are server-confirmed events.</p>
+              {detail.events.length === 0 && <p className="muted">No events recorded yet.</p>}
+              {detail.events.map((e) => (
+                <p key={e.event_id} className="list-row">
+                  <span className="tag">{e.event_type}</span> {new Date(e.occurred_at).toLocaleString()}
+                  {e.event_type === "issue_recorded" && <> · {String((e.payload as { issue_type?: string }).issue_type || "Issue")}: {String((e.payload as { note?: string }).note || "")}</>}
+                  {e.event_type === "issue_recorded" && (role === "reviewer" || role === "expert") && (
+                    <> <button className="btn small secondary" onClick={() => onProposeRevision(detail.procedure_version_id)}>Propose revision from this feedback</button></>
+                  )}
+                </p>
+              ))}
+            </div>
+          )}
+        </div>
+      ))}
+    <p className="muted">Event history is append-only and server-confirmed. A proposed revision always goes through normal review — field feedback never edits an approved version directly.</p></div>;
 }
 
 function Manuals({ notify }: { notify: (s: string, kind?: "ok" | "error" | "info") => void }) {
@@ -804,7 +1031,7 @@ function Manuals({ notify }: { notify: (s: string, kind?: "ok" | "error" | "info
   </div>;
 }
 
-function Settings({ pending, role, clearCache }: { pending: number; role: Role; clearCache: () => void }) {
+function Settings({ pending, role, setRole, clearCache }: { pending: number; role: Role; setRole: (r: Role) => void; clearCache: () => void }) {
   const [note, setNote] = useState("");
   const [health, setHealth] = useState("");
   async function seed() { try { const r = await api.post<{ seeded: boolean }>("/api/seed", {}); setNote(r.seeded ? "Demo data seeded: approved harness procedure + operator notes. Open Procedures to start." : "Demo data already present."); } catch (e) { setNote(e instanceof Error ? e.message : "Seed failed — is the backend running?"); } }
@@ -820,7 +1047,11 @@ function Settings({ pending, role, clearCache }: { pending: number; role: Role; 
     <button className="btn" onClick={seed}>Seed demo procedure</button>{note && <div className="notice ok" role="status">{note}</div>}
     <h3>Offline storage</h3><p>{pending} event(s) pending synchronization. Queued events and the active job survive reloads and airplane mode.</p>
     <button className="btn secondary" onClick={clearCache}>Clear downloaded procedure cache</button>
-    <h3>Identity (demo)</h3><p className="muted">Signed in as the <strong>{role}</strong> demo role (top bar). This build uses header-based demo identity — the server still enforces reviewer-only approval, but it is not production authentication.</p>
+    <h3>Identity (demo)</h3><p className="muted">This build uses header-based demo identity — the server still enforces reviewer-only approval, but it is not production authentication. Switching role here only changes the demo identity sent to the server; it cannot grant real permissions.</p>
+    <label htmlFor="demo-role">Demo role</label>
+    <select id="demo-role" value={role} onChange={(e) => setRole(e.target.value as Role)}>
+      <option value="technician">Technician</option><option value="expert">Expert</option><option value="reviewer">Reviewer</option>
+    </select>
     <h3>Privacy</h3><p className="muted">The Meta API key lives only on the backend and never reaches this browser. Recordings are sent for transcription only when connected and only after you press Record. Delete local data any time by clearing site storage; server records follow your team retention policy.</p>
     <h3>Diagnostics</h3><p className="muted">Check the real API, database, and AI status. No secrets are shown.</p>
     <button className="btn secondary" onClick={checkHealth}>Check connection</button>{health && <div className="notice info" role="status">{health}</div>}

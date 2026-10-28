@@ -30,6 +30,7 @@ export interface ProcSummary {
   id: string;
   title: string;
   favorite: boolean;
+  updated_at?: string | null;
   versions: { id: string; version_number: number; status: string }[];
   approved_version_id: string | null;
   has_pending_review: boolean;
@@ -54,6 +55,7 @@ export interface LocalJob {
   stepStates: Record<string, "done" | "skipped" | "blocked">;
   started_at: string;
   finished: boolean;
+  finish_outcome?: string;
 }
 
 export type View = "home" | "library" | "capture" | "review" | "job" | "history" | "manuals" | "settings" | "activity";

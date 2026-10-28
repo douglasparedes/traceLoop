@@ -365,10 +365,46 @@ def list_procedures(db: Session = Depends(get_db)):
         vers = sorted(p.versions, key=lambda v: v.version_number)
         approved = [v for v in vers if v.status == "approved"]
         out.append({"id": p.id, "title": p.title, "favorite": bool(p.favorite),
+                    "updated_at": p.updated_at.isoformat() if p.updated_at else None,
                     "versions": [{"id": v.id, "version_number": v.version_number, "status": v.status} for v in vers],
                     "approved_version_id": approved[-1].id if approved else None,
                     "has_pending_review": any(v.status == "pending_review" for v in vers)})
     return out
+
+
+@app.get("/api/procedure-versions/{vid}/evidence")
+def version_evidence(vid: str, db: Session = Depends(get_db)):
+    """Source evidence linked to a version (via its capture session), with
+    the latest SAM segmentation per image so guided jobs and reviewers can
+    show the correct highlight for the correct image."""
+    v = db.get(M.ProcedureVersion, vid)
+    if not v: raise HTTPException(404, "Version not found")
+    cap_id = (v.source_evidence or {}).get("capture_session_id")
+    items = []
+    if cap_id:
+        for e in db.scalars(select(M.Evidence).where(M.Evidence.capture_session_id == cap_id)).all():
+            seg_out = None
+            seg = db.scalar(select(M.SegmentationResult).where(M.SegmentationResult.evidence_id == e.id).order_by(M.SegmentationResult.created_at.desc()))
+            if seg is not None:
+                seg_out = {"id": seg.id, "geometry": seg.normalized_geometry, "simulated": bool(seg.simulated),
+                           "status": seg.result_status, "prompt": seg.prompt_text, "model": seg.provider_model}
+            has_file = bool(e.storage_key) and (Path(__file__).resolve().parent.parent / e.storage_key).is_file()
+            items.append({"id": e.id, "evidence_type": e.evidence_type, "description": e.description,
+                          "text_content": e.text_content, "source_reference": e.source_reference,
+                          "image_url": f"/api/evidence/{e.id}/image" if e.evidence_type == "image" and has_file else None,
+                          "segmentation": seg_out})
+    return {"version_id": vid, "capture_session_id": cap_id, "evidence": items}
+
+
+@app.get("/api/evidence/{eid}/image")
+def evidence_image(eid: str, db: Session = Depends(get_db)):
+    from fastapi.responses import FileResponse
+    e = db.get(M.Evidence, eid)
+    if not e or e.evidence_type != "image" or not e.storage_key: raise HTTPException(404, "Evidence image not found")
+    path = Path(__file__).resolve().parent.parent / e.storage_key
+    if not path.is_file(): raise HTTPException(404, "Evidence image file missing")
+    media = {".png": "image/png", ".webp": "image/webp"}.get(path.suffix.lower(), "image/jpeg")
+    return FileResponse(path, media_type=media, filename=path.name)
 
 
 @app.get("/api/procedure-versions/{vid}")
@@ -927,7 +963,13 @@ def start_job(body: S.JobCreate, db: Session = Depends(get_db), who=Depends(acto
     if not v: raise HTTPException(404, "Procedure version not found")
     if v.procedure_id != body.procedure_id: raise HTTPException(409, "Procedure version does not belong to the selected procedure")
     if v.status != "approved": raise HTTPException(409, "Jobs can only start from an approved procedure version")
-    j = M.JobSession(asset_id=body.asset_id, procedure_id=body.procedure_id, procedure_version_id=body.procedure_version_id,
+    if body.id:
+        existing = db.get(M.JobSession, body.id)
+        if existing is not None:
+            if existing.procedure_version_id != body.procedure_version_id:
+                raise HTTPException(409, "A job with this id already exists for a different procedure version")
+            return {"id": existing.id, "status": existing.status, "procedure_version_id": existing.procedure_version_id, "already_registered": True}
+    j = M.JobSession(id=body.id or M.uid(), asset_id=body.asset_id, procedure_id=body.procedure_id, procedure_version_id=body.procedure_version_id,
                      technician_id=who["id"])
     db.add(j); db.flush(); audit(db, who["id"], "job.start", "job_session", j.id)
     db.commit(); db.refresh(j)

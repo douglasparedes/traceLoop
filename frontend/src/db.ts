@@ -17,9 +17,16 @@ function openDb(): Promise<IDBDatabase> {
 async function tx<T>(store: string, mode: IDBTransactionMode, fn: (s: IDBObjectStore) => IDBRequest<T>): Promise<T> {
   const db = await openDb();
   return new Promise((resolve, reject) => {
-    const req = fn(db.transaction(store, mode).objectStore(store));
-    req.onsuccess = () => resolve(req.result);
+    const t = db.transaction(store, mode);
+    const req = fn(t.objectStore(store));
+    let result: T;
+    req.onsuccess = () => { result = req.result; };
     req.onerror = () => reject(req.error);
+    // Resolve only when the transaction commits, not merely when the
+    // request succeeds, so "saved" actually means durable.
+    t.oncomplete = () => resolve(result);
+    t.onerror = () => reject(t.error);
+    t.onabort = () => reject(t.error || new Error("IndexedDB transaction aborted"));
   });
 }
 
