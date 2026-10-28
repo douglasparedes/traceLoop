@@ -1,0 +1,10 @@
+{
+  "name": "TraceLoop FieldGuard",
+  "components": [
+    {"id": "web-pwa", "type": "frontend", "tech": "React + TypeScript + Vite", "stores": ["IndexedDB (versions, jobs, event queue)", "Cache Storage via service worker"]},
+    {"id": "api", "type": "backend", "tech": "FastAPI + SQLAlchemy", "owns": ["authz rules", "approval workflow", "upload validation", "idempotent sync", "audit log"]},
+    {"id": "db", "type": "database", "tech": "SQLite prototype (PostgreSQL via DATABASE_URL)"},
+    {"id": "meta-adapters", "type": "integration", "tech": "backend-only", "models": ["muse-spark-1.3", "muse-voice-transcribe", "sam-3.1"], "fallback": "labelled simulated results when META_API_KEY is unset"}
+  ],
+  "coreLoop": ["expert capture", "AI draft (simulated or live)", "human approval (immutable version)", "offline guided execution", "idempotent event sync", "reviewed new revision"]
+}
