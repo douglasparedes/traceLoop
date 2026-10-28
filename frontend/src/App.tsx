@@ -239,6 +239,7 @@ export default function App() {
   const deskNav: { view: View; label: string; icon: IconName }[] = [
     { view: "home", label: "Workbench", icon: "home" }, { view: "library", label: "Procedures", icon: "book" }, { view: "capture", label: "Capture", icon: "addBox" },
     { view: "review", label: `Review${pendingReview ? ` (${pendingReview})` : ""}`, icon: "edit" }, { view: "job", label: "Guided job", icon: "play" }, { view: "activity", label: "Activity", icon: "schedule" },
+    { view: "history", label: "History", icon: "timer" }, { view: "manuals", label: "Manuals", icon: "library" }, { view: "settings", label: "Settings", icon: "cog" },
   ];
   const mobileNav: { view: View; label: string; icon: IconName }[] = [
     { view: "home", label: "Home", icon: "home" }, { view: "library", label: "Procedures", icon: "book" }, { view: "capture", label: "Capture", icon: "addBox" },
@@ -407,8 +408,10 @@ function Home({ procs, jobs, activeJob, activeVersion, pending, online, storageN
         </div>
         {jobs.length === 0 ? (
           <div className="card"><div className="empty">No jobs yet. Start one from an approved procedure.</div></div>
-        ) : jobs.slice(0, 4).map((j) => (
-          <div key={j.id} className="card" style={{ marginBottom: 8 }}>
+        ) : (
+          <div className="recent-grid">
+            {jobs.slice(0, 4).map((j) => (
+          <div key={j.id} className="card" style={{ marginBottom: 0 }}>
             <div className="row" style={{ justifyContent: "space-between" }}>
               <div style={{ minWidth: 0 }}>
                 <strong style={{ display: "block", overflow: "hidden", textOverflow: "ellipsis" }}>{j.procedure_title}</strong>
@@ -421,8 +424,10 @@ function Home({ procs, jobs, activeJob, activeVersion, pending, online, storageN
                   : <span className="badge info">Open</span>}
             </div>
           </div>
-        ))}
-        {jobs.length > 0 && <button className="btn secondary" onClick={() => go("activity")}>View all activity</button>}
+            ))}
+          </div>
+        )}
+        {jobs.length > 0 && <button className="btn secondary" style={{ marginTop: 12 }} onClick={() => go("activity")}>View all activity</button>}
       </div>
     </div>
   );
@@ -453,7 +458,8 @@ function ProcedureDetail({ title, version, cached, startJob, cache, openReview, 
   return (
     <div>
       <button className="btn small secondary" onClick={() => go("library")}><Icon name="back" size={17} /> Library</button>
-      <div className="card" style={{ marginTop: 10 }}>
+      <div className="detail-layout" style={{ marginTop: 10 }}>
+      <div className="card" style={{ marginTop: 0 }}>
         <div className="proc-badges">
           {version.status === "approved"
             ? <span className="badge ok"><Icon name="verified" size={13} /> Approved (Rev {version.version_number})</span>
@@ -493,6 +499,7 @@ function ProcedureDetail({ title, version, cached, startJob, cache, openReview, 
             {s.expected_result && <p className="small-text" style={{ margin: 0 }}><strong>Expected:</strong> {s.expected_result}</p>}
           </div>
         ))}
+      </div>
       </div>
     </div>
   );
@@ -559,7 +566,7 @@ function Library({ procs, cachedIds, reload, startJob, openVersion, cache }: { p
           {cats.map((c) => <button key={c} className="cat-pill" aria-pressed={cat === c} onClick={() => setCat(c)}>{c}</button>)}
         </div>
       )}
-      <div style={{ marginTop: 10 }}>
+      <div className="proc-grid" style={{ marginTop: 10 }}>
       {list.length === 0 && (
         <div className="card"><div className="empty">
           <p><strong>No matching procedures</strong></p>
@@ -1111,7 +1118,7 @@ function ReviewView({ version, setVersion, procs, openVersion, role, reload, not
     setBusy(false);
   }
   return (
-    <div>
+    <div className="review-layout">
       <div className="card"><h2><Icon name="flag" size={20} /> Review &amp; approvals</h2>
         <p className="muted">AI drafts are never approved automatically. {canReview ? "You can approve or reject versions pending review." : "Approval needs the Reviewer demo role (Activity → Settings) — the server enforces this."} Signed-in role: <strong>{role}</strong>.</p>
         {queue.length === 0
@@ -1353,6 +1360,7 @@ function JobView({ job, version, queueEvent, setJob, notify, reload, go, pending
         <h2 style={{ margin: 0, fontSize: "1.05rem" }}>Procedure Execution</h2>
         <span className={`sync-pill${online ? "" : " offline"}`} role="status"><span className="sync-dot" aria-hidden="true" />{online ? (pending ? `${pending} to sync` : "Synced") : "Offline"}</span>
       </div>
+      <div className="job-layout"><div>
       <section className="card" aria-live="polite">
         <div className="proc-badges">
           <span className="badge ok"><Icon name="verified" size={13} /> Rev {version.version_number} (Approved)</span>
@@ -1383,6 +1391,7 @@ function JobView({ job, version, queueEvent, setJob, notify, reload, go, pending
         <div><span className="panel-title" style={{ color: "var(--primary-container)" }}>Expected physical result</span>
         <p style={{ margin: "4px 0 0" }}>{step.expected_result || "Confirm visually before continuing."}</p></div>
       </section>
+      </div><div>
       <section className="card" style={{ marginTop: 12 }}>
         <div className="row" style={{ justifyContent: "space-between" }}>
           <h3 style={{ margin: 0 }}><Icon name="camera" size={18} /> Component reference</h3>
@@ -1418,6 +1427,7 @@ function JobView({ job, version, queueEvent, setJob, notify, reload, go, pending
           </div>
         </section>
       )}
+      </div></div>
       <section className="card" style={{ marginTop: 12 }}>
         <h3>Job summary so far</h3>
         <p>{doneCount} completed · {blockedCount} blocked · {skippedCount} skipped of {steps.length} steps. {pending > 0 ? `${pending} event(s) saved on this device, waiting for server confirmation.` : "Everything is confirmed by the server."}</p>
