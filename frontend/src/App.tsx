@@ -1103,6 +1103,13 @@ function ReviewView({ version, setVersion, procs, openVersion, role, reload, not
   const [confirmApprove, setConfirmApprove] = useState(false);
   const queue = procs.flatMap((p) => p.versions.filter((v) => v.status === "pending_review" || v.status === "draft" || v.status === "rejected").map((v) => ({ ...v, title: p.title })));
   const canReview = role === "reviewer" || role === "expert";
+  const autoOpened = useRef<string | null>(null);
+  useEffect(() => {
+    if (!version && queue.length > 0 && autoOpened.current !== queue[0].id) {
+      autoOpened.current = queue[0].id;
+      openVersion(queue[0].id).then((v) => { if (v) setVersion(v); else autoOpened.current = null; });
+    }
+  });
   async function act(path: string, ok: string) {
     if (!version) return;
     if (path === "reject" && !comment.trim()) { notify("Add a rejection reason first so the author knows what to fix.", "error"); return; }
