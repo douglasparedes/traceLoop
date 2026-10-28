@@ -1,0 +1,8 @@
+.env
+backend/.venv/
+backend/fieldguard.db
+backend/data/
+__pycache__/
+frontend/node_modules/
+frontend/dist/
+frontend/tsconfig.tsbuildinfo
