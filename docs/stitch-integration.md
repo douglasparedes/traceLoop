@@ -23,6 +23,12 @@ translated into the existing React/CSS/IndexedDB architecture.
   (online/pending/offline), avatar with demo-role initial.
 - Bottom nav (Home/Procedures/Capture/Activity) and desktop nav with icons;
   new `detail` view; screen labels per view.
+- Desktop (≥900/1100/1280px): 9-item side rail (History/Manuals/Settings
+  included — fully reachable without the mobile hub), 2-column library and
+  recent-work grids, two-pane guided-job console (instruction/expected left,
+  reference/safety/tooling right), two-pane procedure detail, two-pane review
+  (queue + draft at ≥1280px). Mobile-first base untouched; verified no
+  horizontal overflow at 320/360/390/430/768/1024/1440 + 390x420.
 
 **Screens (all wired to real state)**
 - Home → Operational Workbench: time greeting + date, sync ribbon (real pending

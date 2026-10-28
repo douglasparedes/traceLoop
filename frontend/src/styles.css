@@ -264,6 +264,33 @@ label.btn:focus-within { outline: 3px solid var(--accent); outline-offset: 2px; 
 .bottomnav button { flex-direction: column; gap: 2px; }
 .bottomnav button .icon { margin: 0 auto; }
 
+/* ---- Wide layouts (desktop-first additions; mobile-first base untouched) ---- */
+.proc-grid > * { min-width: 0; }
+.recent-grid > * { min-width: 0; }
+.job-layout > *, .detail-layout > *, .review-layout > * { min-width: 0; }
+@media (min-width: 900px) {
+  .proc-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; align-items: start; }
+  .proc-grid .proc-card { margin-bottom: 0; }
+  .proc-grid .proc-card + .proc-card { margin-top: 0; }
+  .recent-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+  .recent-grid .card { margin-bottom: 0; }
+}
+@media (min-width: 1100px) {
+  .shell { max-width: 1440px; }
+  .nav { width: 250px; }
+  main { max-width: 1080px; }
+  .job-layout { display: grid; grid-template-columns: minmax(0, 7fr) minmax(0, 5fr); gap: 14px; align-items: start; }
+  .job-layout .card, .job-layout section.card { margin-bottom: 0; }
+  .job-layout > div > :first-child { margin-top: 0 !important; }
+  .job-layout > div > * + * { margin-top: 12px !important; }
+  .detail-layout { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); gap: 14px; align-items: start; }
+  .detail-layout .card { margin-bottom: 0; }
+  .action-dock-row, .aux-row { max-width: 860px; }
+}
+@media (min-width: 1280px) {
+  .review-layout { display: grid; grid-template-columns: 340px minmax(0, 1fr); gap: 14px; align-items: start; }
+}
+
 /* Capture workspace. */
 .stat-tiles { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
 .stat-tile { background: var(--surface-2); border-radius: var(--radius-s); padding: 10px 6px; text-align: center; }
