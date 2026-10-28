@@ -366,6 +366,7 @@ def list_procedures(db: Session = Depends(get_db)):
         approved = [v for v in vers if v.status == "approved"]
         out.append({"id": p.id, "title": p.title, "favorite": bool(p.favorite),
                     "updated_at": p.updated_at.isoformat() if p.updated_at else None,
+                    "asset_type": p.asset_type,
                     "versions": [{"id": v.id, "version_number": v.version_number, "status": v.status} for v in vers],
                     "approved_version_id": approved[-1].id if approved else None,
                     "has_pending_review": any(v.status == "pending_review" for v in vers)})
@@ -996,7 +997,50 @@ def get_job(jid: str, db: Session = Depends(get_db)):
     return {"id": j.id, "status": j.status, "outcome": j.outcome, "procedure_version_id": j.procedure_version_id,
             "started_at": j.started_at.isoformat(), "ended_at": j.ended_at.isoformat() if j.ended_at else None,
             "events": [{"event_id": e.event_id, "event_type": e.event_type, "step_id": e.step_id,
-                        "payload": e.payload, "occurred_at": e.occurred_at.isoformat()} for e in evs]}
+                        "payload": e.payload, "occurred_at": e.occurred_at.isoformat()} for e in evs],
+            "evidence": job_evidence_list(jid, db)}
+
+
+def job_evidence_list(jid: str, db) -> list:
+    """Photos attached during a job (source_reference "job:{jid}" or "job:{jid}:{step}")."""
+    items = []
+    for e in db.scalars(select(M.Evidence).where(M.Evidence.source_reference.like(f"job:{jid}%")).order_by(M.Evidence.captured_at)).all():
+        has_file = bool(e.storage_key) and (Path(__file__).resolve().parent.parent / e.storage_key).is_file()
+        items.append({"id": e.id, "description": e.description, "step_id": (e.source_reference or "").split(":")[2] if (e.source_reference or "").count(":") >= 2 else None,
+                      "captured_at": e.captured_at.isoformat() if e.captured_at else None,
+                      "image_url": f"/api/evidence/{e.id}/image" if e.evidence_type == "image" and has_file else None})
+    return items
+
+
+@app.get("/api/jobs/{jid}/evidence")
+def get_job_evidence(jid: str, db: Session = Depends(get_db)):
+    if not db.get(M.JobSession, jid): raise HTTPException(404, "Job not found")
+    return {"job_id": jid, "evidence": job_evidence_list(jid, db)}
+
+
+@app.post("/api/jobs/{jid}/evidence")
+async def add_job_evidence(jid: str, file: UploadFile = File(...), description: str = Form(default="Job photo evidence"),
+                           step_id: str = Form(default=""), db: Session = Depends(get_db), who=Depends(actor)):
+    j = db.get(M.JobSession, jid)
+    if not j: raise HTTPException(404, "Job not found")
+    if j.status == "finished": raise HTTPException(409, "Job is finished; evidence can no longer be attached")
+    if file.content_type not in ("image/jpeg", "image/png", "image/webp"):
+        raise HTTPException(415, "Only JPEG, PNG or WebP images are supported")
+    data = await file.read()
+    if len(data) > MAX_IMG_BYTES: raise HTTPException(413, "Image too large (max 8 MB)")
+    digest = hashlib.sha256(data).hexdigest()[:16]
+    ref = f"job:{jid}" + (f":{step_id}" if step_id else "")
+    e = M.Evidence(capture_session_id=None, evidence_type="image", description=description or "Job photo evidence",
+                   source_reference=ref, created_by=who["id"], extra={"sha256_16": digest, "size": len(data)})
+    db.add(e); db.flush()
+    suffix = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}.get(file.content_type or "", ".jpg")
+    store_dir = Path(__file__).resolve().parent.parent / "data" / "evidence"
+    store_dir.mkdir(parents=True, exist_ok=True)
+    (store_dir / f"{e.id}{suffix}").write_bytes(data)
+    e.storage_key = f"data/evidence/{e.id}{suffix}"
+    audit(db, who["id"], "job.evidence", "evidence", e.id, {"job": jid})
+    db.commit(); db.refresh(e)
+    return {"id": e.id, "size": len(data)}
 
 
 @app.post("/api/jobs/{jid}/finish")

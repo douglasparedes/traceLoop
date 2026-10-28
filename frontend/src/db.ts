@@ -1,10 +1,10 @@
-// Minimal IndexedDB wrapper: procedures cache, local jobs, durable event queue.
+// Minimal IndexedDB wrapper: procedures cache, local jobs, durable event queue, media blobs.
 const DB_NAME = "fieldguard";
-const STORES = ["versions", "jobs", "events", "meta"] as const;
+const STORES = ["versions", "jobs", "events", "meta", "media"] as const;
 
 function openDb(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
-    const req = indexedDB.open(DB_NAME, 1);
+    const req = indexedDB.open(DB_NAME, 2);
     req.onupgradeneeded = () => {
       const db = req.result;
       for (const s of STORES) if (!db.objectStoreNames.contains(s)) db.createObjectStore(s, { keyPath: "key" });

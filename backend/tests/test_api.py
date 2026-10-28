@@ -36,6 +36,32 @@ def test_seed_and_job_flow_idempotent_sync():
     assert len([e for e in detail["events"] if e["event_id"] == "evt-test-1"]) == 1
 
 
+def test_job_evidence_attach_and_list():
+    c.post("/api/seed")
+    procs = c.get("/api/procedures").json()
+    assert "asset_type" in procs[0]
+    p = [x for x in procs if x["approved_version_id"]][0]
+    job = c.post("/api/jobs", json={"procedure_id": p["id"], "procedure_version_id": p["approved_version_id"]}, headers=TECH).json()
+    assert c.get(f"/api/jobs/{job['id']}/evidence").json() == {"job_id": job["id"], "evidence": []}
+    assert c.get(f"/api/jobs/{job['id']}").json()["evidence"] == []
+    assert c.post(f"/api/jobs/does-not-exist/evidence", files={"file": ("a.jpg", b"x", "image/jpeg")}).status_code == 404
+    bad_type = c.post(f"/api/jobs/{job['id']}/evidence", files={"file": ("a.txt", b"x", "text/plain")}, headers=TECH)
+    assert bad_type.status_code == 415
+    png = bytes.fromhex("89504e470d0a1a0a") + b"\x00" * 64
+    r = c.post(f"/api/jobs/{job['id']}/evidence", files={"file": ("step.png", png, "image/png")}, data={"step_id": "s1", "description": "Housing open"}, headers=TECH)
+    assert r.status_code == 200 and "id" in r.json()
+    listing = c.get(f"/api/jobs/{job['id']}/evidence", headers=TECH).json()
+    assert len(listing["evidence"]) == 1 and listing["evidence"][0]["step_id"] == "s1"
+    assert listing["evidence"][0]["image_url"].startswith("/api/evidence/")
+    img = c.get(listing["evidence"][0]["image_url"])
+    assert img.status_code == 200 and img.headers["content-type"] == "image/png"
+    detail = c.get(f"/api/jobs/{job['id']}").json()
+    assert len(detail["evidence"]) == 1
+    c.post(f"/api/jobs/{job['id']}/finish", json={"outcome": "completed", "reason": "", "summary": ""}, headers=TECH)
+    late = c.post(f"/api/jobs/{job['id']}/evidence", files={"file": ("b.png", png, "image/png")}, headers=TECH)
+    assert late.status_code == 409
+
+
 def test_approval_requires_reviewer_and_approved_immutable():
     cap = c.post("/api/capture-sessions", json={"title": "T", "task_description": "d", "asset_name": "Trainer"}, headers=TECH).json()
     c.put(f"/api/capture-sessions/{cap['id']}/transcript", json={"transcript_corrected": "First do A. Then do B."}, headers=TECH)
