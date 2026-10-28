@@ -54,6 +54,10 @@ class JobCreate(BaseModel):
     procedure_id: str
     procedure_version_id: str
     asset_id: str | None = None
+    # Optional stable client-generated id for offline-created jobs. When
+    # supplied, job creation is idempotent on this id so queued events
+    # referencing it can sync after reconnect.
+    id: str | None = None
 
 
 class JobEventIn(BaseModel):

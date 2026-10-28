@@ -87,6 +87,39 @@ def test_job_procedure_mismatch_and_finish_idempotent():
     assert again.get("already_finished") is True
 
 
+def test_offline_job_registration_with_client_id():
+    # A job created offline keeps its client id; registering it on reconnect
+    # is idempotent and its queued events then sync exactly once.
+    c.post("/api/seed")
+    procs = c.get("/api/procedures").json()
+    p = [x for x in procs if x["approved_version_id"]][0]
+    body = {"id": "11111111-2222-3333-4444-555555555555", "procedure_id": p["id"], "procedure_version_id": p["approved_version_id"]}
+    r1 = c.post("/api/jobs", json=body, headers=TECH)
+    assert r1.status_code == 200 and r1.json()["id"] == body["id"]
+    r2 = c.post("/api/jobs", json=body, headers=TECH)
+    assert r2.status_code == 200 and r2.json().get("already_registered") is True
+    assert len([j for j in c.get("/api/jobs").json() if j["id"] == body["id"]]) == 1
+    ev = {"event_id": "evt-offline-1", "session_id": body["id"], "event_type": "step_completed", "payload": {}}
+    s1 = c.post("/api/sync/events", json={"events": [ev]}, headers=TECH).json()
+    s2 = c.post("/api/sync/events", json={"events": [ev]}, headers=TECH).json()
+    assert s1["acknowledged"] == ["evt-offline-1"] and s2["duplicates"] == ["evt-offline-1"]
+    # Mismatched reuse of the id is rejected.
+    bad = c.post("/api/jobs", json={"id": body["id"], "procedure_id": p["id"], "procedure_version_id": "nope"}, headers=TECH)
+    assert bad.status_code in (404, 409)
+
+
+def test_version_evidence_endpoint():
+    cap = c.post("/api/capture-sessions", json={"title": "EV", "task_description": "d", "asset_name": "Trainer"}, headers=TECH).json()
+    c.put(f"/api/capture-sessions/{cap['id']}/transcript", json={"transcript_corrected": "First do A. Then do B."}, headers=TECH)
+    ver = c.post("/api/procedures/draft", json={"capture_session_id": cap["id"]}, headers=TECH).json()
+    r = c.get(f"/api/procedure-versions/{ver['id']}/evidence")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["capture_session_id"] == cap["id"] and isinstance(body["evidence"], list)
+    assert c.get("/api/procedure-versions/does-not-exist/evidence").status_code == 404
+    assert c.get("/api/evidence/does-not-exist/image").status_code == 404
+
+
 def test_reject_requires_reason_and_rejected_can_resubmit():
     cap = c.post("/api/capture-sessions", json={"title": "T3", "task_description": "d"}, headers=TECH).json()
     ver = c.post("/api/procedures/draft", json={"capture_session_id": cap["id"]}, headers=TECH).json()
