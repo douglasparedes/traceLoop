@@ -19,6 +19,25 @@ REV = {"X-User": "rev-1", "X-Role": "reviewer"}
 TECH = {"X-User": "tech-1", "X-Role": "technician"}
 
 
+def test_frontend_static_and_spa_fallback():
+    # Production single-origin serving: built PWA is served by the API app.
+    # Skipped in environments without a frontend build.
+    from pathlib import Path
+    dist = Path(__file__).resolve().parent.parent.parent / "frontend" / "dist"
+    if not (dist / "index.html").is_file():
+        import pytest as _pt
+        _pt.skip("frontend/dist not built")
+    r = c.get("/")
+    assert r.status_code == 200 and "text/html" in r.headers["content-type"]
+    man = c.get("/manifest.webmanifest")
+    assert man.status_code == 200 and "manifest" in man.headers["content-type"]
+    assert c.get("/sw.js").status_code == 200
+    spa = c.get("/procedures")
+    assert spa.status_code == 200 and "text/html" in spa.headers["content-type"]
+    assert c.get("/api/does-not-exist").status_code == 404
+    assert c.get("/api/health").status_code == 200
+
+
 def test_health():
     r = c.get("/api/health"); assert r.status_code == 200 and r.json()["status"] == "ok"
 

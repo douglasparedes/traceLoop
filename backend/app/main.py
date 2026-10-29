@@ -30,7 +30,16 @@ with engine.begin() as _conn:
             _conn.execute(_text(f"ALTER TABLE {_table} ADD COLUMN {_col} {_type}"))
 
 app = FastAPI(title="TraceLoop FieldGuard API", version="0.1.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+import os as _os
+
+# Same-origin in production (frontend served by this app); CORS only matters
+# for local dev servers. Override with CORS_ORIGINS (comma-separated).
+_cors_origins = [o.strip() for o in _os.getenv(
+    "CORS_ORIGINS",
+    "https://knowloop.online,http://localhost:5173,http://127.0.0.1:5173,http://localhost:8000,http://127.0.0.1:8000",
+).split(",") if o.strip()]
+app.add_middleware(CORSMiddleware, allow_origins=_cors_origins, allow_methods=["*"], allow_headers=["*"])
 
 MAX_PDF_BYTES = 15 * 1024 * 1024
 MAX_IMG_BYTES = 8 * 1024 * 1024
@@ -1129,3 +1138,35 @@ def seed(db: Session = Depends(get_db)):
     db.add(M.ManualChunk(manual_id=man.id, chunk_index=0, page_number=1, text=man.extracted_text))
     db.commit()
     return {"seeded": True, "procedure_id": proc.id, "version_id": ver.id}
+
+
+# ---------------------------------------------------------------------------
+# Frontend hosting (production): serve the built PWA from this same origin so
+# the manifest, service worker and /api calls share one scope. Skipped when no
+# dist exists (local dev uses the Vite server on :5173 with its /api proxy).
+# Registered last: API routes above always take precedence.
+# ---------------------------------------------------------------------------
+def _frontend_dist() -> Path | None:
+    env = _os.getenv("FRONTEND_DIST")
+    candidates = [Path(env)] if env else []
+    here = Path(__file__).resolve()
+    candidates += [here.parent.parent.parent / "frontend" / "dist", here.parent.parent / "frontend" / "dist"]
+    for c in candidates:
+        if (c / "index.html").is_file():
+            return c
+    return None
+
+
+_DIST = _frontend_dist()
+if _DIST is not None:
+    from fastapi.responses import FileResponse as _FileResponse
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    def _spa(full_path: str):
+        if full_path.startswith("api/") or full_path == "api":
+            raise HTTPException(404, "Not found")
+        candidate = (_DIST / full_path).resolve()
+        if candidate.is_file() and _DIST.resolve() in candidate.parents:
+            media = "application/manifest+json" if candidate.name == "manifest.webmanifest" else None
+            return _FileResponse(candidate, media_type=media)
+        return _FileResponse(_DIST / "index.html")
