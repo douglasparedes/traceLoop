@@ -19,13 +19,14 @@ interface TutObject {
 interface TutStep { step_number: number; title: string; start: number; end: number; summary: string; objects_used: number[] }
 interface TutSegment { text: string; start: number; end: number }
 interface ProcEvent { id: string; correlation_id: string; stage: string; operation: string; provider: string; model: string; status: string; duration_ms?: number | null; summary: Record<string, unknown>; created_at: string }
-interface GuideSnap { id: string; trigger: string; model: string; simulated: boolean; guide_hash: string; materials: string[]; created_at: string; markdown_chars: number }
+
 interface TutJob {
   id: string; title: string; status: string; progress: number; error?: string;
   duration_sec: number; access_token: string; video_url: string;
   full_transcript: string; timed_segments: TutSegment[]; objects: TutObject[];
   steps: TutStep[]; materials: string[]; guide_markdown: string; cached?: boolean;
   draft_procedure_id?: string | null; draft_version_id?: string | null;
+  guide_format?: string; format_source?: string; format_rationale?: string;
 }
 interface PastItem {
   id: string; title: string; status: string; access_token: string; actor: string;
@@ -33,9 +34,78 @@ interface PastItem {
   objects_total: number; objects_unresolved: number; has_guide: boolean;
 }
 
+import GuideFormatSelector from "./GuideFormatSelector";
+import VisualStudio from "./VisualStudio";
+import type { GuideSnapshotItem, VisualAsset } from "./guideFormats";
+import { acceptVisual, rejectVisual, visualFileUrl } from "./guideFormats";
+
+/** Current format badge + change-format entry point. */
 function fmt(sec: number): string {
   const m = Math.floor(sec / 60); const s = Math.floor(sec % 60);
   return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+/** Current format badge + change-format entry point. */
+function GuideFormatBanner({ job, onPick }: {
+  job: { guide_format?: string; format_source?: string; format_rationale?: string };
+  onPick: () => void;
+}) {
+  const names: Record<string, string> = {
+    work_instruction: "Illustrated Work Instruction",
+    reference_manual: "Reference Manual",
+    interactive: "Interactive Guided Execution",
+  };
+  return (
+    <div className="card" style={{ marginBottom: 10 }}>
+      <div className="row" style={{ justifyContent: "space-between" }}>
+        <div>
+          <span className="eyebrow">Guide format</span>
+          <h3 style={{ margin: "2px 0" }}>{job.guide_format ? names[job.guide_format] || job.guide_format : "Not set yet"}</h3>
+          {job.format_rationale && <p className="muted small-text" style={{ margin: 0 }}>{job.format_source === "user" ? "You selected this format. " : ""}{job.format_rationale}</p>}
+        </div>
+        <button className="btn small secondary" onClick={onPick}>Change format</button>
+      </div>
+    </div>
+  );
+}
+
+function VersionHistory({ snaps, currentMarkdown, compareId, compareMd, onView, onCompare, onCloseCompare, resolveImage }: {
+  snaps: GuideSnapshotItem[]; currentMarkdown: string; compareId: string | null; compareMd: string;
+  onView: (id: string) => void; onCompare: (id: string | null) => void; onCloseCompare: () => void;
+  resolveImage: (src: string) => string;
+}) {
+  if (!snaps.length) return null;
+  const TRIGGER_LABEL: Record<string, string> = { initial: "Initial generation", refresh: "Illustration refresh", tap: "Tap correction", retry: "Retry", format: "Format change" };
+  const FMT: Record<string, string> = { work_instruction: "Work instruction", reference_manual: "Reference manual", interactive: "Interactive" };
+  return (
+    <div className="card" style={{ marginBottom: 10 }}>
+      <h3 style={{ marginTop: 0 }}>Version history ({snaps.length})</h3>
+      <p className="muted small-text">Every generation is kept. New versions never overwrite older ones; drafts only move to Review when you send them.</p>
+      {snaps.map((s) => (
+        <p key={s.id} className="list-row">
+          <span className="tag">{TRIGGER_LABEL[s.trigger] || s.trigger}</span>
+          {s.guide_format && <span className="tag ai">{FMT[s.guide_format] || s.guide_format}</span>}
+          {s.simulated && <span className="tag warn">simulated model</span>}
+          <span className="muted small-text"> · {new Date(s.created_at).toLocaleString()} · {s.markdown_chars} chars</span>{" "}
+          <button className="btn small secondary" onClick={() => onView(s.id)}>View</button>{" "}
+          <button className="btn small secondary" aria-pressed={compareId === s.id}
+            onClick={() => onCompare(compareId === s.id ? null : s.id)}>{compareId === s.id ? "Hide compare" : "Compare"}</button>
+        </p>
+      ))}
+      {compareId && (
+        <div style={{ marginTop: 8 }}>
+          <div className="row" style={{ justifyContent: "space-between" }}>
+            <strong>Comparing with current guide</strong>
+            <button className="btn small secondary" onClick={onCloseCompare}>Close compare</button>
+          </div>
+          <div className="grid" style={{ gridTemplateColumns: "1fr 1fr" }}>
+            <div className="card"><h4>Selected version</h4><Markdown text={compareMd} resolveImage={resolveImage} /></div>
+            <div className="card"><h4>Current guide</h4><Markdown text={currentMarkdown} resolveImage={resolveImage} /></div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
 }
 
 /** Compact, honest rendering of one processing event's diagnostic summary. */
@@ -115,12 +185,17 @@ export default function TutorialMode({ onUseTranscript, onOpenReview }: { onUseT
   const [uploadPct, setUploadPct] = useState<number | null>(null);
   const [job, setJob] = useState<TutJob | null>(null);
   const [status, setStatus] = useState("");
-  const [tab, setTab] = useState<"guide" | "transcript" | "objects" | "pipeline">("guide");
+  const [tab, setTab] = useState<"guide" | "transcript" | "objects" | "pipeline" | "visuals">("guide");
   const [events, setEvents] = useState<ProcEvent[]>([]);
   const [eventsTotal, setEventsTotal] = useState(0);
-  const [snaps, setSnaps] = useState<GuideSnap[]>([]);
+  const [snaps, setSnaps] = useState<GuideSnapshotItem[]>([]);
   const [snapId, setSnapId] = useState<string | null>(null);
   const [snapMd, setSnapMd] = useState("");
+  const [compareId, setCompareId] = useState<string | null>(null);
+  const [compareMd, setCompareMd] = useState("");
+  const [showFormatPicker, setShowFormatPicker] = useState(false);
+  const [visuals, setVisuals] = useState<VisualAsset[]>([]);
+  const [visualSource, setVisualSource] = useState<{ id: string; label: string; imageUrl: string; kind: string; source: Record<string, unknown> } | null>(null);
   const [draftBusy, setDraftBusy] = useState(false);
   const [past, setPast] = useState<PastItem[]>([]);
   const [pastTotal, setPastTotal] = useState(0);
@@ -137,6 +212,11 @@ export default function TutorialMode({ onUseTranscript, onOpenReview }: { onUseT
   const streamRef = useRef<MediaStream | null>(null);
   const recRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const peakRef = useRef(0);
+  const [micLevel, setMicLevel] = useState(0);
+  const [audioInfo, setAudioInfo] = useState<{ tracks: number; muted: boolean; silent: boolean; mime: string } | null>(null);
   const startedRef = useRef(0);
   const xhrRef = useRef<XMLHttpRequest | null>(null);
   const uploadingRef = useRef(false);
@@ -164,6 +244,8 @@ export default function TutorialMode({ onUseTranscript, onOpenReview }: { onUseT
   useEffect(() => () => {
     streamRef.current?.getTracks().forEach((t) => t.stop());
     if (recorded) URL.revokeObjectURL(recorded.url);
+    audioCtxRef.current?.close().catch(() => undefined);
+    audioCtxRef.current = null; analyserRef.current = null;
   }, [recorded]);
 
   useEffect(() => {
@@ -171,6 +253,17 @@ export default function TutorialMode({ onUseTranscript, onOpenReview }: { onUseT
     const t = window.setInterval(() => {
       const el = Math.floor((Date.now() - startedRef.current) / 1000);
       setElapsed(el);
+      const an = analyserRef.current;
+      if (an) {
+        try {
+          const buf = new Uint8Array(an.fftSize);
+          an.getByteTimeDomainData(buf);
+          let peak = 0;
+          for (let i = 0; i < buf.length; i++) peak = Math.max(peak, Math.abs(buf[i] - 128) / 128);
+          peakRef.current = Math.max(peakRef.current, peak);
+          setMicLevel(peak);
+        } catch { /* meter unavailable on this browser */ }
+      }
       if (el >= TUTORIAL.MAX_VIDEO_SEC) stopRecording();
     }, 250);
     return () => window.clearInterval(t);
@@ -210,7 +303,12 @@ export default function TutorialMode({ onUseTranscript, onOpenReview }: { onUseT
       }
       streamRef.current = stream;
       if (previewRef.current) { previewRef.current.srcObject = stream; await previewRef.current.play().catch(() => undefined); }
-      setStatus("");
+      const at = stream.getAudioTracks();
+      const live = at.filter((t) => t.readyState === "live");
+      setAudioInfo({ tracks: live.length, muted: live.length > 0 && live.every((t) => t.muted), silent: false, mime: "" });
+      setStatus(live.length === 0
+        ? "Camera opened, but no microphone track was granted. Check the browser site settings allow the microphone, then reopen the camera."
+        : "");
     } catch (e) {
       const name = e instanceof DOMException ? e.name : "";
       setStatus(name === "NotAllowedError" ? "Camera/microphone blocked. Allow both in the address-bar site settings, then retry."
@@ -222,14 +320,37 @@ export default function TutorialMode({ onUseTranscript, onOpenReview }: { onUseT
   function startRecording() {
     const stream = streamRef.current;
     if (!stream) { setStatus("Open the camera first."); return; }
+    const liveAudio = stream.getAudioTracks().filter((t) => t.readyState === "live");
+    if (liveAudio.length === 0) {
+      setStatus("Cannot record: this camera stream has no live microphone track. Reopen the camera and allow the microphone — a tutorial without narration cannot be transcribed.");
+      return;
+    }
     if (typeof MediaRecorder === "undefined") { setStatus("MediaRecorder is not supported in this browser. Use current Chrome/Edge."); return; }
     const mime = ["video/mp4;codecs=avc1,mp4a.40.2", "video/mp4", "video/webm;codecs=vp9,opus", "video/webm"].find((m) => MediaRecorder.isTypeSupported(m));
     const rec = mime ? new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 2_500_000 }) : new MediaRecorder(stream);
     chunksRef.current = [];
+    peakRef.current = 0; setMicLevel(0);
+    setAudioInfo({ tracks: liveAudio.length, muted: liveAudio.every((t) => t.muted), silent: false, mime: rec.mimeType || mime || "browser default" });
+    try {
+      audioCtxRef.current?.close().catch(() => undefined);
+      const Ctx = window.AudioContext || (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+      if (Ctx) {
+        const ctx = new Ctx();
+        audioCtxRef.current = ctx;
+        const src = ctx.createMediaStreamSource(stream);
+        const an = ctx.createAnalyser(); an.fftSize = 512;
+        src.connect(an); analyserRef.current = an;
+      }
+    } catch { /* level meter unavailable; recording still proceeds */ }
     rec.ondataavailable = (e) => { if (e.data.size) chunksRef.current.push(e.data); };
     rec.onstop = () => {
       const type = rec.mimeType || mime || "video/webm";
       const blob = new Blob(chunksRef.current, { type });
+      const silent = peakRef.current < 0.02;
+      setAudioInfo((prev) => (prev ? { ...prev, silent } : { tracks: liveAudio.length, muted: false, silent, mime: type }));
+      setMicLevel(0);
+      audioCtxRef.current?.close().catch(() => undefined);
+      audioCtxRef.current = null; analyserRef.current = null;
       setRecorded((old) => { if (old) URL.revokeObjectURL(old.url); return { blob, url: URL.createObjectURL(blob) }; });
       setPhase("review");
       uploadRef.current?.(blob);
@@ -349,6 +470,24 @@ export default function TutorialMode({ onUseTranscript, onOpenReview }: { onUseT
     } catch { /* offline */ }
   }
 
+  async function loadVisuals() {
+    if (!job) return;
+    try {
+      const idn = getIdentity();
+      const res = await fetch(`${API}/api/tutorial/${job.id}/visuals`, { headers: authHeaders({ "X-Tutorial-Token": job.access_token }) });
+      if (res.ok) setVisuals((await res.json()).items || []);
+    } catch { /* offline */ }
+  }
+
+  async function openCompare(id: string) {
+    if (!job) return;
+    try {
+      const idn = getIdentity();
+      const res = await fetch(`${API}/api/tutorial/${job.id}/snapshots/${id}`, { headers: authHeaders({ "X-Tutorial-Token": job.access_token }) });
+      if (res.ok) { const s = await res.json(); setCompareId(id); setCompareMd(s.guide_markdown || ""); }
+    } catch { setStatus("Could not load that snapshot."); }
+  }
+
   async function openSnapshot(id: string) {
     if (!job) return;
     try {
@@ -404,6 +543,17 @@ export default function TutorialMode({ onUseTranscript, onOpenReview }: { onUseT
             <video ref={previewRef} className="live-video" autoPlay playsInline muted aria-label="Tutorial camera preview" />
             {recording && <div className="live-processing"><span className="rec-dot" aria-hidden="true" /> REC {fmt(elapsed)} / {fmt(TUTORIAL.MAX_VIDEO_SEC)}</div>}
           </div>
+          {recording && (
+            <div role="status" aria-label={`Microphone level ${Math.round(micLevel * 100)} percent`} style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8 }}>
+              <span className="muted small-text" style={{ whiteSpace: "nowrap" }}>Mic {micLevel < 0.02 ? "— silent, speak up" : "level"}</span>
+              <div style={{ flex: "1 1 auto", height: 8, borderRadius: 4, background: "var(--line)", overflow: "hidden" }}>
+                <div style={{ width: `${Math.round(micLevel * 100)}%`, height: "100%", background: micLevel < 0.02 ? "var(--warn)" : "var(--ok)" }} />
+              </div>
+            </div>
+          )}
+          {audioInfo && audioInfo.tracks === 0 && !recording && (
+            <p className="notice warn" role="alert" style={{ marginTop: 8 }}>No microphone track in this camera stream. Recording is blocked until the microphone is allowed — a silent video cannot be transcribed.</p>
+          )}
           <div className="row" style={{ marginTop: 10 }}>
             <button className="btn secondary" onClick={() => void openCamera()}>Open camera</button>
             <label className="btn secondary" style={{ margin: 0 }} aria-label="Choose camera">Camera
@@ -452,6 +602,17 @@ export default function TutorialMode({ onUseTranscript, onOpenReview }: { onUseT
           <h3>{uploadPct !== null ? "Uploading your tutorial…" : uploadFailed ? "Upload didn't finish" : "Review your recording"}</h3>
           <video className="live-video" src={recorded.url} controls playsInline aria-label="Recorded tutorial preview" />
           <p className="muted">{(recorded.blob.size / 1024 / 1024).toFixed(1)} MB · {fmt(elapsed)} recorded. Processing a 3-minute tutorial typically takes 1–3 minutes.</p>
+          {audioInfo && (
+            <p className="muted small-text" role="status">
+              Captured as {audioInfo.mime || "browser default"} · {audioInfo.tracks} mic track{audioInfo.tracks === 1 ? "" : "s"}
+              {audioInfo.muted ? " · microphone reports muted" : ""} · {audioInfo.silent ? "no audible speech detected" : "speech detected"}.
+            </p>
+          )}
+          {audioInfo?.silent && (
+            <div className="notice warn" role="alert">
+              <strong>No audible speech was detected in this recording.</strong> If you narrated, your microphone may be muted at the OS level or another app may hold it. Uploading a silent video will fail transcription — consider recording again.
+            </div>
+          )}
           <label htmlFor="tut-title2">Tutorial title</label>
           <input id="tut-title2" value={title} onChange={(e) => setTitle(e.target.value)} disabled={uploadPct !== null} />
           <div className="row" style={{ marginTop: 10 }}>
@@ -473,15 +634,25 @@ export default function TutorialMode({ onUseTranscript, onOpenReview }: { onUseT
         </div>
       )}
 
-      {job?.status === "error" && (
-        <div className="notice error" role="alert">
-          <strong>Processing failed.</strong> {job.error}
-          <div className="row" style={{ marginTop: 8 }}>
-            <button className="btn small" onClick={async () => { await authPost(`/api/tutorial/${job.id}/retry`, {}, { "X-Tutorial-Token": job.access_token }); setJob({ ...job, status: "uploaded", progress: 2, error: "" }); setPhase("processing"); }}>Retry processing</button>
-            <button className="btn small secondary" onClick={() => setPhase("record")}>Record again</button>
+      {job?.status === "error" && (() => {
+        const noAudio = /no audio track/i.test(job.error || "");
+        return (
+          <div className="notice error" role="alert">
+            <strong>Processing failed.</strong> {job.error}
+            {noAudio && (
+              <p className="muted small-text" style={{ margin: "6px 0 0" }}>
+                This recording captured video but no sound — check the microphone is on and not muted at the OS/browser level, then record again while narrating each step out loud. Retrying this file cannot work: it contains no audio to transcribe.
+              </p>
+            )}
+            <div className="row" style={{ marginTop: 8 }}>
+              {!noAudio && (
+                <button className="btn small" onClick={async () => { await authPost(`/api/tutorial/${job.id}/retry`, {}, { "X-Tutorial-Token": job.access_token }); setJob({ ...job, status: "uploaded", progress: 2, error: "" }); setPhase("processing"); }}>Retry processing</button>
+              )}
+              <button className="btn small secondary" onClick={() => setPhase("record")}>{noAudio ? "Record again with microphone" : "Record again"}</button>
+            </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
 
       {phase === "guide" && job && job.status === "done" && (
         <div>
@@ -511,9 +682,9 @@ export default function TutorialMode({ onUseTranscript, onOpenReview }: { onUseT
           </div>
           {tapTarget !== null && <p className="notice warn" role="status">Tap the object you meant on the video above to re-track it.</p>}
           <div className="row" role="group" aria-label="Guide sections" style={{ margin: "10px 0" }}>
-            {(["guide", "transcript", "objects", "pipeline"] as const).map((t) => (
-              <button key={t} className={`btn small ${tab === t ? "" : "secondary"}`} aria-pressed={tab === t} onClick={() => { setTab(t); if (t === "pipeline") void loadPipeline(); if (t === "guide") void loadSnapshots(); }}>
-                {t === "guide" ? "Guide" : t === "transcript" ? "Transcript" : t === "objects" ? `Objects (${job.objects.length})` : "Pipeline"}
+            {(["guide", "transcript", "objects", "pipeline", "visuals"] as const).map((t) => (
+              <button key={t} className={`btn small ${tab === t ? "" : "secondary"}`} aria-pressed={tab === t} onClick={() => { setTab(t); if (t === "pipeline") void loadPipeline(); if (t === "guide") void loadSnapshots(); if (t === "visuals") void loadVisuals(); }}>
+                {t === "guide" ? "Guide" : t === "transcript" ? "Transcript" : t === "objects" ? `Objects (${job.objects.length})` : t === "pipeline" ? "Pipeline" : "Visuals"}
               </button>
             ))}
             <button className="btn small secondary" onClick={async () => { try { await navigator.clipboard.writeText(job.guide_markdown); setStatus("Guide Markdown copied."); } catch { setStatus("Copy failed in this browser — use Download .md."); } }}>Copy Markdown</button>
@@ -544,6 +715,23 @@ export default function TutorialMode({ onUseTranscript, onOpenReview }: { onUseT
 
           {tab === "guide" && (
             <div>
+              <GuideFormatBanner job={job} onPick={() => setShowFormatPicker(true)} />
+              {showFormatPicker && (
+                <GuideFormatSelector tutorialId={job.id} token={job.access_token} current={job.guide_format || ""}
+                  onGenerated={(sid) => { setShowFormatPicker(false); void openSnapshot(sid); void loadSnapshots(); void (async () => { try { const j = await getJob(job.id, job.access_token); setJob(j); } catch { /* keep current */ } })(); }}
+                  onChanged={() => { void loadPast(); }} />
+              )}
+              <VersionHistory snaps={snaps} currentMarkdown={job.guide_markdown} compareId={compareId} compareMd={compareMd}
+                resolveImage={resolveMdImage}
+                onView={(id) => void openSnapshot(id)} onCompare={(id: string | null) => { if (id) void openCompare(id); else { setCompareId(null); setCompareMd(""); } }} onCloseCompare={() => { setCompareId(null); setCompareMd(""); }} />
+              {job.guide_format === "interactive" && (
+                <div className="notice info" role="status" style={{ marginBottom: 10 }}>
+                  This guide is presented for <strong>interactive guided execution</strong> — one step at a time with recorded outcomes.
+                  {job.draft_version_id && onOpenReview
+                    ? <div className="row" style={{ marginTop: 8 }}><button className="btn small" onClick={() => onOpenReview(job.draft_version_id!)}>Review &amp; approve for guided execution</button></div>
+                    : <span> Approve its Review draft first — jobs always run the exact approved revision.</span>}
+                </div>
+              )}
               {job.draft_version_id ? (
                 <div className="notice ok" role="status">
                   This tutorial created Review draft v{job.draft_version_id.slice(0, 8)} — it persists in the Review queue even if the tutorial is deleted.
@@ -668,6 +856,55 @@ export default function TutorialMode({ onUseTranscript, onOpenReview }: { onUseT
               {snapId && (
                 <div className="card"><h4>Snapshot {snapId.slice(0, 8)}…</h4><Markdown text={snapMd} resolveImage={resolveMdImage} /></div>
               )}
+            </div>
+          )}
+
+          {tab === "visuals" && job && (
+            <div>
+              <div className="card">
+                <h3 style={{ marginTop: 0 }}>Visual sources</h3>
+                <p className="muted small-text">Pick any source image to work on. Object overlays come from SAM segmentation; accepted visuals can be reused as sources. Nothing here overwrites the originals.</p>
+                {job.objects.filter((o) => o.overlay || o.illustration).map((o) => (
+                  <div key={o.obj_id} className="row" style={{ marginBottom: 6 }}>
+                    {o.overlay && <img src={imgUrl(o.overlay)} alt={`${o.label} overlay`} style={{ width: 72, borderRadius: 8 }} />}
+                    <div style={{ flex: "1 1 auto" }}>
+                      <strong>{o.label}</strong> <span className={`tag ${o.status === "ok" ? "approved" : o.status === "needs_tap" ? "warn" : ""}`}>{o.status}</span>
+                    </div>
+                    {o.overlay && <button className="btn small secondary" aria-pressed={visualSource?.id === `obj-${o.obj_id}-overlay`} onClick={() => setVisualSource({ id: `obj-${o.obj_id}-overlay`, label: `${o.label} overlay`, imageUrl: imgUrl(o.overlay), kind: "segmentation", source: { kind: "illustration", name: o.overlay } })}>Use overlay</button>}
+                    {o.illustration && <button className="btn small secondary" aria-pressed={visualSource?.id === `obj-${o.obj_id}-cutout`} onClick={() => setVisualSource({ id: `obj-${o.obj_id}-cutout`, label: `${o.label} cutout`, imageUrl: imgUrl(o.illustration), kind: "segmentation", source: { kind: "illustration", name: o.illustration } })}>Use cutout</button>}
+                  </div>
+                ))}
+                {job.objects.every((o) => !o.overlay && !o.illustration) && <p className="muted">No segmented illustrations yet — they appear after processing finds objects.</p>}
+              </div>
+              <VisualStudio tutorialId={job.id} token={job.access_token} sourceAsset={visualSource}
+                references={visuals.map((v) => ({ id: v.id, label: (v.instruction || v.kind).slice(0, 80) }))}
+                onChanged={() => void loadVisuals()} />
+              <div className="card">
+                <h3 style={{ marginTop: 0 }}>Visual assets ({visuals.length})</h3>
+                <p className="muted small-text">Every improve / alternative / annotation is a separate asset with provenance. Only accepted assets can attach to guide steps.</p>
+                {visuals.length === 0 && <p className="muted">No visual assets yet — select a source above and create one.</p>}
+                {visuals.map((a) => (
+                  <div key={a.id} className="card" style={{ marginBottom: 8 }}>
+                    <div className="row" style={{ alignItems: "flex-start" }}>
+                      {a.mime_type === "image/svg+xml"
+                        ? <div className="overlay-wrap" style={{ width: 120 }}><img src={visualFileUrl(a, job.access_token)} alt={a.instruction || "Annotation overlay"} style={{ width: "100%", borderRadius: 8 }} /></div>
+                        : <img src={a.image_url ? visualFileUrl(a, job.access_token) : ""} alt={a.instruction || a.kind} style={{ width: 120, borderRadius: 8 }} />}
+                      <div style={{ flex: "1 1 auto" }}>
+                        <span className={`tag ${a.kind === "illustrative_alternative" ? "warn" : a.kind === "annotation" ? "ai" : ""}`}>{a.kind.replace(/_/g, " ")}</span>{" "}
+                        <span className={`tag ${a.status === "accepted" ? "approved" : ""}`}>{a.status}</span>
+                        {a.model && <span className="muted small-text"> · {a.model}</span>}
+                        {a.instruction && <p className="small-text" style={{ margin: "4px 0" }}>{a.instruction}</p>}
+                        {typeof (a.provenance as { warning?: unknown }).warning === "string" && <p className="muted small-text" style={{ margin: 0 }}>{String((a.provenance as { warning?: unknown }).warning)}</p>}
+                        <div className="row" style={{ marginTop: 6 }}>
+                          <button className="btn small secondary" aria-pressed={visualSource?.id === a.id} onClick={() => a.image_url && setVisualSource({ id: a.id, label: a.instruction || a.kind, imageUrl: visualFileUrl(a, job.access_token), kind: a.kind, source: { kind: "asset", id: a.id } })}>Use as source</button>
+                          <button className="btn small" disabled={a.status === "accepted"} onClick={async () => { try { await acceptVisual(a.id, {}); setVisualSource((s) => s); void loadVisuals(); } catch (e) { setStatus(e instanceof Error ? e.message : "Accept failed"); } }}>{a.status === "accepted" ? "Accepted" : "Accept"}</button>
+                          <button className="btn small secondary" disabled={a.status !== "review"} onClick={async () => { try { await rejectVisual(a.id); void loadVisuals(); } catch (e) { setStatus(e instanceof Error ? e.message : "Reject failed"); } }}>Reject</button>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+              </div>
             </div>
           )}
         </div>

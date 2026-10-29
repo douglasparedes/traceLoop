@@ -39,7 +39,7 @@ def _patch_pipeline(monkeypatch):
                                              "image_size": [320, 240], "confidence": 0.9, "mask": None}]}],
         "simulated": False, "status": "ok"})
     monkeypatch.setattr(tutorial, "make_illustrations", _fake_illustrations)
-    monkeypatch.setattr(ai, "generate_guide", lambda title, steps, objects, segs: {
+    monkeypatch.setattr(ai, "generate_guide", lambda title, steps, objects, segs, guide_format="work_instruction", **kw: {
         "guide_markdown": "# Guide\n\n## Steps\n\n### 1. Show the flag (0s-8s)", "materials": ["flag"], "simulated": False})
 
 
@@ -174,3 +174,54 @@ def test_tutorial_upload_validation_and_hash_cache(monkeypatch):
     assert done["status"] == "done"
     up2 = c.post("/api/tutorial/start", files={"file": ("tut2.mp4", b"same-bytes-123", "video/mp4")}, headers=TECH).json()
     assert up2["id"] == up1["id"] and up2.get("cached") is True
+
+
+def _make_fixture_video(path, with_audio: bool):
+    import subprocess
+    ff = tutorial._ffmpeg()
+    if with_audio:
+        cmd = [ff, "-y", "-f", "lavfi", "-i", "color=c=black:s=64x64:r=10:d=1",
+               "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+               "-c:v", "mpeg4", "-c:a", "aac", "-shortest", str(path)]
+    else:
+        cmd = [ff, "-y", "-f", "lavfi", "-i", "color=c=black:s=64x64:r=10:d=1",
+               "-c:v", "mpeg4", "-an", str(path)]
+    r = subprocess.run(cmd, capture_output=True, timeout=60)
+    assert r.returncode == 0, r.stderr.decode("utf-8", "replace")[-300:]
+
+
+def test_probe_detects_audio_presence(tmp_path):
+    silent = tmp_path / "silent.mp4"
+    toned = tmp_path / "toned.mp4"
+    _make_fixture_video(silent, with_audio=False)
+    _make_fixture_video(toned, with_audio=True)
+    ps, pt = tutorial.probe_video(silent), tutorial.probe_video(toned)
+    assert ps["duration"] > 0 and ps["has_audio"] is False
+    assert pt["duration"] > 0 and pt["has_audio"] is True
+
+
+def test_extract_audio_rejects_silent_video(tmp_path):
+    import pytest
+    silent = tmp_path / "silent.mp4"
+    toned = tmp_path / "toned.mp4"
+    _make_fixture_video(silent, with_audio=False)
+    _make_fixture_video(toned, with_audio=True)
+    with pytest.raises(tutorial.NoAudioTrackError, match="no audio track"):
+        tutorial.extract_audio_wav(silent, tmp_path / "silent.wav")
+    out = tmp_path / "tone.wav"
+    tutorial.extract_audio_wav(toned, out)
+    assert out.stat().st_size > 0
+
+
+def test_pipeline_fails_fast_on_silent_video(tmp_path):
+    # No pipeline mocks: the real probe finds no audio stream, so the job
+    # must fail with an actionable message (retrying can never succeed).
+    silent = tmp_path / "silent.mp4"
+    _make_fixture_video(silent, with_audio=False)
+    up = c.post("/api/tutorial/start", files={"file": ("silent.mp4", silent.read_bytes(), "video/mp4")},
+                data={"title": "Silent test"}, headers=TECH)
+    assert up.status_code == 200
+    job = up.json()
+    done = _wait_done(job["id"], job["access_token"])
+    assert done["status"] == "error", done
+    assert "no audio track" in (done.get("error") or "").lower()

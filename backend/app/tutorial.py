@@ -57,6 +57,13 @@ def _run(args: list[str], timeout: int = 300) -> subprocess.CompletedProcess:
     return subprocess.run(args, capture_output=True, timeout=timeout)
 
 
+class NoAudioTrackError(RuntimeError):
+    """The uploaded video carries no audio stream — there is nothing to transcribe."""
+
+
+_AUDIO_STREAM_RE = re.compile(r"Stream #\d+:\d+.*Audio:", re.S)
+
+
 def probe_video(path: Path) -> dict:
     proc = _run([_ffmpeg(), "-i", str(path)], timeout=60)
     err = proc.stderr.decode("utf-8", "replace")
@@ -68,13 +75,33 @@ def probe_video(path: Path) -> dict:
     vm = re.search(r"Video:.*?(\d{2,5})x(\d{2,5})", err)
     if vm:
         w, h = int(vm.group(1)), int(vm.group(2))
-    return {"duration": dur, "width": w, "height": h}
+    return {"duration": dur, "width": w, "height": h,
+            "has_audio": bool(_AUDIO_STREAM_RE.search(err))}
+
+
+def _ffmpeg_tail(proc: subprocess.CompletedProcess, limit: int = 400) -> str:
+    try:
+        err = proc.stderr.decode("utf-8", "replace")
+    except Exception:
+        err = ""
+    lines = [ln.strip() for ln in err.strip().splitlines() if ln.strip()]
+    return " ".join(lines[-4:])[-limit:]
 
 
 def extract_audio_wav(source: Path, out: Path) -> None:
     proc = _run([_ffmpeg(), "-y", "-i", str(source), "-vn", "-ac", "1", "-ar", "24000", "-c:a", "pcm_s16le", str(out)])
-    if proc.returncode != 0 or not out.exists():
-        raise RuntimeError("Could not extract an audio track from the video")
+    if proc.returncode == 0 and out.exists() and out.stat().st_size > 0:
+        return
+    tail = _ffmpeg_tail(proc)
+    if ("matches no streams" in tail or "does not contain any stream" in tail
+            or "Stream map" in tail and "matches no streams" in tail):
+        raise NoAudioTrackError(
+            "This video has no audio track, so there is nothing to transcribe. "
+            "Record again with the microphone on and narrate each step as you show it.")
+    raise RuntimeError(
+        "Could not read the audio track in this video"
+        + (f" (ffmpeg: {tail})" if tail else "")
+        + ". Try recording again, or convert the file to MP4 with AAC audio.")
 
 
 def make_tracking_copy(source: Path, out: Path, max_width: int = TRACKING_MAX_WIDTH) -> dict:
@@ -304,6 +331,119 @@ def _segment_object(job_dir: Path, source: Path, tracking: Path, file_id: str, o
     return out
 
 
+GUIDE_FORMATS: dict[str, dict[str, str]] = {
+    "work_instruction": {
+        "name": "Illustrated Work Instruction",
+        "tagline": "Visual, numbered instructions with relevant images and concise actions.",
+        "best_for": "Technicians who need to understand and perform a task without reading a long manual.",
+    },
+    "reference_manual": {
+        "name": "Reference Manual",
+        "tagline": "A structured technical reference with sections, diagrams, source material, and supporting details.",
+        "best_for": "Finding information, understanding context, and returning to specific sections later.",
+    },
+    "interactive": {
+        "name": "Interactive Guided Execution",
+        "tagline": "A step-by-step workflow for completing the task and recording outcomes in the field.",
+        "best_for": "Field execution with minimal distractions, large touch targets, and recorded outcomes.",
+    },
+}
+
+FORMAT_STRUCTURE_HINTS = {
+    "work_instruction": (
+        "Structure: # title, a 2-3 sentence task objective, ## Before you start (prerequisites + tools), "
+        "## Safety only if the transcript supports it, ## Steps with one ### per step including its time range like (0:45-1:10) "
+        "and 2-4 imperative sentences starting with a verb, each step ending with an 'Expected:' verification line where supported, "
+        "## If something goes wrong only if supported. Never invent tools, values, warnings, or steps."
+    ),
+    "reference_manual": (
+        "Structure: # title plus scope, ## Equipment (only if identifiable from input, else omit), "
+        "## Prerequisites, ## Tools and materials (only items named in the input), ## Safety (only transcript-supported notes), "
+        "## Procedure overview (2-3 sentences), ## Numbered procedure (same ### per step with time ranges), "
+        "## Expected outcomes (only supported checkpoints), ## Troubleshooting (only supported), "
+        "## Sources (transcript ranges and objects used). Never invent torque, ratings, measurements, model identities, "
+        "or specifications; omit unsupported sections entirely."
+    ),
+    "interactive": (
+        "Structure: # title, one-line objective, ## Before you start (prerequisites + tools only if in input), "
+        "## Steps with one ### per step including its time range, each step exactly: one imperative instruction paragraph, "
+        "then an 'Expected:' line only if verifiable from input, then a 'Watch for:' safety line only if transcript-supported. "
+        "Keep each step self-contained for field execution. Never invent checks, values, or warnings."
+    ),
+}
+
+
+def recommend_format(job: M.TutorialJob) -> dict:
+    """Deterministic default-format recommendation from actual source data.
+
+    Returns {format, rationale, scores}. No LLM call: the inputs are counts
+    the pipeline already measured, so the choice is explainable and stable.
+    """
+    steps = job.steps or []
+    objects = job.objects or []
+    segments = job.timed_segments or []
+    text_len = len(job.full_transcript or "")
+    n_steps = len(steps)
+    n_objects = len(objects)
+    n_illustrated = sum(1 for o in objects if o.get("illustration") or o.get("overlay"))
+    n_verified = sum(1 for o in objects if o.get("status") == "ok")
+    expected_hits = sum(1 for s in steps if (s.get("summary") or "").strip())
+    has_times = sum(1 for s in steps if s.get("start") is not None and s.get("end") is not None)
+    reasons: list[str] = []
+    scores = {
+        "work_instruction": 0,
+        "reference_manual": 0,
+        "interactive": 0,
+    }
+    if n_steps >= 2:
+        scores["work_instruction"] += 2
+        scores["interactive"] += 2
+        reasons.append(f"{n_steps} distinct steps")
+    if n_illustrated > 0:
+        scores["work_instruction"] += 2
+        scores["interactive"] += 1
+        reasons.append(f"{n_illustrated} illustrated object(s)")
+    if n_verified > 0:
+        scores["work_instruction"] += 1
+    if text_len >= 200 or len(segments) >= 3:
+        scores["reference_manual"] += 2
+        reasons.append("rich transcript for context sections")
+    if expected_hits == n_steps and n_steps > 0:
+        scores["interactive"] += 1
+        scores["reference_manual"] += 1
+        reasons.append("every step has a verifiable outcome")
+    if has_times == n_steps and n_steps > 0:
+        scores["interactive"] += 1
+        reasons.append("all steps timestamped for execution order")
+    if (job.materials or []):
+        scores["reference_manual"] += 1
+        reasons.append("materials list available")
+    if not steps:
+        return {"format": "reference_manual",
+                "rationale": "No structured steps were detected; a reference-style document preserves the transcript without inventing a procedure.",
+                "scores": scores}
+    best = max(scores, key=lambda k: scores[k])
+    if best == "work_instruction":
+        why = "the tutorial contains clear sequential actions" + (f" with {n_illustrated} illustrated object(s)" if n_illustrated else "")
+    elif best == "interactive":
+        why = "steps are sequential and timestamped for field execution"
+    else:
+        why = "the source is richest in explanatory context"
+    if reasons:
+        why += " (" + "; ".join(reasons[:3]) + ")"
+    return {"format": best, "rationale": f"Recommended because {why}.", "scores": scores}
+
+
+def _format_for_job(job: M.TutorialJob) -> tuple[str, str, str]:
+    """Effective (format, source, rationale): explicit user choice wins."""
+    if job.guide_format in GUIDE_FORMATS:
+        src = job.format_source or "user"
+        why = job.format_rationale or "Selected explicitly; kept as-is."
+        return job.guide_format, src, why
+    rec = recommend_format(job)
+    return rec["format"], "recommended", rec["rationale"]
+
+
 def _track_stats(frames: list[dict]) -> dict:
     """Coverage diagnostics for one SAM result: how many frames carried a match."""
     seen = len(frames or [])
@@ -363,7 +503,7 @@ def _hirez_retry(job_dir: Path, source: Path, obj: dict, prompt: str,
 
 def _ensure_review_draft(db, job: M.TutorialJob, steps: list, objects: list, md: str,
                          materials: list, model: str = "", simulated: bool = True,
-                         actor: str = "") -> M.ProcedureVersion | None:
+                         actor: str = "", snapshot_id: str = "") -> M.ProcedureVersion | None:
     """Create (once) the persistent Review-queue draft linked to a tutorial.
 
     Idempotent on job.draft_version_id: re-running never duplicates the draft.
@@ -379,22 +519,29 @@ def _ensure_review_draft(db, job: M.TutorialJob, steps: list, objects: list, md:
     with proc.timed() as t:
         proc_obj = {int(o.get("obj_id", 0)): o for o in (objects or [])}
         ev_by_obj: dict[int, list[str]] = {}
+        overlay_by_obj: dict[int, list[str]] = {}
         for o in (objects or []):
-            files = [f for f in [o.get("overlay"), o.get("illustration")] if f]
-            if not files:
-                continue
-            first = files[0]
-            path = BASE / "data" / "tutorials" / job.id / first
-            if not path.is_file():
-                continue
-            e = M.Evidence(capture_session_id=None, evidence_type="image",
-                           storage_key=f"data/tutorials/{job.id}/{first}",
-                           description=f"Tutorial illustration: {o.get('label', 'object')}",
-                           source_reference=f"tutorial:{job.id}", created_by=actor or job.actor,
-                           extra={"tutorial_id": job.id, "obj_id": o.get("obj_id")})
-            db.add(e)
-            db.flush()
-            ev_by_obj[int(o.get("obj_id", 0))] = [e.id]
+            # Link BOTH the annotated overlay (display) and the isolated cutout
+            # (source detail) as evidence; visual_refs carries the overlay as
+            # the primary presentation image, evidence_refs carries everything.
+            oid = int(o.get("obj_id", 0))
+            names = [("overlay", o.get("overlay")), ("cutout", o.get("illustration"))]
+            for kind, name in names:
+                if not name:
+                    continue
+                path = BASE / "data" / "tutorials" / job.id / name
+                if not path.is_file():
+                    continue
+                e = M.Evidence(capture_session_id=None, evidence_type="image",
+                               storage_key=f"data/tutorials/{job.id}/{name}",
+                               description=f"Tutorial illustration ({kind}): {o.get('label', 'object')}",
+                               source_reference=f"tutorial:{job.id}", created_by=actor or job.actor,
+                               extra={"tutorial_id": job.id, "obj_id": o.get("obj_id"), "kind": kind})
+                db.add(e)
+                db.flush()
+                ev_by_obj.setdefault(oid, []).append(e.id)
+                if kind == "overlay":
+                    overlay_by_obj.setdefault(oid, []).append(e.id)
         procedure = M.Procedure(title=f"{job.title} (tutorial)", asset_type="training-assembly",
                           created_by=actor or job.actor)
         db.add(procedure)
@@ -405,6 +552,9 @@ def _ensure_review_draft(db, job: M.TutorialJob, steps: list, objects: list, md:
             prerequisites="", ai_model=model or "tutorial-pipeline",
             ai_simulated=1 if simulated else 0, created_by=actor or job.actor,
             source_evidence={"tutorial_id": job.id,
+                             "guide_format": job.guide_format or "",
+                             "format_source": job.format_source or "",
+                             "guide_snapshot_id": snapshot_id,
                              "transcript_chars": len(job.full_transcript or ""),
                              "segments": len(job.timed_segments or []),
                              "objects": [{"obj_id": o.get("obj_id"), "label": o.get("label"),
@@ -414,14 +564,25 @@ def _ensure_review_draft(db, job: M.TutorialJob, steps: list, objects: list, md:
         for s in (steps or []):
             used = [int(x) for x in (s.get("objects_used") or []) if isinstance(x, int) or (isinstance(x, str) and x.isdigit())]
             refs: list[str] = []
+            visuals: list[str] = []
             for oid in used:
                 refs.extend(ev_by_obj.get(int(oid), []))
+                visuals.extend(overlay_by_obj.get(int(oid), []))
+            try:
+                start_sec = float(s.get("start")) if s.get("start") is not None else None
+            except (TypeError, ValueError):
+                start_sec = None
+            try:
+                end_sec = float(s.get("end")) if s.get("end") is not None else None
+            except (TypeError, ValueError):
+                end_sec = None
             db.add(M.ProcedureStep(
                 procedure_version_id=ver.id, step_order=int(s.get("step_number", 1)),
                 title=str(s.get("title", "")) or f"Step {s.get('step_number', 1)}",
                 instruction=str(s.get("summary", "")),
                 expected_result="", required_tools=[],
-                evidence_refs=refs, visual_refs=list(refs),
+                evidence_refs=refs, visual_refs=visuals,
+                start_sec=start_sec, end_sec=end_sec,
                 verification_notes="From tutorial narration; verify against source video."))
         db.flush()
         job.draft_procedure_id = procedure.id
@@ -455,18 +616,22 @@ def _diagnostic_frame(job_dir: Path, source: Path, obj: dict) -> str | None:
 
 
 def snapshot_guide(db, job: M.TutorialJob, trigger: str, md: str, objects: list | None,
-                   model: str = "", simulated: bool = True, materials: list | None = None) -> M.GuideSnapshot:
+                   model: str = "", simulated: bool = True, materials: list | None = None,
+                   guide_format: str = "", format_source: str = "", format_rationale: str = "") -> M.GuideSnapshot:
     """Persist an immutable record of one guide generation.
 
     The live guide_markdown on TutorialJob keeps moving (refreshes, tap
     corrections); snapshots preserve what each generation produced, with
-    which models, from which objects, and why.
+    which models, from which objects, in which format, and why.
     """
     import hashlib as _hashlib
     snap = M.GuideSnapshot(
         tutorial_id=job.id, trigger=trigger, model=model, simulated=bool(simulated),
         guide_markdown=md or "", guide_hash=_hashlib.sha256((md or "").encode("utf-8")).hexdigest(),
         materials=list(materials or []),
+        guide_format=guide_format or getattr(job, "guide_format", "") or "",
+        format_source=format_source or getattr(job, "format_source", "") or "",
+        format_rationale=format_rationale or getattr(job, "format_rationale", ""),
         object_statuses=[{"obj_id": o.get("obj_id"), "label": o.get("label"),
                           "status": o.get("status"), "confidence": o.get("confidence")}
                          for o in (objects or [])])
@@ -497,11 +662,32 @@ def run_job(job_id: str) -> None:
                 raise RuntimeError("Could not read the uploaded video (unsupported format?)")
             if info["duration"] > MAX_VIDEO_SEC + 5:
                 raise RuntimeError(f"Video is {info['duration']:.0f}s — tutorials are limited to {MAX_VIDEO_SEC}s (10 minutes)")
+            if not info.get("has_audio", True):
+                # Fail fast with an actionable message: retrying a silent video
+                # can never succeed, and transcribing silence is not an option.
+                proc.safe_record(db, "tutorial", job_id, "extract_audio", "failed",
+                                 operation="extract_audio_wav", duration_ms=0, actor=actor,
+                                 summary={"has_audio": False,
+                                          "note": "probe found no audio stream; failing before transcription"})
+                raise NoAudioTrackError(
+                    "This video has no audio track, so there is nothing to transcribe. "
+                    "Record again with the microphone on and narrate each step as you show it.")
             _set(db, job, duration_sec=info["duration"], width=info["width"], height=info["height"], progress=8)
 
             _set(db, job, status="transcribing", progress=12)
             wav = job_dir / "audio.wav"
-            extract_audio_wav(source, wav)
+            try:
+                extract_audio_wav(source, wav)
+            except NoAudioTrackError:
+                proc.safe_record(db, "tutorial", job_id, "extract_audio", "failed",
+                                 operation="extract_audio_wav", duration_ms=0, actor=actor,
+                                 summary={"has_audio": False})
+                raise
+            except RuntimeError as ee:
+                proc.safe_record(db, "tutorial", job_id, "extract_audio", "failed",
+                                 operation="extract_audio_wav", duration_ms=0, actor=actor,
+                                 summary={"error_type": "RuntimeError", "ffmpeg": str(ee)[-300:]})
+                raise
             with proc.timed() as t:
                 tr = ai.transcribe_timed("audio.wav", wav.read_bytes(), duration_sec=info["duration"])
             proc.safe_record(
@@ -530,8 +716,10 @@ def run_job(job_id: str) -> None:
             _set(db, job, objects=objects, steps=steps, progress=45)
             if not objects:
                 _set(db, job, status="generating", progress=90)
+                fmt, fsrc, why = _format_for_job(job)
+                _set(db, job, guide_format=fmt, format_source=fsrc, format_rationale=why)
                 with proc.timed() as t:
-                    guide = ai.generate_guide(job.title, steps, objects, tr["segments"])
+                    guide = ai.generate_guide(job.title, steps, objects, tr["segments"], guide_format=fmt)
                 md = guide.get("guide_markdown") or ai.fallback_guide_markdown(job.title, steps, objects)
                 md = inject_illustrations(md, steps, objects)
                 proc.safe_record(db, "tutorial", job_id, "guide", "simulated" if guide.get("simulated") else "succeeded",
@@ -539,13 +727,14 @@ def run_job(job_id: str) -> None:
                                  duration_ms=t.ms, actor=actor,
                                  summary={"markdown_chars": len(md), "materials": len(guide.get("materials", [])),
                                           "note": guide.get("note", "")})
-                snapshot_guide(db, job, "initial", md, objects, model=guide.get("model", ""),
-                               simulated=bool(guide.get("simulated", True)), materials=guide.get("materials", []))
+                snapshot = snapshot_guide(db, job, "initial", md, objects, model=guide.get("model", ""),
+                                            simulated=bool(guide.get("simulated", True)), materials=guide.get("materials", []),
+                                            guide_format=fmt, format_source=fsrc, format_rationale=why)
                 db.commit()
                 try:
                     _ensure_review_draft(db, job, steps, objects, md, guide.get("materials", []),
                                          model=guide.get("model", ""), simulated=bool(guide.get("simulated", True)),
-                                         actor=actor)
+                                         actor=actor, snapshot_id=snapshot.id)
                 except Exception as de:
                     proc.safe_record(db, "tutorial", job_id, "draft", "failed",
                                      operation="ensure_review_draft", duration_ms=0, actor=actor,
@@ -590,25 +779,29 @@ def run_job(job_id: str) -> None:
                 ai.delete_video_file(file_id)
 
             _set(db, job, status="generating", progress=88, objects=done_objects)
+            fmt, fsrc, why = _format_for_job(job)
+            _set(db, job, guide_format=fmt, format_source=fsrc, format_rationale=why)
             with proc.timed() as t:
-                guide = ai.generate_guide(job.title, steps, done_objects, tr["segments"])
+                guide = ai.generate_guide(job.title, steps, done_objects, tr["segments"], guide_format=fmt)
             md = guide.get("guide_markdown") or ai.fallback_guide_markdown(job.title, steps, done_objects)
             md = inject_illustrations(md, steps, done_objects)
             proc.safe_record(db, "tutorial", job_id, "guide", "simulated" if guide.get("simulated") else "succeeded",
                              operation="generate_guide", provider="meta", model=guide.get("model", ""),
                              duration_ms=t.ms, actor=actor,
-                             summary={"markdown_chars": len(md), "materials": len(guide.get("materials", [])),
+                             summary={"format": fmt, "format_source": fsrc,
+                                      "markdown_chars": len(md), "materials": len(guide.get("materials", [])),
                                       "ok_objects": sum(1 for o in done_objects if o.get("status") == "ok"),
                                       "needs_tap": sum(1 for o in done_objects if o.get("status") == "needs_tap"),
                                       "note": guide.get("note", "")})
-            snapshot_guide(db, job, "initial", md, done_objects, model=guide.get("model", ""),
-                           simulated=bool(guide.get("simulated", True)), materials=guide.get("materials", []))
+            snapshot = snapshot_guide(db, job, "initial", md, done_objects, model=guide.get("model", ""),
+                                        simulated=bool(guide.get("simulated", True)), materials=guide.get("materials", []),
+                                        guide_format=fmt, format_source=fsrc, format_rationale=why)
             db.commit()
             try:
                 _ensure_review_draft(db, job, steps, done_objects, md,
                                      guide.get("materials", [o["label"] for o in done_objects]),
                                      model=guide.get("model", ""), simulated=bool(guide.get("simulated", True)),
-                                     actor=actor)
+                                     actor=actor, snapshot_id=snapshot.id)
             except Exception as de:
                 proc.safe_record(db, "tutorial", job_id, "draft", "failed",
                                  operation="ensure_review_draft", duration_ms=0, actor=actor,
@@ -666,6 +859,13 @@ def resegment_object_tap(job_id: str, obj_id: int, nx: float, ny: float) -> dict
             updated["note"] = "Corrected from your tap."
         objects = [updated if int(o.get("obj_id", 0)) == obj_id else o for o in objects]
         _set(db, job, objects=objects)
+        try:
+            snapshot_guide(db, job, "tap", job.guide_markdown or "", objects,
+                           model=ai.SAM_MODEL, simulated=bool(updated.get("simulated", True)),
+                           materials=job.materials or [])
+            db.commit()
+        except Exception:
+            db.rollback()
         proc.safe_record(db, "tutorial", job_id, "tap", updated.get("status", "corrected"),
                          operation="tap_correction", provider="meta", model=ai.SAM_MODEL,
                          duration_ms=timer.ms, actor=job.actor or "",

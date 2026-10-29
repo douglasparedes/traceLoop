@@ -21,6 +21,11 @@ TECH = {"X-User": "tech-1", "X-Role": "technician"}
 OTHER = {"X-User": "other-1", "X-Role": "technician"}
 
 
+import base64 as _b64mod
+
+_TINY_PNG = _b64mod.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
+
+
 @pytest.fixture(autouse=True)
 def _patch(monkeypatch):
     monkeypatch.setattr(tutorial, "probe_video", lambda p: {"duration": 30.0, "width": 320, "height": 240})
@@ -41,11 +46,11 @@ def _patch(monkeypatch):
                                              "confidence": 0.9, "mask": None}]}],
         "simulated": False, "status": "ok"})
     def _fake_illu(job_dir, source, obj, best):
-        (job_dir / "obj-1.png").write_bytes(b"\x89PNG\r\n\x1a\nfakepng")
-        (job_dir / "obj-1-overlay.png").write_bytes(b"\x89PNG\r\n\x1a\nfakepng")
+        (job_dir / "obj-1.png").write_bytes(_TINY_PNG)
+        (job_dir / "obj-1-overlay.png").write_bytes(_TINY_PNG)
         return {"illustration": "obj-1.png", "overlay": "obj-1-overlay.png"}
     monkeypatch.setattr(tutorial, "make_illustrations", _fake_illu)
-    monkeypatch.setattr(ai, "generate_guide", lambda title, steps, objects, segs: {
+    monkeypatch.setattr(ai, "generate_guide", lambda title, steps, objects, segs, guide_format="work_instruction", **kw: {
         "guide_markdown": "# Guide\n\n## Steps\n\n### 1. Show the flag (0s-8s)", "materials": ["flag"], "simulated": False})
 
 
@@ -154,7 +159,8 @@ def test_auto_draft_created_and_idempotent(monkeypatch):
 
 
 def test_draft_endpoint_rejects_unfinished(monkeypatch):
-    _patch_pipeline = None
+    # No background thread: the job deterministically stays "uploaded".
+    monkeypatch.setattr(tutorial, "start_job", lambda job_id: None)
     up = c.post("/api/tutorial/start", files={"file": ("unfin.mp4", b"unfin-1", "video/mp4")}, headers=TECH).json()
     hdr = {**TECH, "X-Tutorial-Token": up["access_token"]}
     r = c.post(f"/api/tutorial/{up['id']}/draft", headers=hdr)
