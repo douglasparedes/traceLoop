@@ -33,12 +33,15 @@ worker and `/api` calls share one scope. No CORS or separate frontend service.
    service worker and security cards should be green. The repo already ships:
    192/512 `any` + maskable icons, `screenshots` (narrow + wide, real captures),
    `categories`, `display_override`, precached app shell. The service worker
-   (`public/sw.js`, v4) also runtime-caches evidence/reference images and
+   (`public/sw.js`, v5) also runtime-caches evidence/reference images and
    tutorial/live videos (cache-first, ~120-entry cap, token URLs normalized),
-   while `/api/*` JSON stays network-only — app data syncs via IndexedDB, so a
-   stale cached response could never corrupt it. SW updates are user-approved:
-   a waiting worker shows an "App update ready" toast and only activates on
-   Reload, never mid-job.
+   uses navigation preload for faster online navigations, and serves the
+   offline-capable app shell for failed navigations — while `/api/*` JSON stays
+   network-only: app data syncs via IndexedDB, so a stale cached response could
+   never corrupt it. `sw.js` is served with `Cache-Control: no-store` so edge
+   caches (e.g. Cloudflare) can never pin an old worker version. SW updates are
+   user-approved: a waiting worker shows an "App update ready" toast and only
+   activates on Reload, never mid-job.
 3. Install prompt: Chrome desktop (⊕ icon) and Android (“Install app”).
    Smoke test: install → airplane mode → app opens, queued work syncs later.
 
