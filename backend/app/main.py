@@ -25,7 +25,9 @@ with engine.begin() as _conn:
     _insp = _inspect(_conn)
     for _table, _col, _type in (("live_chunks", "transcript", "TEXT DEFAULT ''"), ("live_recordings", "transcript", "TEXT DEFAULT ''"),
                                 ("live_chunks", "start_ms", "INTEGER DEFAULT 0"), ("live_chunks", "end_ms", "INTEGER DEFAULT 0"),
-                                ("live_chunks", "prompt_source", "TEXT DEFAULT ''"), ("live_chunks", "speech_phrase", "TEXT DEFAULT ''")):
+                                ("live_chunks", "prompt_source", "TEXT DEFAULT ''"), ("live_chunks", "speech_phrase", "TEXT DEFAULT ''"),
+                                ("tutorial_jobs", "draft_procedure_id", "VARCHAR DEFAULT ''"),
+                                ("tutorial_jobs", "draft_version_id", "VARCHAR DEFAULT ''")):
         if _insp.has_table(_table) and _col not in {c["name"] for c in _insp.get_columns(_table)}:
             _conn.execute(_text(f"ALTER TABLE {_table} ADD COLUMN {_col} {_type}"))
 
@@ -390,20 +392,32 @@ def version_evidence(vid: str, db: Session = Depends(get_db)):
     v = db.get(M.ProcedureVersion, vid)
     if not v: raise HTTPException(404, "Version not found")
     cap_id = (v.source_evidence or {}).get("capture_session_id")
+    tut_id = (v.source_evidence or {}).get("tutorial_id")
     items = []
+    seen: set[str] = set()
+
+    def add_item(e):
+        if e.id in seen:
+            return
+        seen.add(e.id)
+        seg_out = None
+        seg = db.scalar(select(M.SegmentationResult).where(M.SegmentationResult.evidence_id == e.id).order_by(M.SegmentationResult.created_at.desc()))
+        if seg is not None:
+            seg_out = {"id": seg.id, "geometry": seg.normalized_geometry, "simulated": bool(seg.simulated),
+                       "status": seg.result_status, "prompt": seg.prompt_text, "model": seg.provider_model}
+        has_file = bool(e.storage_key) and (Path(__file__).resolve().parent.parent / e.storage_key).is_file()
+        items.append({"id": e.id, "evidence_type": e.evidence_type, "description": e.description,
+                      "text_content": e.text_content, "source_reference": e.source_reference,
+                      "image_url": f"/api/evidence/{e.id}/image" if e.evidence_type == "image" and has_file else None,
+                      "segmentation": seg_out})
+
     if cap_id:
         for e in db.scalars(select(M.Evidence).where(M.Evidence.capture_session_id == cap_id)).all():
-            seg_out = None
-            seg = db.scalar(select(M.SegmentationResult).where(M.SegmentationResult.evidence_id == e.id).order_by(M.SegmentationResult.created_at.desc()))
-            if seg is not None:
-                seg_out = {"id": seg.id, "geometry": seg.normalized_geometry, "simulated": bool(seg.simulated),
-                           "status": seg.result_status, "prompt": seg.prompt_text, "model": seg.provider_model}
-            has_file = bool(e.storage_key) and (Path(__file__).resolve().parent.parent / e.storage_key).is_file()
-            items.append({"id": e.id, "evidence_type": e.evidence_type, "description": e.description,
-                          "text_content": e.text_content, "source_reference": e.source_reference,
-                          "image_url": f"/api/evidence/{e.id}/image" if e.evidence_type == "image" and has_file else None,
-                          "segmentation": seg_out})
-    return {"version_id": vid, "capture_session_id": cap_id, "evidence": items}
+            add_item(e)
+    if tut_id:
+        for e in db.scalars(select(M.Evidence).where(M.Evidence.source_reference == f"tutorial:{tut_id}")).all():
+            add_item(e)
+    return {"version_id": vid, "capture_session_id": cap_id, "tutorial_id": tut_id, "evidence": items}
 
 
 @app.get("/api/evidence/{eid}/image")
@@ -592,7 +606,9 @@ def _tutorial_out(job: M.TutorialJob) -> dict:
             "video_url": f"/api/tutorial/{job.id}/video",
             "full_transcript": job.full_transcript, "timed_segments": job.timed_segments or [],
             "objects": job.objects or [], "steps": job.steps or [], "materials": job.materials or [],
-            "guide_markdown": job.guide_markdown, "created_at": job.created_at.isoformat()}
+            "guide_markdown": job.guide_markdown, "created_at": job.created_at.isoformat(),
+            "draft_procedure_id": job.draft_procedure_id or None,
+            "draft_version_id": job.draft_version_id or None}
 
 
 @app.post("/api/tutorial/start")
@@ -628,10 +644,30 @@ async def tutorial_start(file: UploadFile = File(...), title: str = Form(default
 
 
 @app.get("/api/tutorial")
-def list_tutorials(db: Session = Depends(get_db), who=Depends(actor)):
-    jobs = db.scalars(select(M.TutorialJob).where(M.TutorialJob.actor == who["id"]).order_by(M.TutorialJob.created_at.desc()).limit(20)).all()
-    return [{"id": j.id, "title": j.title, "status": j.status, "progress": j.progress, "access_token": j.access_token,
-             "duration_sec": j.duration_sec, "created_at": j.created_at.isoformat()} for j in jobs]
+def list_tutorials(q: str = "", status: str = "", limit: int = 50, offset: int = 0,
+                   include_archived: bool = False, db: Session = Depends(get_db)):
+    """Tutorial library: visible to all demo users (demo identity is not a
+    security boundary), newest first, with search + status filter +
+    pagination so older, failed and unapproved tutorials stay findable."""
+    stmt = select(M.TutorialJob).order_by(M.TutorialJob.created_at.desc())
+    if not include_archived:
+        stmt = stmt.where(M.TutorialJob.status != "archived")
+    if status:
+        stmt = stmt.where(M.TutorialJob.status == status)
+    rows = list(db.scalars(stmt).all())
+    if q:
+        needle = q.strip().lower()
+        rows = [j for j in rows if needle in (j.title or "").lower()]
+    total = len(rows)
+    page = rows[offset:offset + max(1, min(limit, 200))]
+    return {"total": total, "offset": offset,
+            "items": [{"id": j.id, "title": j.title, "status": j.status, "progress": j.progress,
+                       "access_token": j.access_token, "duration_sec": j.duration_sec,
+                       "created_at": j.created_at.isoformat(), "actor": j.actor,
+                       "draft_version_id": j.draft_version_id or None,
+                       "objects_total": len(j.objects or []),
+                       "objects_unresolved": sum(1 for o in (j.objects or []) if o.get("status") in ("needs_tap", "error")),
+                       "has_guide": bool(j.guide_markdown)} for j in page]}
 
 
 @app.get("/api/tutorial/{jid}")
@@ -695,12 +731,158 @@ def tutorial_delete(jid: str, x_tutorial_token: str = Header(default=""), db: Se
 @app.post("/api/tutorial/{jid}/refresh-guide")
 def refresh_guide(jid: str, x_tutorial_token: str = Header(default=""), db: Session = Depends(get_db), who=Depends(actor)):
     """Deterministically re-inject illustration links after tap corrections (no LLM call)."""
+    from . import tutorial as tut
     job = _get_tutorial(db, jid, x_tutorial_token)
     if job.status != "done":
         raise HTTPException(409, "The guide is not finished yet")
     job.guide_markdown = tut.inject_illustrations(job.guide_markdown or "", job.steps or [], job.objects or [])
+    snap = tut.snapshot_guide(db, job, "refresh", job.guide_markdown, job.objects or [],
+                              model="deterministic-inject", simulated=True,
+                              materials=job.materials or [])
     db.commit(); db.refresh(job)
-    return {"ok": True, "guide_markdown": job.guide_markdown}
+    from . import processing as proc
+    proc.safe_record(db, "tutorial", job.id, "guide", "succeeded", operation="refresh_guide",
+                     actor=who["id"], summary={"snapshot_id": snap.id, "markdown_chars": len(job.guide_markdown or "")})
+    return {"ok": True, "guide_markdown": job.guide_markdown, "snapshot_id": snap.id}
+
+
+@app.get("/api/tutorial/{jid}/snapshots")
+def tutorial_snapshots(jid: str, x_tutorial_token: str = Header(default=""), db: Session = Depends(get_db)):
+    """Immutable history of every generated guide for this tutorial."""
+    job = _get_tutorial(db, jid, x_tutorial_token)
+    snaps = db.scalars(select(M.GuideSnapshot).where(M.GuideSnapshot.tutorial_id == job.id).order_by(M.GuideSnapshot.created_at)).all()
+    return {"tutorial_id": job.id,
+            "snapshots": [{"id": s.id, "trigger": s.trigger, "model": s.model, "simulated": bool(s.simulated),
+                           "guide_hash": s.guide_hash, "materials": s.materials or [],
+                           "object_statuses": s.object_statuses or [], "created_at": s.created_at.isoformat(),
+                           "markdown_chars": len(s.guide_markdown or "")} for s in snaps]}
+
+
+@app.get("/api/tutorial/{jid}/snapshots/{sid}")
+def tutorial_snapshot(jid: str, sid: str, x_tutorial_token: str = Header(default=""), db: Session = Depends(get_db)):
+    job = _get_tutorial(db, jid, x_tutorial_token)
+    snap = db.get(M.GuideSnapshot, sid)
+    if not snap or snap.tutorial_id != job.id: raise HTTPException(404, "Guide snapshot not found")
+    return {"id": snap.id, "trigger": snap.trigger, "model": snap.model, "simulated": bool(snap.simulated),
+            "guide_hash": snap.guide_hash, "materials": snap.materials or [],
+            "object_statuses": snap.object_statuses or [], "created_at": snap.created_at.isoformat(),
+            "guide_markdown": snap.guide_markdown}
+
+
+@app.get("/api/tutorial/{jid}/diagnostics")
+def tutorial_diagnostics(jid: str, x_tutorial_token: str = Header(default=""), db: Session = Depends(get_db)):
+    """Machine-readable debug bundle: transcript, object attempts, snapshots, events."""
+    from . import processing as _proc  # noqa: F401 (ensures table mapping import order)
+    job = _get_tutorial(db, jid, x_tutorial_token)
+    snaps = db.scalars(select(M.GuideSnapshot).where(M.GuideSnapshot.tutorial_id == job.id).order_by(M.GuideSnapshot.created_at)).all()
+    evs = db.scalars(select(M.ProcessingEvent).where(M.ProcessingEvent.entity_type == "tutorial",
+                                                     M.ProcessingEvent.entity_id == job.id).order_by(M.ProcessingEvent.created_at)).all()
+    return {"tutorial_id": job.id, "title": job.title, "status": job.status, "progress": job.progress,
+            "error": job.error, "duration_sec": job.duration_sec,
+            "draft_procedure_id": job.draft_procedure_id or None,
+            "draft_version_id": job.draft_version_id or None,
+            "full_transcript": job.full_transcript, "timed_segments": job.timed_segments or [],
+            "objects": job.objects or [], "steps": job.steps or [],
+            "snapshots": [{"id": s.id, "trigger": s.trigger, "model": s.model, "simulated": bool(s.simulated),
+                           "guide_hash": s.guide_hash, "created_at": s.created_at.isoformat()} for s in snaps],
+            "events": [{"id": e.id, "correlation_id": e.correlation_id, "stage": e.stage,
+                        "operation": e.operation, "provider": e.provider, "model": e.model,
+                        "status": e.status, "duration_ms": e.duration_ms, "summary": e.summary or {},
+                        "created_at": e.created_at.isoformat()} for e in evs]}
+
+
+@app.get("/api/tutorial/{jid}/diagnostics/frame/{obj_id}")
+def tutorial_diagnostic_frame(jid: str, obj_id: int, token: str = "", db: Session = Depends(get_db)):
+    """The frame SAM was asked about for an object it could not track."""
+    from fastapi.responses import FileResponse
+    job = _get_tutorial(db, jid, token)
+    obj = next((o for o in (job.objects or []) if int(o.get("obj_id", 0)) == obj_id), None)
+    if obj is None: raise HTTPException(404, "Object not found")
+    names = [n for n in [obj.get("diagnostic_frame")] if n]
+    for n in names:
+        path = Path(__file__).resolve().parent.parent / "data" / "tutorials" / jid / Path(n).name
+        if path.is_file():
+            return FileResponse(path, media_type="image/jpeg", filename=path.name)
+    raise HTTPException(404, "No diagnostic frame recorded for this object")
+
+
+@app.post("/api/tutorial/{jid}/draft")
+def tutorial_ensure_draft(jid: str, x_tutorial_token: str = Header(default=""), db: Session = Depends(get_db), who=Depends(actor)):
+    """Create (or return) the persistent Review-queue draft for a finished tutorial.
+
+    Idempotent: never duplicates. Also serves as retry/backfill for older tutorials.
+    """
+    from . import tutorial as tut
+    from . import processing as proc
+    job = _get_tutorial(db, jid, x_tutorial_token)
+    if job.status != "done":
+        raise HTTPException(409, "The tutorial has not finished processing yet")
+    if job.draft_version_id:
+        existing = db.get(M.ProcedureVersion, job.draft_version_id)
+        if existing is not None:
+            return {"ok": True, "procedure_id": job.draft_procedure_id, "version_id": job.draft_version_id,
+                    "created": False}
+    try:
+        ver = tut._ensure_review_draft(db, job, job.steps or [], job.objects or [],
+                                       job.guide_markdown or "", job.materials or [],
+                                       model="tutorial-pipeline", simulated=True, actor=who["id"])
+    except Exception as e:
+        proc.safe_record(db, "tutorial", job.id, "draft", "failed", operation="ensure_review_draft",
+                         actor=who["id"], summary={"error_type": type(e).__name__, "error": str(e)[:300]})
+        raise HTTPException(500, f"Draft creation failed: {type(e).__name__}: {str(e)[:200]}")
+    return {"ok": True, "procedure_id": ver.procedure_id, "version_id": ver.id, "created": True}
+
+
+@app.post("/api/tutorial/{jid}/archive")
+def tutorial_archive(jid: str, x_tutorial_token: str = Header(default=""), db: Session = Depends(get_db)):
+    job = _get_tutorial(db, jid, x_tutorial_token)
+    if job.status not in ("done", "error"):
+        raise HTTPException(409, "Only finished or failed tutorials can be archived")
+    job.status = "archived"; db.commit()
+    return {"ok": True, "status": job.status}
+
+
+@app.post("/api/tutorial/{jid}/unarchive")
+def tutorial_unarchive(jid: str, x_tutorial_token: str = Header(default=""), db: Session = Depends(get_db)):
+    job = _get_tutorial(db, jid, x_tutorial_token)
+    if job.status != "archived":
+        raise HTTPException(409, "Only archived tutorials can be restored")
+    job.status = "done" if job.guide_markdown else "error"; db.commit()
+    return {"ok": True, "status": job.status}
+
+
+@app.get("/api/processing/events")
+def processing_events(entity_type: str = "", entity_id: str = "", model: str = "",
+                      status: str = "", stage: str = "", q: str = "",
+                      limit: int = 100, offset: int = 0, db: Session = Depends(get_db)):
+    """Observability timeline: newest first, filterable by entity, model,
+    status, stage, or free text over operation/notes."""
+    stmt = select(M.ProcessingEvent).order_by(M.ProcessingEvent.created_at.desc())
+    if entity_type:
+        stmt = stmt.where(M.ProcessingEvent.entity_type == entity_type)
+    if entity_id:
+        stmt = stmt.where(M.ProcessingEvent.entity_id == entity_id)
+    if model:
+        stmt = stmt.where(M.ProcessingEvent.model == model)
+    if status:
+        stmt = stmt.where(M.ProcessingEvent.status == status)
+    if stage:
+        stmt = stmt.where(M.ProcessingEvent.stage == stage)
+    rows = list(db.scalars(stmt).all())
+    if q:
+        needle = q.strip().lower()
+        rows = [e for e in rows if needle in (e.operation or "").lower()
+                or needle in str((e.summary or {}).get("note", "")).lower()
+                or needle in str((e.summary or {}).get("label", "")).lower()
+                or needle in (e.correlation_id or "")]
+    total = len(rows)
+    page = rows[offset:offset + max(1, min(limit, 500))]
+    return {"total": total, "offset": offset,
+            "items": [{"id": e.id, "correlation_id": e.correlation_id, "entity_type": e.entity_type,
+                       "entity_id": e.entity_id, "actor": e.actor, "stage": e.stage,
+                       "operation": e.operation, "provider": e.provider, "model": e.model,
+                       "status": e.status, "duration_ms": e.duration_ms, "summary": e.summary or {},
+                       "created_at": e.created_at.isoformat()} for e in page]}
 
 
 @app.get("/api/tutorial/{jid}/bundle.zip")

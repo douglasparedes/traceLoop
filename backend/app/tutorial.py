@@ -261,18 +261,24 @@ def _segment_object(job_dir: Path, source: Path, tracking: Path, file_id: str, o
         if result.get("status") != "no_match" and result.get("frames"):
             break
     out = {**obj, "track": [], "simulated": result.get("simulated", True), "prompt_used": prompt_used, "attempts": tried}
+    out.update(_track_stats(result.get("frames", [])))
+    out.update({"distinct_count": 0, "margin": None, "best_frame": None, "best_time": None,
+                "best_confidence": None, "best_bbox_norm": None, "diagnostic_frame": None})
     if result.get("simulated"):
         out.update({"status": "error", "confidence": None, "note": result.get("note", "SAM unavailable")})
         return out
     best, distinct, margin = _best_track(result.get("frames", []))
+    out["distinct_count"] = distinct
+    out["margin"] = margin
     if best:
         out["track"] = [{"frame": f.get("frame", 0), "objects": [
             {"object_id": o.get("object_id"), "bbox_norm": o.get("bbox_norm"), "confidence": o.get("confidence")}
             for o in (f.get("objects") or [])]} for f in result.get("frames", [])]
     if not best:
         # One bounded hi-res retry before giving up: small objects are the
-        # most common miss at 512px tracking resolution.
-        hired = _hirez_retry(job_dir, source, obj, prompt_used)
+        # most common miss at 512px tracking resolution. Earlier attempts are
+        # kept so the timeline shows the full trail.
+        hired = _hirez_retry(job_dir, source, obj, prompt_used, prior_attempts=tried)
         if hired is not None:
             return hired
         out.update({"status": "needs_tap", "confidence": None,
@@ -281,6 +287,9 @@ def _segment_object(job_dir: Path, source: Path, tracking: Path, file_id: str, o
     conf = best.get("confidence")
     out["confidence"] = conf
     out["best_frame"] = best["frame"]
+    out["best_time"] = float(best.get("frame", 0)) / TRACKING_FPS
+    out["best_confidence"] = conf
+    out["best_bbox_norm"] = best.get("bbox_norm")
     ill = make_illustrations(job_dir, source, obj, best)
     out.update(ill)
     ambiguous = distinct > 1 and (conf is None or margin < CLOSE_MARGIN)
@@ -295,8 +304,21 @@ def _segment_object(job_dir: Path, source: Path, tracking: Path, file_id: str, o
     return out
 
 
-def _hirez_retry(job_dir: Path, source: Path, obj: dict, prompt: str) -> dict | None:
-    """One bounded re-run on a higher-res tracking copy for failed objects."""
+def _track_stats(frames: list[dict]) -> dict:
+    """Coverage diagnostics for one SAM result: how many frames carried a match."""
+    seen = len(frames or [])
+    matched = sum(1 for f in (frames or []) if f.get("objects"))
+    return {"frames_seen": seen, "frames_with_match": matched,
+            "coverage": (matched / seen) if seen else 0.0}
+
+
+def _hirez_retry(job_dir: Path, source: Path, obj: dict, prompt: str,
+                 prior_attempts: list[dict] | None = None) -> dict | None:
+    """One bounded re-run on a higher-res tracking copy for failed objects.
+
+    Prior low-res attempts are preserved (appended, never replaced) so the
+    processing timeline shows the full diagnostic trail.
+    """
     try:
         hired = job_dir / "tracking-hirez.mp4"
         if not hired.exists():
@@ -312,14 +334,21 @@ def _hirez_retry(job_dir: Path, source: Path, obj: dict, prompt: str) -> dict | 
         if not best:
             return None
         out = {**obj, "simulated": False, "prompt_used": prompt,
-               "attempts": [{"prompt": prompt + " (hi-res retry)", "status": result.get("status"),
-                             "frames": len(result.get("frames", [])), "simulated": False}],
+               "attempts": list(prior_attempts or []) + [
+                   {"prompt": prompt + " (hi-res retry)", "status": result.get("status"),
+                    "frames": len(result.get("frames", [])), "simulated": False}],
                "track": [{"frame": f.get("frame", 0), "objects": [
                    {"object_id": o.get("object_id"), "bbox_norm": o.get("bbox_norm"), "confidence": o.get("confidence")}
                    for o in (f.get("objects") or [])]} for f in result.get("frames", [])]}
+        out.update(_track_stats(result.get("frames", [])))
         conf = best.get("confidence")
         out["confidence"] = conf
         out["best_frame"] = best["frame"]
+        out["best_time"] = float(best.get("frame", 0)) / TRACKING_FPS
+        out["best_confidence"] = conf
+        out["best_bbox_norm"] = best.get("bbox_norm")
+        out["distinct_count"] = distinct
+        out["margin"] = margin
         out.update(make_illustrations(job_dir, source, obj, best))
         ambiguous = distinct > 1 and (conf is None or margin < CLOSE_MARGIN)
         if (conf is not None and conf < REVIEW_CONF) or ambiguous:
@@ -332,17 +361,138 @@ def _hirez_retry(job_dir: Path, source: Path, obj: dict, prompt: str) -> dict | 
         return None
 
 
+def _ensure_review_draft(db, job: M.TutorialJob, steps: list, objects: list, md: str,
+                         materials: list, model: str = "", simulated: bool = True,
+                         actor: str = "") -> M.ProcedureVersion | None:
+    """Create (once) the persistent Review-queue draft linked to a tutorial.
+
+    Idempotent on job.draft_version_id: re-running never duplicates the draft.
+    Evidence rows point at the tutorial's illustration PNGs so reviewers see
+    the SAM highlights beside the draft. Failures are recorded as events and
+    re-raised for the caller to mark retryable.
+    """
+    from . import processing as proc
+    if job.draft_version_id:
+        existing = db.get(M.ProcedureVersion, job.draft_version_id)
+        if existing is not None:
+            return existing
+    with proc.timed() as t:
+        proc_obj = {int(o.get("obj_id", 0)): o for o in (objects or [])}
+        ev_by_obj: dict[int, list[str]] = {}
+        for o in (objects or []):
+            files = [f for f in [o.get("overlay"), o.get("illustration")] if f]
+            if not files:
+                continue
+            first = files[0]
+            path = BASE / "data" / "tutorials" / job.id / first
+            if not path.is_file():
+                continue
+            e = M.Evidence(capture_session_id=None, evidence_type="image",
+                           storage_key=f"data/tutorials/{job.id}/{first}",
+                           description=f"Tutorial illustration: {o.get('label', 'object')}",
+                           source_reference=f"tutorial:{job.id}", created_by=actor or job.actor,
+                           extra={"tutorial_id": job.id, "obj_id": o.get("obj_id")})
+            db.add(e)
+            db.flush()
+            ev_by_obj[int(o.get("obj_id", 0))] = [e.id]
+        procedure = M.Procedure(title=f"{job.title} (tutorial)", asset_type="training-assembly",
+                          created_by=actor or job.actor)
+        db.add(procedure)
+        db.flush()
+        ver = M.ProcedureVersion(
+            procedure_id=procedure.id, version_number=1, status="draft",
+            summary=f"Draft generated from tutorial “{job.title}”. Review SAM highlights and transcript before approving.",
+            prerequisites="", ai_model=model or "tutorial-pipeline",
+            ai_simulated=1 if simulated else 0, created_by=actor or job.actor,
+            source_evidence={"tutorial_id": job.id,
+                             "transcript_chars": len(job.full_transcript or ""),
+                             "segments": len(job.timed_segments or []),
+                             "objects": [{"obj_id": o.get("obj_id"), "label": o.get("label"),
+                                          "status": o.get("status")} for o in (objects or [])]})
+        db.add(ver)
+        db.flush()
+        for s in (steps or []):
+            used = [int(x) for x in (s.get("objects_used") or []) if isinstance(x, int) or (isinstance(x, str) and x.isdigit())]
+            refs: list[str] = []
+            for oid in used:
+                refs.extend(ev_by_obj.get(int(oid), []))
+            db.add(M.ProcedureStep(
+                procedure_version_id=ver.id, step_order=int(s.get("step_number", 1)),
+                title=str(s.get("title", "")) or f"Step {s.get('step_number', 1)}",
+                instruction=str(s.get("summary", "")),
+                expected_result="", required_tools=[],
+                evidence_refs=refs, visual_refs=list(refs),
+                verification_notes="From tutorial narration; verify against source video."))
+        db.flush()
+        job.draft_procedure_id = procedure.id
+        job.draft_version_id = ver.id
+        from . import main as _main  # local import: audit lives on the app module
+        _main.audit(db, actor or job.actor, "procedure.draft", "procedure_version", ver.id,
+                   {"tutorial_id": job.id, "simulated": bool(simulated)})
+        db.commit()
+    proc.safe_record(db, "tutorial", job.id, "draft", "succeeded",
+                     operation="ensure_review_draft", model=model, duration_ms=t.ms, actor=actor or job.actor,
+                     summary={"procedure_id": procedure.id, "version_id": ver.id,
+                              "steps": len(steps or []), "evidence": sum(len(v) for v in ev_by_obj.values())})
+    return ver
+
+
+def _diagnostic_frame(job_dir: Path, source: Path, obj: dict) -> str | None:
+    """Save a small JPEG of the frame where the object was first mentioned.
+
+    Used when SAM found nothing to track: reviewers see what the model was
+    asked to find instead of an empty state.
+    """
+    try:
+        t = float(obj.get("first_mentioned_at") or 0)
+        frame = extract_frame_image(source, t)
+        frame.thumbnail((640, 640))
+        name = f"diag-obj-{int(obj.get('obj_id', 0))}.jpg"
+        frame.convert("RGB").save(job_dir / name, "JPEG", quality=80)
+        return name
+    except Exception:
+        return None
+
+
+def snapshot_guide(db, job: M.TutorialJob, trigger: str, md: str, objects: list | None,
+                   model: str = "", simulated: bool = True, materials: list | None = None) -> M.GuideSnapshot:
+    """Persist an immutable record of one guide generation.
+
+    The live guide_markdown on TutorialJob keeps moving (refreshes, tap
+    corrections); snapshots preserve what each generation produced, with
+    which models, from which objects, and why.
+    """
+    import hashlib as _hashlib
+    snap = M.GuideSnapshot(
+        tutorial_id=job.id, trigger=trigger, model=model, simulated=bool(simulated),
+        guide_markdown=md or "", guide_hash=_hashlib.sha256((md or "").encode("utf-8")).hexdigest(),
+        materials=list(materials or []),
+        object_statuses=[{"obj_id": o.get("obj_id"), "label": o.get("label"),
+                          "status": o.get("status"), "confidence": o.get("confidence")}
+                         for o in (objects or [])])
+    db.add(snap)
+    db.flush()
+    return snap
+
+
 def run_job(job_id: str) -> None:
+    from . import processing as proc
     db = SessionLocal()
+    proc.new_correlation()
     try:
         job = db.get(M.TutorialJob, job_id)
         if job is None:
             return
+        actor = job.actor or ""
         job_dir = BASE / "data" / "tutorials" / job_id
         job_dir.mkdir(parents=True, exist_ok=True)
         source = BASE / job.video_storage_key
         try:
-            info = probe_video(source)
+            with proc.timed() as t:
+                info = probe_video(source)
+            proc.safe_record(db, "tutorial", job_id, "probe", "succeeded", operation="probe_video",
+                             duration_ms=t.ms, actor=actor,
+                             summary={"duration_sec": info["duration"], "width": info["width"], "height": info["height"]})
             if info["duration"] <= 0:
                 raise RuntimeError("Could not read the uploaded video (unsupported format?)")
             if info["duration"] > MAX_VIDEO_SEC + 5:
@@ -352,7 +502,14 @@ def run_job(job_id: str) -> None:
             _set(db, job, status="transcribing", progress=12)
             wav = job_dir / "audio.wav"
             extract_audio_wav(source, wav)
-            tr = ai.transcribe_timed("audio.wav", wav.read_bytes(), duration_sec=info["duration"])
+            with proc.timed() as t:
+                tr = ai.transcribe_timed("audio.wav", wav.read_bytes(), duration_sec=info["duration"])
+            proc.safe_record(
+                db, "tutorial", job_id, "transcribe", "failed" if tr.get("error") else ("simulated" if tr.get("simulated") else "succeeded"),
+                operation="transcribe_timed", provider="meta", model=tr.get("model", ""), duration_ms=t.ms, actor=actor,
+                summary={"audio_sec": info["duration"], "text_chars": len(tr.get("text") or ""),
+                         "segments": len(tr.get("segments") or []), "error": tr.get("error", ""),
+                         "note": tr.get("note", "")})
             if tr.get("error"):
                 raise RuntimeError(tr["error"])
             if not (tr.get("text") or "").strip():
@@ -360,14 +517,39 @@ def run_job(job_id: str) -> None:
             _set(db, job, full_transcript=tr["text"], timed_segments=tr["segments"], progress=30)
 
             _set(db, job, status="understanding", progress=38)
-            und = ai.understand_tutorial(tr["segments"], info["duration"])
+            with proc.timed() as t:
+                und = ai.understand_tutorial(tr["segments"], info["duration"])
             objects, steps = und.get("objects", []), und.get("steps", [])
+            proc.safe_record(
+                db, "tutorial", job_id, "understand", "simulated" if und.get("simulated") else "succeeded",
+                operation="understand_tutorial", provider="meta", model=und.get("model", ""), duration_ms=t.ms, actor=actor,
+                summary={"objects": len(objects), "steps": len(steps),
+                         "labels": [o.get("label") for o in objects],
+                         "first_mentioned_at": [o.get("first_mentioned_at") for o in objects],
+                         "note": und.get("note", "")})
             _set(db, job, objects=objects, steps=steps, progress=45)
             if not objects:
                 _set(db, job, status="generating", progress=90)
-                guide = ai.generate_guide(job.title, steps, objects, tr["segments"])
+                with proc.timed() as t:
+                    guide = ai.generate_guide(job.title, steps, objects, tr["segments"])
                 md = guide.get("guide_markdown") or ai.fallback_guide_markdown(job.title, steps, objects)
                 md = inject_illustrations(md, steps, objects)
+                proc.safe_record(db, "tutorial", job_id, "guide", "simulated" if guide.get("simulated") else "succeeded",
+                                 operation="generate_guide", provider="meta", model=guide.get("model", ""),
+                                 duration_ms=t.ms, actor=actor,
+                                 summary={"markdown_chars": len(md), "materials": len(guide.get("materials", [])),
+                                          "note": guide.get("note", "")})
+                snapshot_guide(db, job, "initial", md, objects, model=guide.get("model", ""),
+                               simulated=bool(guide.get("simulated", True)), materials=guide.get("materials", []))
+                db.commit()
+                try:
+                    _ensure_review_draft(db, job, steps, objects, md, guide.get("materials", []),
+                                         model=guide.get("model", ""), simulated=bool(guide.get("simulated", True)),
+                                         actor=actor)
+                except Exception as de:
+                    proc.safe_record(db, "tutorial", job_id, "draft", "failed",
+                                     operation="ensure_review_draft", duration_ms=0, actor=actor,
+                                     summary={"error_type": type(de).__name__, "error": str(de)[:300]})
                 _set(db, job, guide_markdown=md, materials=guide.get("materials", []), status="done", progress=100)
                 return
 
@@ -379,21 +561,72 @@ def run_job(job_id: str) -> None:
             try:
                 done_objects = []
                 for i, obj in enumerate(objects):
-                    done_objects.append(_segment_object(job_dir, source, tracking, file_id, obj))
+                    with proc.timed() as t:
+                        seg = _segment_object(job_dir, source, tracking, file_id, obj)
+                    if seg.get("status") == "needs_tap" and not seg.get("illustration"):
+                        seg["diagnostic_frame"] = _diagnostic_frame(job_dir, source, obj)
+                    proc.safe_record(
+                        db, "tutorial", job_id, "segment", seg.get("status") or "error",
+                        operation="segment_video_clip", provider="meta", model=ai.SAM_MODEL,
+                        duration_ms=t.ms, actor=actor,
+                        summary={"obj_id": obj.get("obj_id"), "label": obj.get("label"),
+                                 "prompt_used": seg.get("prompt_used"),
+                                 "attempts": [{"prompt": a.get("prompt"), "status": a.get("status"),
+                                              "frames": a.get("frames"), "simulated": a.get("simulated")}
+                                             for a in (seg.get("attempts") or [])],
+                                 "frames_seen": seg.get("frames_seen", 0),
+                                 "frames_with_match": seg.get("frames_with_match", 0),
+                                 "coverage": seg.get("coverage", 0.0),
+                                 "distinct_count": seg.get("distinct_count", 0),
+                                 "margin": seg.get("margin"),
+                                 "best_frame": seg.get("best_frame"), "best_time": seg.get("best_time"),
+                                 "best_confidence": seg.get("best_confidence"),
+                                 "best_bbox_norm": seg.get("best_bbox_norm"),
+                                 "has_illustration": bool(seg.get("illustration")),
+                                 "note": seg.get("note", "")})
+                    done_objects.append(seg)
                     _set(db, job, objects=done_objects + objects[i + 1:], progress=50 + int(30 * (i + 1) / len(objects)))
             finally:
                 ai.delete_video_file(file_id)
 
             _set(db, job, status="generating", progress=88, objects=done_objects)
-            guide = ai.generate_guide(job.title, steps, done_objects, tr["segments"])
+            with proc.timed() as t:
+                guide = ai.generate_guide(job.title, steps, done_objects, tr["segments"])
             md = guide.get("guide_markdown") or ai.fallback_guide_markdown(job.title, steps, done_objects)
             md = inject_illustrations(md, steps, done_objects)
+            proc.safe_record(db, "tutorial", job_id, "guide", "simulated" if guide.get("simulated") else "succeeded",
+                             operation="generate_guide", provider="meta", model=guide.get("model", ""),
+                             duration_ms=t.ms, actor=actor,
+                             summary={"markdown_chars": len(md), "materials": len(guide.get("materials", [])),
+                                      "ok_objects": sum(1 for o in done_objects if o.get("status") == "ok"),
+                                      "needs_tap": sum(1 for o in done_objects if o.get("status") == "needs_tap"),
+                                      "note": guide.get("note", "")})
+            snapshot_guide(db, job, "initial", md, done_objects, model=guide.get("model", ""),
+                           simulated=bool(guide.get("simulated", True)), materials=guide.get("materials", []))
+            db.commit()
+            try:
+                _ensure_review_draft(db, job, steps, done_objects, md,
+                                     guide.get("materials", [o["label"] for o in done_objects]),
+                                     model=guide.get("model", ""), simulated=bool(guide.get("simulated", True)),
+                                     actor=actor)
+            except Exception as de:
+                proc.safe_record(db, "tutorial", job_id, "draft", "failed",
+                                 operation="ensure_review_draft", duration_ms=0, actor=actor,
+                                 summary={"error_type": type(de).__name__, "error": str(de)[:300]})
             _set(db, job, guide_markdown=md, materials=guide.get("materials", [o["label"] for o in done_objects]),
                  status="done", progress=100)
         except Exception as e:
+            from . import processing as proc
+            proc.safe_record(db, "tutorial", job_id, "run", "failed", operation="run_job",
+                             summary={"error_type": type(e).__name__, "error": str(e)[:300]})
             _set(db, job, status="error", error=f"{type(e).__name__}: {str(e)[:300]}")
+        finally:
+            db.close()
     finally:
-        db.close()
+        try:
+            db.close()
+        except Exception:
+            pass
 
 
 def start_job(job_id: str) -> None:
@@ -402,6 +635,8 @@ def start_job(job_id: str) -> None:
 
 def resegment_object_tap(job_id: str, obj_id: int, nx: float, ny: float) -> dict:
     """Re-track one object from a user tap (normalized coords on a video frame)."""
+    from . import processing as proc
+    proc.new_correlation()
     db = SessionLocal()
     try:
         job = db.get(M.TutorialJob, job_id)
@@ -422,7 +657,8 @@ def resegment_object_tap(job_id: str, obj_id: int, nx: float, ny: float) -> dict
         prompt = ai.build_point_prompt(min(max(int(nx * tw), 0), tw - 1), min(max(int(ny * th), 0), th - 1), tw, th, obj_id=obj_id, frame=frame_idx)
         file_id = ai.upload_video_file(tracking.read_bytes(), "tracking.mp4")
         try:
-            updated = _segment_object(job_dir, source, tracking, file_id, obj, prompt_override=prompt)
+            with proc.timed() as timer:
+                updated = _segment_object(job_dir, source, tracking, file_id, obj, prompt_override=prompt)
         finally:
             ai.delete_video_file(file_id)
         if updated.get("status") == "needs_tap" and updated.get("illustration"):
@@ -430,6 +666,15 @@ def resegment_object_tap(job_id: str, obj_id: int, nx: float, ny: float) -> dict
             updated["note"] = "Corrected from your tap."
         objects = [updated if int(o.get("obj_id", 0)) == obj_id else o for o in objects]
         _set(db, job, objects=objects)
+        proc.safe_record(db, "tutorial", job_id, "tap", updated.get("status", "corrected"),
+                         operation="tap_correction", provider="meta", model=ai.SAM_MODEL,
+                         duration_ms=timer.ms, actor=job.actor or "",
+                         summary={"obj_id": obj_id, "tap_nx": round(nx, 4), "tap_ny": round(ny, 4),
+                                  "prompt_used": updated.get("prompt_used"),
+                                  "attempts": [{"prompt": a.get("prompt"), "status": a.get("status"),
+                                              "frames": a.get("frames")} for a in (updated.get("attempts") or [])],
+                                  "best_confidence": updated.get("best_confidence"),
+                                  "note": updated.get("note", "")})
         return updated
     finally:
         db.close()

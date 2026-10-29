@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime, timezone
-from sqlalchemy import String, Integer, Text, DateTime, ForeignKey, JSON, UniqueConstraint, Float
+from sqlalchemy import String, Integer, Text, DateTime, ForeignKey, JSON, UniqueConstraint, Float, Boolean
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from .db import Base
 
@@ -186,6 +186,50 @@ class AuditLog(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
 
 
+class ProcessingEvent(Base):
+    """Append-only observability timeline for AI/model pipeline stages.
+
+    Summaries and diagnostics only: prompts tried, confidences, counts,
+    hashes, durations, error types. Never secrets, auth headers, full raw
+    provider payloads, or duplicated video/transcript bytes (those live in
+    their own records, linked from here by entity_type/entity_id).
+    """
+    __tablename__ = "processing_events"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
+    correlation_id: Mapped[str] = mapped_column(String, default="", index=True)
+    entity_type: Mapped[str] = mapped_column(String, default="", index=True)
+    entity_id: Mapped[str] = mapped_column(String, default="", index=True)
+    actor: Mapped[str] = mapped_column(String, default="")
+    stage: Mapped[str] = mapped_column(String, default="", index=True)
+    operation: Mapped[str] = mapped_column(String, default="")
+    provider: Mapped[str] = mapped_column(String, default="")
+    model: Mapped[str] = mapped_column(String, default="", index=True)
+    status: Mapped[str] = mapped_column(String, default="", index=True)
+    duration_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    summary: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+
+
+class GuideSnapshot(Base):
+    """Immutable per-generation record of a tutorial guide.
+
+    The live guide_markdown on TutorialJob keeps moving (refreshes, tap
+    corrections); snapshots preserve what each generation produced, with
+    what models, from which objects, and why.
+    """
+    __tablename__ = "guide_snapshots"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
+    tutorial_id: Mapped[str] = mapped_column(ForeignKey("tutorial_jobs.id"), nullable=False, index=True)
+    trigger: Mapped[str] = mapped_column(String, default="")  # initial|refresh|tap|retry
+    model: Mapped[str] = mapped_column(String, default="")
+    simulated: Mapped[bool] = mapped_column(Boolean, default=True)
+    guide_markdown: Mapped[str] = mapped_column(Text, default="")
+    guide_hash: Mapped[str] = mapped_column(String, default="", index=True)
+    materials: Mapped[list] = mapped_column(JSON, default=list)
+    object_statuses: Mapped[list] = mapped_column(JSON, default=list)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+
+
 class LiveRecording(Base):
     __tablename__ = "live_recordings"
     id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
@@ -247,5 +291,7 @@ class TutorialJob(Base):
     steps: Mapped[list] = mapped_column(JSON, default=list)
     materials: Mapped[list] = mapped_column(JSON, default=list)
     guide_markdown: Mapped[str] = mapped_column(Text, default="")
+    draft_procedure_id: Mapped[str] = mapped_column(String, default="")
+    draft_version_id: Mapped[str] = mapped_column(String, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
