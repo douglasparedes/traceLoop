@@ -18,7 +18,7 @@ worker and `/api` calls share one scope. No CORS or separate frontend service.
    | `META_API_KEY` | your Meta key | Server-only, never in the image. Without it the app runs with labelled simulated AI. |
    | `DATABASE_URL` | `sqlite:////data/fieldguard.db` | Already the image default; set explicitly anyway. |
    | `CORS_ORIGINS` | `https://knowloop.online` | Optional; same-origin traffic doesn't need CORS. |
-   | `PORT` | `8000` | Only if Coolify doesn't inject it. |
+   | `PORT` | _(leave to Coolify)_ | Coolify injects this (e.g. `3000`); the image's CMD and healthcheck both follow `$PORT`. Do **not** set it manually unless you also change the port mapping. |
 5. **Persistent volumes** (both required, or data dies on redeploy):
    - `/data` — SQLite database.
    - `/app/backend/data` — uploaded evidence, tutorial videos, live chunks.
