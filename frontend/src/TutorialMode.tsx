@@ -212,6 +212,11 @@ export default function TutorialMode({ onUseTranscript, onOpenReview }: { onUseT
   const streamRef = useRef<MediaStream | null>(null);
   const recRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const peakRef = useRef(0);
+  const [micLevel, setMicLevel] = useState(0);
+  const [audioInfo, setAudioInfo] = useState<{ tracks: number; muted: boolean; silent: boolean; mime: string } | null>(null);
   const startedRef = useRef(0);
   const xhrRef = useRef<XMLHttpRequest | null>(null);
   const uploadingRef = useRef(false);
@@ -239,6 +244,8 @@ export default function TutorialMode({ onUseTranscript, onOpenReview }: { onUseT
   useEffect(() => () => {
     streamRef.current?.getTracks().forEach((t) => t.stop());
     if (recorded) URL.revokeObjectURL(recorded.url);
+    audioCtxRef.current?.close().catch(() => undefined);
+    audioCtxRef.current = null; analyserRef.current = null;
   }, [recorded]);
 
   useEffect(() => {
@@ -246,6 +253,17 @@ export default function TutorialMode({ onUseTranscript, onOpenReview }: { onUseT
     const t = window.setInterval(() => {
       const el = Math.floor((Date.now() - startedRef.current) / 1000);
       setElapsed(el);
+      const an = analyserRef.current;
+      if (an) {
+        try {
+          const buf = new Uint8Array(an.fftSize);
+          an.getByteTimeDomainData(buf);
+          let peak = 0;
+          for (let i = 0; i < buf.length; i++) peak = Math.max(peak, Math.abs(buf[i] - 128) / 128);
+          peakRef.current = Math.max(peakRef.current, peak);
+          setMicLevel(peak);
+        } catch { /* meter unavailable on this browser */ }
+      }
       if (el >= TUTORIAL.MAX_VIDEO_SEC) stopRecording();
     }, 250);
     return () => window.clearInterval(t);
@@ -285,7 +303,12 @@ export default function TutorialMode({ onUseTranscript, onOpenReview }: { onUseT
       }
       streamRef.current = stream;
       if (previewRef.current) { previewRef.current.srcObject = stream; await previewRef.current.play().catch(() => undefined); }
-      setStatus("");
+      const at = stream.getAudioTracks();
+      const live = at.filter((t) => t.readyState === "live");
+      setAudioInfo({ tracks: live.length, muted: live.length > 0 && live.every((t) => t.muted), silent: false, mime: "" });
+      setStatus(live.length === 0
+        ? "Camera opened, but no microphone track was granted. Check the browser site settings allow the microphone, then reopen the camera."
+        : "");
     } catch (e) {
       const name = e instanceof DOMException ? e.name : "";
       setStatus(name === "NotAllowedError" ? "Camera/microphone blocked. Allow both in the address-bar site settings, then retry."
@@ -297,14 +320,37 @@ export default function TutorialMode({ onUseTranscript, onOpenReview }: { onUseT
   function startRecording() {
     const stream = streamRef.current;
     if (!stream) { setStatus("Open the camera first."); return; }
+    const liveAudio = stream.getAudioTracks().filter((t) => t.readyState === "live");
+    if (liveAudio.length === 0) {
+      setStatus("Cannot record: this camera stream has no live microphone track. Reopen the camera and allow the microphone — a tutorial without narration cannot be transcribed.");
+      return;
+    }
     if (typeof MediaRecorder === "undefined") { setStatus("MediaRecorder is not supported in this browser. Use current Chrome/Edge."); return; }
     const mime = ["video/mp4;codecs=avc1,mp4a.40.2", "video/mp4", "video/webm;codecs=vp9,opus", "video/webm"].find((m) => MediaRecorder.isTypeSupported(m));
     const rec = mime ? new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 2_500_000 }) : new MediaRecorder(stream);
     chunksRef.current = [];
+    peakRef.current = 0; setMicLevel(0);
+    setAudioInfo({ tracks: liveAudio.length, muted: liveAudio.every((t) => t.muted), silent: false, mime: rec.mimeType || mime || "browser default" });
+    try {
+      audioCtxRef.current?.close().catch(() => undefined);
+      const Ctx = window.AudioContext || (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+      if (Ctx) {
+        const ctx = new Ctx();
+        audioCtxRef.current = ctx;
+        const src = ctx.createMediaStreamSource(stream);
+        const an = ctx.createAnalyser(); an.fftSize = 512;
+        src.connect(an); analyserRef.current = an;
+      }
+    } catch { /* level meter unavailable; recording still proceeds */ }
     rec.ondataavailable = (e) => { if (e.data.size) chunksRef.current.push(e.data); };
     rec.onstop = () => {
       const type = rec.mimeType || mime || "video/webm";
       const blob = new Blob(chunksRef.current, { type });
+      const silent = peakRef.current < 0.02;
+      setAudioInfo((prev) => (prev ? { ...prev, silent } : { tracks: liveAudio.length, muted: false, silent, mime: type }));
+      setMicLevel(0);
+      audioCtxRef.current?.close().catch(() => undefined);
+      audioCtxRef.current = null; analyserRef.current = null;
       setRecorded((old) => { if (old) URL.revokeObjectURL(old.url); return { blob, url: URL.createObjectURL(blob) }; });
       setPhase("review");
       uploadRef.current?.(blob);
@@ -497,6 +543,17 @@ export default function TutorialMode({ onUseTranscript, onOpenReview }: { onUseT
             <video ref={previewRef} className="live-video" autoPlay playsInline muted aria-label="Tutorial camera preview" />
             {recording && <div className="live-processing"><span className="rec-dot" aria-hidden="true" /> REC {fmt(elapsed)} / {fmt(TUTORIAL.MAX_VIDEO_SEC)}</div>}
           </div>
+          {recording && (
+            <div role="status" aria-label={`Microphone level ${Math.round(micLevel * 100)} percent`} style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8 }}>
+              <span className="muted small-text" style={{ whiteSpace: "nowrap" }}>Mic {micLevel < 0.02 ? "— silent, speak up" : "level"}</span>
+              <div style={{ flex: "1 1 auto", height: 8, borderRadius: 4, background: "var(--line)", overflow: "hidden" }}>
+                <div style={{ width: `${Math.round(micLevel * 100)}%`, height: "100%", background: micLevel < 0.02 ? "var(--warn)" : "var(--ok)" }} />
+              </div>
+            </div>
+          )}
+          {audioInfo && audioInfo.tracks === 0 && !recording && (
+            <p className="notice warn" role="alert" style={{ marginTop: 8 }}>No microphone track in this camera stream. Recording is blocked until the microphone is allowed — a silent video cannot be transcribed.</p>
+          )}
           <div className="row" style={{ marginTop: 10 }}>
             <button className="btn secondary" onClick={() => void openCamera()}>Open camera</button>
             <label className="btn secondary" style={{ margin: 0 }} aria-label="Choose camera">Camera
@@ -545,6 +602,17 @@ export default function TutorialMode({ onUseTranscript, onOpenReview }: { onUseT
           <h3>{uploadPct !== null ? "Uploading your tutorial…" : uploadFailed ? "Upload didn't finish" : "Review your recording"}</h3>
           <video className="live-video" src={recorded.url} controls playsInline aria-label="Recorded tutorial preview" />
           <p className="muted">{(recorded.blob.size / 1024 / 1024).toFixed(1)} MB · {fmt(elapsed)} recorded. Processing a 3-minute tutorial typically takes 1–3 minutes.</p>
+          {audioInfo && (
+            <p className="muted small-text" role="status">
+              Captured as {audioInfo.mime || "browser default"} · {audioInfo.tracks} mic track{audioInfo.tracks === 1 ? "" : "s"}
+              {audioInfo.muted ? " · microphone reports muted" : ""} · {audioInfo.silent ? "no audible speech detected" : "speech detected"}.
+            </p>
+          )}
+          {audioInfo?.silent && (
+            <div className="notice warn" role="alert">
+              <strong>No audible speech was detected in this recording.</strong> If you narrated, your microphone may be muted at the OS level or another app may hold it. Uploading a silent video will fail transcription — consider recording again.
+            </div>
+          )}
           <label htmlFor="tut-title2">Tutorial title</label>
           <input id="tut-title2" value={title} onChange={(e) => setTitle(e.target.value)} disabled={uploadPct !== null} />
           <div className="row" style={{ marginTop: 10 }}>
