@@ -2028,7 +2028,14 @@ if _DIST is not None:
             raise HTTPException(404, "Not found")
         candidate = (_DIST / full_path).resolve()
         if candidate.is_file() and _DIST.resolve() in candidate.parents:
-            media = "application/manifest+json" if candidate.name == "manifest.webmanifest" else None
+            if candidate.name == "manifest.webmanifest":
+                media = "application/manifest+json"
+            elif candidate.name == "assetlinks.json":
+                # Android's asset-link verifier requires application/json;
+                # system mimetypes tables map .json inconsistently.
+                media = "application/json"
+            else:
+                media = None
             headers = {"Cache-Control": "no-store"} if candidate.name == "sw.js" else None
             return _FileResponse(candidate, media_type=media, headers=headers)
         return _FileResponse(_DIST / "index.html")

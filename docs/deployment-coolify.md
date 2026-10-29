@@ -67,7 +67,11 @@ follow-up; until then treat all data on the public URL as shared demo data.
    `REPLACE_WITH_SHA256_FINGERPRINT_FROM_PWA_BUILDER_PACKAGE`.
 3. Commit, push, redeploy; verify
    `https://knowloop.online/.well-known/assetlinks.json` serves the real
-   fingerprint with `content-type: application/json`.
+   fingerprint with `content-type: application/json` (the backend forces this
+   content-type for `assetlinks.json`; Android rejects `text/plain`).
+   `backend/tests/test_api.py::test_assetlinks_served_as_json_for_twa_verification`
+   checks serving + structure on every run and skips only the fingerprint-value
+   assertion while the placeholder is present — un-skip it by pasting the key.
 4. Upload the `.aab` to Play Console (internal testing track first).
 
 ## 4. Known status / accepted risks
