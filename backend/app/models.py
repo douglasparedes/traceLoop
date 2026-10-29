@@ -116,6 +116,8 @@ class ProcedureStep(Base):
     evidence_refs: Mapped[list] = mapped_column(JSON, default=list)
     visual_refs: Mapped[list] = mapped_column(JSON, default=list)
     verification_notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    start_sec: Mapped[float | None] = mapped_column(Float, nullable=True)
+    end_sec: Mapped[float | None] = mapped_column(Float, nullable=True)
     version = relationship("ProcedureVersion", back_populates="steps")
 
 
@@ -220,13 +222,46 @@ class GuideSnapshot(Base):
     __tablename__ = "guide_snapshots"
     id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
     tutorial_id: Mapped[str] = mapped_column(ForeignKey("tutorial_jobs.id"), nullable=False, index=True)
-    trigger: Mapped[str] = mapped_column(String, default="")  # initial|refresh|tap|retry
+    trigger: Mapped[str] = mapped_column(String, default="")  # initial|refresh|tap|retry|format
     model: Mapped[str] = mapped_column(String, default="")
     simulated: Mapped[bool] = mapped_column(Boolean, default=True)
     guide_markdown: Mapped[str] = mapped_column(Text, default="")
     guide_hash: Mapped[str] = mapped_column(String, default="", index=True)
     materials: Mapped[list] = mapped_column(JSON, default=list)
     object_statuses: Mapped[list] = mapped_column(JSON, default=list)
+    guide_format: Mapped[str] = mapped_column(String, default="")  # work_instruction|reference_manual|interactive
+    format_source: Mapped[str] = mapped_column(String, default="")  # user|recommended
+    format_rationale: Mapped[str] = mapped_column(String, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+
+
+class VisualAsset(Base):
+    """Every visual has an identity: source pixels, deterministic overlays,
+    and AI-generated derivatives are distinct rows linked by parentage.
+
+    kind: source_frame | photo | segmentation | enhanced | annotation |
+          illustrative_alternative | user_reference | guide_visual
+    status: ready | review | accepted | rejected
+    An accepted asset never replaces its source; acceptance only links it.
+    """
+    __tablename__ = "visual_assets"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
+    tutorial_id: Mapped[str] = mapped_column(String, default="", index=True)
+    parent_id: Mapped[str] = mapped_column(String, default="", index=True)
+    kind: Mapped[str] = mapped_column(String, default="", index=True)
+    status: Mapped[str] = mapped_column(String, default="review")
+    step_id: Mapped[str] = mapped_column(String, default="")
+    version_id: Mapped[str] = mapped_column(String, default="")
+    storage_key: Mapped[str] = mapped_column(String, default="")
+    mime_type: Mapped[str] = mapped_column(String, default="image/png")
+    width: Mapped[int] = mapped_column(Integer, default=0)
+    height: Mapped[int] = mapped_column(Integer, default=0)
+    instruction: Mapped[str] = mapped_column(Text, default="")
+    model: Mapped[str] = mapped_column(String, default="")
+    simulated: Mapped[bool] = mapped_column(Boolean, default=False)
+    provenance: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_by: Mapped[str] = mapped_column(String, default="demo-tech")
+    idempotency_key: Mapped[str] = mapped_column(String, default="", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
 
 
@@ -291,6 +326,9 @@ class TutorialJob(Base):
     steps: Mapped[list] = mapped_column(JSON, default=list)
     materials: Mapped[list] = mapped_column(JSON, default=list)
     guide_markdown: Mapped[str] = mapped_column(Text, default="")
+    guide_format: Mapped[str] = mapped_column(String, default="")
+    format_source: Mapped[str] = mapped_column(String, default="")
+    format_rationale: Mapped[str] = mapped_column(String, default="")
     draft_procedure_id: Mapped[str] = mapped_column(String, default="")
     draft_version_id: Mapped[str] = mapped_column(String, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)

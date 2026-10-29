@@ -38,6 +38,10 @@ META_BASE_URL = os.getenv("META_BASE_URL", "https://api.meta.ai/v1").rstrip("/")
 SPARK_MODEL = os.getenv("MUSE_SPARK_MODEL", "muse-spark-1.3")
 SAM_MODEL = os.getenv("SAM_MODEL", "sam-3.1")
 VOICE_MODEL = os.getenv("VOICE_MODEL", "muse-voice-transcribe-1.0")
+IMAGE_MODEL = os.getenv("MUSE_IMAGE_MODEL", "muse-image-1.0")
+# Cost control: single-image calls only, low reasoning pass (same $0.01/image price).
+IMAGE_REASONING = os.getenv("MUSE_IMAGE_REASONING", "low")
+IMAGE_TIMEOUT = int(os.getenv("MUSE_IMAGE_TIMEOUT", "180"))
 
 
 def live_enabled() -> bool:
@@ -390,7 +394,148 @@ def suggest_segment_prompts(image_bytes: bytes | None, content_type: str = "imag
                 "note": f"Object suggestions failed ({type(e).__name__}{detail}); type a prompt or tap the object instead."}
 
 
+# ---------------------------------------------------------------- Muse Image (muse-image-1.0)
+
+_IMAGE_TOOLS_OFF = {"enable_image_search": False, "enable_web_search": False, "enable_shell": False}
+
+
+def _image_error(e: Exception, op: str) -> dict:
+    """Honest failure envelope. Never fabricates image bytes.
+
+    503 (retryable) and 5xx are surfaced distinctly from 400 validation /
+    safety blocks so callers can decide whether a retry makes sense.
+    """
+    status = getattr(getattr(e, "response", None), "status_code", None)
+    detail = f" HTTP {status}" if status else ""
+    try:
+        body = getattr(e, "response", None).json() if getattr(e, "response", None) is not None else {}
+        err = (body.get("error") or {}) if isinstance(body, dict) else {}
+        code = str(err.get("code", "") or "")
+        msg = str(err.get("message", "") or "")
+    except Exception:
+        code, msg = "", ""
+    if status == 503:
+        return {"ok": False, "model": IMAGE_MODEL, "simulated": False, "status": "retryable",
+                "note": f"Muse Image temporarily unavailable{detail} — safe to retry once. {msg}".strip()}
+    if status == 400 and code == "content_policy_violation":
+        return {"ok": False, "model": IMAGE_MODEL, "simulated": False, "status": "blocked",
+                "note": "Muse Image declined this prompt (safety filter). Rephrase the request."}
+    return {"ok": False, "model": IMAGE_MODEL, "simulated": False, "status": "error",
+            "note": f"Muse Image {op} failed ({type(e).__name__}{detail}). Original image kept." + (f" {msg}" if msg and len(msg) < 200 else "")}
+
+
+def _image_result(data: dict, usage: dict | None) -> dict:
+    return {"ok": True, "model": IMAGE_MODEL, "simulated": False, "status": "ok",
+            "image_b64": (data.get("data") or [{}])[0].get("b64_json", ""),
+            "output_format": data.get("output_format", "webp"),
+            "usage": usage or {}}
+
+
+def image_edit(image_bytes: bytes, prompt: str, mime: str = "image/png") -> dict:
+    """Edit one image with an instruction; keeps the rest intact.
+
+    Uses raw JSON (data-URL reference) so no multipart SDK is required.
+    Web/image search tools are disabled: edits must preserve the source,
+    never pull in external references.
+    """
+    if not prompt or not prompt.strip():
+        return {"ok": False, "model": IMAGE_MODEL, "simulated": False, "status": "error",
+                "note": "An edit instruction is required."}
+    if not live_enabled():
+        return {"ok": False, "model": IMAGE_MODEL, "simulated": False, "status": "unavailable",
+                "note": "No META_API_KEY configured; image editing unavailable. Original kept."}
+    import base64 as _b64
+    import httpx
+    import time as _time
+
+    data_url = f"data:{mime};base64,{_b64.b64encode(image_bytes).decode()}"
+    body = {"model": IMAGE_MODEL, "prompt": prompt.strip(),
+            "images": [{"image_url": data_url}], "n": 1,
+            "output_format": "png", "reasoning_strength": IMAGE_REASONING,
+            "tool_enablement": dict(_IMAGE_TOOLS_OFF)}
+    last: dict | None = None
+    for attempt in (1, 2):
+        try:
+            r = httpx.post(f"{META_BASE_URL}/images/edits", headers=_headers(), json=body, timeout=IMAGE_TIMEOUT)
+            r.raise_for_status()
+            payload = r.json()
+            if not ((payload.get("data") or [{}])[0].get("b64_json")):
+                return {"ok": False, "model": IMAGE_MODEL, "simulated": False, "status": "error",
+                        "note": "Muse Image returned no image bytes. Original kept."}
+            out = _image_result(payload, payload.get("usage"))
+            out["attempts"] = attempt
+            return out
+        except Exception as e:
+            last = _image_error(e, "edit")
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status == 503 and attempt == 1:
+                _time.sleep(2)  # single bounded retry for retryable failures only
+                continue
+            return last
+    return last or {"ok": False, "model": IMAGE_MODEL, "simulated": False, "status": "error",
+                    "note": "Muse Image edit failed. Original kept."}
+
+
+def image_generate(prompt: str, reference_bytes: list[tuple[bytes, str]] | None = None) -> dict:
+    """Text-to-image, optionally steered by reference images (data URLs).
+
+    References guide composition only; the result is ALWAYS labelled an
+    AI-generated illustrative alternative, never source evidence.
+    """
+    if not prompt or not prompt.strip():
+        return {"ok": False, "model": IMAGE_MODEL, "simulated": False, "status": "error",
+                "note": "A description is required."}
+    if not live_enabled():
+        return {"ok": False, "model": IMAGE_MODEL, "simulated": False, "status": "unavailable",
+                "note": "No META_API_KEY configured; image generation unavailable."}
+    import base64 as _b64
+    import httpx
+    import time as _time
+
+    images = []
+    for raw, mime in (reference_bytes or [])[:4]:
+        images.append({"image_url": f"data:{mime};base64,{_b64.b64encode(raw).decode()}"})
+    body: dict = {"model": IMAGE_MODEL, "prompt": prompt.strip(), "n": 1,
+                 "output_format": "png", "reasoning_strength": IMAGE_REASONING,
+                 "tool_enablement": dict(_IMAGE_TOOLS_OFF)}
+    if images:
+        body["images"] = images
+    endpoint = "/images/edits" if images else "/images/generations"
+    last: dict | None = None
+    for attempt in (1, 2):
+        try:
+            r = httpx.post(f"{META_BASE_URL}{endpoint}", headers=_headers(), json=body, timeout=IMAGE_TIMEOUT)
+            r.raise_for_status()
+            payload = r.json()
+            if not ((payload.get("data") or [{}])[0].get("b64_json")):
+                return {"ok": False, "model": IMAGE_MODEL, "simulated": False, "status": "error",
+                        "note": "Muse Image returned no image bytes."}
+            out = _image_result(payload, payload.get("usage"))
+            out["attempts"] = attempt
+            return out
+        except Exception as e:
+            last = _image_error(e, "generate")
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status == 503 and attempt == 1:
+                _time.sleep(2)
+                continue
+            return last
+    return last or {"ok": False, "model": IMAGE_MODEL, "simulated": False, "status": "error",
+                    "note": "Muse Image generation failed."}
+
+
 # ---------------------------------------------------------------- SAM 3.1 Video (Option A: clip chunks)
+
+
+def image_refine(previous_b64: str, instruction: str, mime: str = "image/png") -> dict:
+    """One follow-up edit on a just-generated image (stateless refine)."""
+    import base64 as _b64
+    try:
+        raw = _b64.b64decode(previous_b64)
+    except Exception:
+        return {"ok": False, "model": IMAGE_MODEL, "simulated": False, "status": "error",
+                "note": "Previous image data is unreadable; cannot refine."}
+    return image_edit(raw, instruction, mime=mime)
 
 def upload_video_file(mp4_bytes: bytes, filename: str = "live-chunk.mp4") -> str:
     """Upload a clip to Meta Files API (purpose=user_data). Returns file_id."""
@@ -622,15 +767,44 @@ def understand_tutorial(segments: list[dict], duration_sec: float) -> dict:
                 "note": f"Understanding failed ({type(e).__name__})"}
 
 
-def generate_guide(title: str, steps: list[dict], objects: list[dict], segments: list[dict]) -> dict:
-    """Muse Spark: final guide markdown + materials from validated steps/objects."""
+def generate_guide(title: str, steps: list[dict], objects: list[dict], segments: list[dict],
+                   guide_format: str = "work_instruction") -> dict:
+    """Muse Spark: final guide markdown + materials from validated steps/objects.
+
+    guide_format selects the presentation structure (work_instruction |
+    reference_manual | interactive). Content always comes from the validated
+    inputs; unsupported sections are omitted, never invented.
+    """
+    structure = {
+        "work_instruction": (
+            "Structure: # title, a 2-3 sentence task objective, ## Before you start (prerequisites + tools), "
+            "## Safety only if the transcript supports it, ## Steps with one ### per step including its time range like (0:45-1:10) "
+            "and 2-4 imperative sentences starting with a verb, each step ending with an 'Expected:' verification line where supported, "
+            "## If something goes wrong only if supported. Never invent tools, values, warnings, or steps."
+        ),
+        "reference_manual": (
+            "Structure: # title plus scope, ## Equipment (only if identifiable from input, else omit), "
+            "## Prerequisites, ## Tools and materials (only items named in the input), ## Safety (only transcript-supported notes), "
+            "## Procedure overview (2-3 sentences), ## Numbered procedure (same ### per step with time ranges), "
+            "## Expected outcomes (only supported checkpoints), ## Troubleshooting (only supported), "
+            "## Sources (transcript ranges and objects used). Never invent torque, ratings, measurements, model identities, "
+            "or specifications; omit unsupported sections entirely."
+        ),
+        "interactive": (
+            "Structure: # title, one-line objective, ## Before you start (prerequisites + tools only if in input), "
+            "## Steps with one ### per step including its time range, each step exactly: one imperative instruction paragraph, "
+            "then an 'Expected:' line only if verifiable from input, then a 'Watch for:' safety line only if transcript-supported. "
+            "Keep each step self-contained for field execution. Never invent checks, values, or warnings."
+        ),
+    }.get(guide_format, "")
     if not live_enabled():
-        return {"guide_markdown": "", "materials": [], "simulated": True, "model": SPARK_MODEL}
+        return {"guide_markdown": "", "materials": [], "simulated": True, "model": SPARK_MODEL,
+                "format": guide_format}
     system = (
         "Write a clear tutorial guide in Markdown from the validated steps, objects, and transcript excerpts. "
-        "Structure: # title, a 2-3 sentence intro, ## What you need (materials from objects), "
-        "## Steps with one ### per step including its time range like (0:45-1:10) and 2-4 sentences, "
-        "## Tips only if the transcript supports them. Never invent tools, values, warnings, or steps."
+        + structure + " "
+        + "A Table of contents is allowed only for the reference_manual format. "
+        + "Never invent tools, values, warnings, steps, or specifications."
     )
     user = (f"Title: {title}\nObjects: {json.dumps(objects)}\nSteps: {json.dumps(steps)}\n"
             f"Transcript excerpts:\n" + "\n".join(f"[{s.get('start', 0):.0f}s] {s.get('text', '')}" for s in segments[:60]))
@@ -639,9 +813,9 @@ def generate_guide(title: str, steps: list[dict], objects: list[dict], segments:
         md = str(parsed.get("guide_markdown") or "").strip()
         if not md:
             raise ValueError("empty guide")
-        return {"guide_markdown": md, "materials": [str(m) for m in (parsed.get("materials") or [])], "simulated": False, "model": SPARK_MODEL}
+        return {"guide_markdown": md, "materials": [str(m) for m in (parsed.get("materials") or [])], "simulated": False, "model": SPARK_MODEL, "format": guide_format}
     except Exception as e:
-        return {"guide_markdown": "", "materials": [o.get("label", "") for o in objects], "simulated": True, "model": SPARK_MODEL,
+        return {"guide_markdown": "", "materials": [o.get("label", "") for o in objects], "simulated": True, "model": SPARK_MODEL, "format": guide_format,
                 "note": f"Guide generation failed ({type(e).__name__})"}
 
 

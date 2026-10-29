@@ -38,6 +38,8 @@ class StepIn(BaseModel):
     evidence_refs: list[str] = []
     visual_refs: list[str] = []
     verification_notes: str | None = None
+    start_sec: float | None = None
+    end_sec: float | None = None
 
 
 class VersionEdit(BaseModel):

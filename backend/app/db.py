@@ -2,7 +2,6 @@ import os
 from pathlib import Path
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, DeclarativeBase
-from sqlalchemy.pool import StaticPool
 
 try:
     from dotenv import load_dotenv
@@ -15,10 +14,31 @@ except ImportError:  # python-dotenv not installed (e.g. minimal test env)
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./fieldguard.db")
 if DATABASE_URL in ("sqlite://", "sqlite:///:memory:"):
+    # Tests + background workers share one process: an in-memory DB on
+    # StaticPool hands a SINGLE connection to every thread, so a TestClient
+    # request racing a run_job thread corrupts or locks it (flaky suite).
+    # Mirror production instead: one temp-file DB per process, default
+    # pooling, one connection per thread; SQLite file locking serializes
+    # the tiny test transactions safely.
+    import atexit as _atexit
+    import tempfile as _tempfile
+    _tmp = os.path.join(_tempfile.gettempdir(), f"fieldguard-test-{os.getpid()}.db")
+    try:
+        os.remove(_tmp)
+    except OSError:
+        pass
+    DATABASE_URL = f"sqlite:///{_tmp}"
+
+    def _cleanup_tmp_db(path: str = _tmp) -> None:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+    _atexit.register(_cleanup_tmp_db)
     engine = create_engine(
         DATABASE_URL,
         connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
     )
 else:
     engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {})
