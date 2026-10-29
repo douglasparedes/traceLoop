@@ -3,6 +3,7 @@ import { api, authPost, authDelete } from "./api";
 import { SAM_LIVE } from "./samLiveConfig";
 import LiveTranscribe from "./LiveTranscribe";
 import { promptVariants } from "./speechPrompt";
+import { listCameras, setPreferredCameraId, getPreferredCameraId, type CameraDevice } from "./camera";
 
 interface LiveMask { svg_path: string; width: number; height: number }
 interface LiveObject { object_id: number; bbox_norm: number[]; confidence?: number | null; mask?: LiveMask | null }
@@ -38,6 +39,8 @@ export default function LiveMode({ captureId, onEvidenceSaved, onTranscript }: {
   const [starting, setStarting] = useState(false);
   const [paused, setPaused] = useState(false);
   const [facing, setFacing] = useState<"environment" | "user">("environment");
+  const [cameras, setCameras] = useState<CameraDevice[]>([]);
+  const [cameraId, setCameraId] = useState<string | null>(() => getPreferredCameraId());
   const [promptText, setPromptText] = useState("blue adjustment knob");
   const [tap, setTap] = useState<{ nx: number; ny: number } | null>(null);
   const [status, setStatus] = useState("Near-live SAM 3.1: the camera records short clips; SAM tracks your prompt through each clip and masks play back here. Expect a 5–10 second delay — this is clip-based, not instant.");
@@ -154,7 +157,7 @@ export default function LiveMode({ captureId, onEvidenceSaved, onTranscript }: {
     })();
   }, []);
 
-  async function startCamera(nextFacing = facing) {
+  async function startCamera(nextFacing = facing, nextCameraId: string | null = cameraId) {
     setStarting(true);
     try {
       if (!sessionRef.current) {
@@ -165,14 +168,24 @@ export default function LiveMode({ captureId, onEvidenceSaved, onTranscript }: {
       if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) throw new DOMException("mediaDevices unavailable", "NotSupportedError");
       stopChunkAudio();
       streamRef.current?.getTracks().forEach((t) => t.stop());
+      void listCameras().then(setCameras).catch(() => undefined);
       let stream: MediaStream;
       let silent = false;
       let silentReason = "";
       try {
-        stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: nextFacing }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: true });
+        const video = nextCameraId
+          ? { deviceId: { exact: nextCameraId }, width: { ideal: 1280 }, height: { ideal: 720 } }
+          : { facingMode: { ideal: nextFacing }, width: { ideal: 1280 }, height: { ideal: 720 } };
+        stream = await navigator.mediaDevices.getUserMedia({ video, audio: true });
       } catch (e) {
         if (e instanceof DOMException && (e.name === "OverconstrainedError" || e.name === "NotFoundError" || e.name === "NotAllowedError")) {
-          stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+          // Saved device gone (or still locked down): fall back to any camera.
+          if (nextCameraId) {
+            setCameraId(null); setPreferredCameraId(null);
+            stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: nextFacing }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: true });
+          } else {
+            stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
+          }
           silent = true;
           silentReason = e.name === "NotAllowedError" ? "microphone permission was denied" : "no working microphone was found";
         } else throw e;
@@ -585,7 +598,17 @@ export default function LiveMode({ captureId, onEvidenceSaved, onTranscript }: {
           ? <button className="btn" onClick={() => void startCamera()} disabled={starting}>{starting ? "Starting…" : "Start camera"}</button>
           : <button className="btn danger" onClick={() => stopCamera()}>Stop camera</button>}
         <button className="btn secondary" onClick={() => setPaused((p) => !p)} disabled={!running}>{paused ? "Resume capture" : "Pause capture"}</button>
-        <button className="btn secondary" onClick={() => { const nf = facing === "environment" ? "user" : "environment"; setFacing(nf); if (running) void startCamera(nf); }} disabled={starting}>Switch camera</button>
+        <button className="btn secondary" onClick={() => { const nf = facing === "environment" ? "user" : "environment"; setFacing(nf); setCameraId(null); setPreferredCameraId(null); if (running) void startCamera(nf, null); }} disabled={starting}>Switch camera</button>
+        <label className="btn secondary" style={{ margin: 0 }} aria-label="Choose camera">Camera
+          <select value={cameraId || ""} aria-label="Choose camera" onChange={(e) => {
+            const id = e.target.value || null;
+            setCameraId(id); setPreferredCameraId(id);
+            if (running) void startCamera(facing, id);
+          }} style={{ width: "auto", minHeight: 0, border: 0, background: "transparent", marginLeft: 6, font: "inherit", color: "inherit" }}>
+            <option value="">Auto</option>
+            {cameras.map((c) => <option key={c.id} value={c.id}>{c.label}</option>)}
+          </select>
+        </label>
         <button className="btn secondary" onClick={() => setStage((s) => (s === "live" ? "playback" : "live"))} disabled={!running || playback.urls.length === 0}>{stage === "live" ? "Show tracked clip" : "Show live view"}</button>
         <button className="btn secondary" onClick={clearMask} disabled={!running}>Clear mask</button>
       </div>

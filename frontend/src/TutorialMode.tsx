@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { authPost, getIdentity } from "./api";
+import { authHeaders, authPost, getIdentity, getToken } from "./api";
+import { listCameras, setPreferredCameraId, getPreferredCameraId, type CameraDevice } from "./camera";
 import { STATUS_LABELS, TUTORIAL } from "./museTutorialConfig";
 
 const API = (import.meta as unknown as { env: Record<string, string> }).env?.VITE_API_URL || "";
@@ -65,7 +66,7 @@ function PipelineSummary({ summary }: { summary: Record<string, unknown> }) {
 
 async function getJob(id: string, token: string): Promise<TutJob> {
   const idn = getIdentity();
-  const res = await fetch(`${API}/api/tutorial/${id}`, { headers: { "X-User": idn.user, "X-Role": idn.role, "X-Tutorial-Token": token } });
+  const res = await fetch(`${API}/api/tutorial/${id}`, { headers: authHeaders({ "X-Tutorial-Token": token }) });
   if (!res.ok) throw new Error(`Status check failed (${res.status})`);
   return res.json() as Promise<TutJob>;
 }
@@ -128,6 +129,8 @@ export default function TutorialMode({ onUseTranscript, onOpenReview }: { onUseT
   const [pastShown, setPastShown] = useState(20);
   const [now, setNow] = useState(0);
   const [tapTarget, setTapTarget] = useState<number | null>(null);
+  const [cameras, setCameras] = useState<CameraDevice[]>([]);
+  const [cameraId, setCameraId] = useState<string | null>(() => getPreferredCameraId());
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const previewRef = useRef<HTMLVideoElement | null>(null);
@@ -147,7 +150,7 @@ export default function TutorialMode({ onUseTranscript, onOpenReview }: { onUseT
       const params = new URLSearchParams({ limit: "100", offset: "0" });
       if (pastQ.trim()) params.set("q", pastQ.trim());
       if (pastStatus) params.set("status", pastStatus);
-      const res = await fetch(`${API}/api/tutorial?${params}`, { headers: { "X-User": idn.user, "X-Role": idn.role } });
+      const res = await fetch(`${API}/api/tutorial?${params}`, { headers: authHeaders() });
       if (!res.ok) return;
       const body = await res.json();
       const items: PastItem[] = Array.isArray(body) ? body : body.items || [];
@@ -190,9 +193,21 @@ export default function TutorialMode({ onUseTranscript, onOpenReview }: { onUseT
     try {
       if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) throw new DOMException("mediaDevices unavailable", "NotSupportedError");
       streamRef.current?.getTracks().forEach((t) => t.stop());
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: true,
-      });
+      void listCameras().then(setCameras).catch(() => undefined);
+      let stream: MediaStream;
+      try {
+        stream = await navigator.mediaDevices.getUserMedia({
+          video: cameraId ? { deviceId: { exact: cameraId }, width: { ideal: 1280 }, height: { ideal: 720 } }
+                            : { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: true,
+        });
+      } catch (e) {
+        if (cameraId && e instanceof DOMException && (e.name === "OverconstrainedError" || e.name === "NotFoundError")) {
+          setCameraId(null); setPreferredCameraId(null);
+          stream = await navigator.mediaDevices.getUserMedia({
+            video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: true,
+          });
+        } else throw e;
+      }
       streamRef.current = stream;
       if (previewRef.current) { previewRef.current.srcObject = stream; await previewRef.current.play().catch(() => undefined); }
       setStatus("");
@@ -252,6 +267,8 @@ export default function TutorialMode({ onUseTranscript, onOpenReview }: { onUseT
     xhr.open("POST", `${API}/api/tutorial/start`);
     xhr.setRequestHeader("X-User", idn.user);
     xhr.setRequestHeader("X-Role", idn.role);
+    const _tok = getToken();
+    if (_tok) xhr.setRequestHeader("X-Auth-Token", _tok);
     xhr.upload.onprogress = (e) => { if (e.lengthComputable) setUploadPct(Math.round((e.loaded / e.total) * 100)); };
     xhr.onload = () => {
       xhrRef.current = null; uploadingRef.current = false;
@@ -315,7 +332,7 @@ export default function TutorialMode({ onUseTranscript, onOpenReview }: { onUseT
     if (!job) return;
     try {
       const res = await fetch(`${API}/api/processing/events?entity_type=tutorial&entity_id=${job.id}&limit=200`,
-        { headers: { "X-User": getIdentity().user, "X-Role": getIdentity().role } });
+        { headers: authHeaders() });
       if (!res.ok) return;
       const body = await res.json();
       setEvents(body.items || []);
@@ -327,7 +344,7 @@ export default function TutorialMode({ onUseTranscript, onOpenReview }: { onUseT
     if (!job) return;
     try {
       const idn = getIdentity();
-      const res = await fetch(`${API}/api/tutorial/${job.id}/snapshots`, { headers: { "X-User": idn.user, "X-Role": idn.role, "X-Tutorial-Token": job.access_token } });
+      const res = await fetch(`${API}/api/tutorial/${job.id}/snapshots`, { headers: authHeaders({ "X-Tutorial-Token": job.access_token }) });
       if (res.ok) setSnaps((await res.json()).snapshots || []);
     } catch { /* offline */ }
   }
@@ -336,7 +353,7 @@ export default function TutorialMode({ onUseTranscript, onOpenReview }: { onUseT
     if (!job) return;
     try {
       const idn = getIdentity();
-      const res = await fetch(`${API}/api/tutorial/${job.id}/snapshots/${id}`, { headers: { "X-User": idn.user, "X-Role": idn.role, "X-Tutorial-Token": job.access_token } });
+      const res = await fetch(`${API}/api/tutorial/${job.id}/snapshots/${id}`, { headers: authHeaders({ "X-Tutorial-Token": job.access_token }) });
       if (res.ok) { const s = await res.json(); setSnapId(id); setSnapMd(s.guide_markdown || ""); }
     } catch { setStatus("Could not load that snapshot."); }
   }
@@ -345,7 +362,7 @@ export default function TutorialMode({ onUseTranscript, onOpenReview }: { onUseT
     if (!job) return;
     try {
       const idn = getIdentity();
-      const res = await fetch(`${API}/api/tutorial/${job.id}/diagnostics`, { headers: { "X-User": idn.user, "X-Role": idn.role, "X-Tutorial-Token": job.access_token } });
+      const res = await fetch(`${API}/api/tutorial/${job.id}/diagnostics`, { headers: authHeaders({ "X-Tutorial-Token": job.access_token }) });
       if (!res.ok) throw new Error(`Diagnostics failed (${res.status})`);
       const blob = await res.blob();
       const a = document.createElement("a");
@@ -389,6 +406,12 @@ export default function TutorialMode({ onUseTranscript, onOpenReview }: { onUseT
           </div>
           <div className="row" style={{ marginTop: 10 }}>
             <button className="btn secondary" onClick={() => void openCamera()}>Open camera</button>
+            <label className="btn secondary" style={{ margin: 0 }} aria-label="Choose camera">Camera
+              <select value={cameraId || ""} aria-label="Choose camera" onChange={(e) => { const id = e.target.value || null; setCameraId(id); setPreferredCameraId(id); }} style={{ width: "auto", minHeight: 0, border: 0, background: "transparent", marginLeft: 6, font: "inherit", color: "inherit" }}>
+                <option value="">Auto</option>
+                {cameras.map((c) => <option key={c.id} value={c.id}>{c.label}</option>)}
+              </select>
+            </label>
             {!recording
               ? <button className="btn" onClick={startRecording}>Start recording</button>
               : <button className="btn danger" onClick={stopRecording}>Stop recording</button>}
@@ -511,7 +534,7 @@ export default function TutorialMode({ onUseTranscript, onOpenReview }: { onUseT
               if (!window.confirm("Delete this tutorial and all its videos and illustrations? This cannot be undone.")) return;
               try {
                 const idn = getIdentity();
-                const res = await fetch(`${API}/api/tutorial/${job.id}`, { method: "DELETE", headers: { "X-User": idn.user, "X-Role": idn.role, "X-Tutorial-Token": job.access_token } });
+                const res = await fetch(`${API}/api/tutorial/${job.id}`, { method: "DELETE", headers: authHeaders({ "X-Tutorial-Token": job.access_token }) });
                 if (!res.ok) throw new Error(`Delete failed (${res.status})`);
                 setJob(null); setPhase("record"); setStatus("Tutorial deleted.");
                 void loadPast();
