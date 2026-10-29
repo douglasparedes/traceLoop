@@ -9,20 +9,58 @@ interface TutObject {
   obj_id: number; label: string; first_mentioned_at: number; status: string;
   confidence?: number | null; illustration?: string; overlay?: string; note?: string;
   prompt_used?: string; attempts?: TutAttempt[];
+  best_frame?: number | null; best_time?: number | null; best_confidence?: number | null;
+  best_bbox_norm?: number[] | null; distinct_count?: number | null; margin?: number | null;
+  frames_seen?: number; frames_with_match?: number; coverage?: number;
+  diagnostic_frame?: string | null;
   track?: { frame: number; objects: { object_id: number; bbox_norm: number[]; confidence?: number | null }[] }[];
 }
 interface TutStep { step_number: number; title: string; start: number; end: number; summary: string; objects_used: number[] }
 interface TutSegment { text: string; start: number; end: number }
+interface ProcEvent { id: string; correlation_id: string; stage: string; operation: string; provider: string; model: string; status: string; duration_ms?: number | null; summary: Record<string, unknown>; created_at: string }
+interface GuideSnap { id: string; trigger: string; model: string; simulated: boolean; guide_hash: string; materials: string[]; created_at: string; markdown_chars: number }
 interface TutJob {
   id: string; title: string; status: string; progress: number; error?: string;
   duration_sec: number; access_token: string; video_url: string;
   full_transcript: string; timed_segments: TutSegment[]; objects: TutObject[];
   steps: TutStep[]; materials: string[]; guide_markdown: string; cached?: boolean;
+  draft_procedure_id?: string | null; draft_version_id?: string | null;
+}
+interface PastItem {
+  id: string; title: string; status: string; access_token: string; actor: string;
+  duration_sec: number; created_at: string; draft_version_id?: string | null;
+  objects_total: number; objects_unresolved: number; has_guide: boolean;
 }
 
 function fmt(sec: number): string {
   const m = Math.floor(sec / 60); const s = Math.floor(sec % 60);
   return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+/** Compact, honest rendering of one processing event's diagnostic summary. */
+function PipelineSummary({ summary }: { summary: Record<string, unknown> }) {
+  const s = summary as Record<string, unknown>;
+  const bits: string[] = [];
+  const str = (v: unknown) => (typeof v === "string" ? v : v == null ? "" : String(v));
+  if (Array.isArray(s.labels)) bits.push(`objects: ${(s.labels as unknown[]).map(String).join(", ") || "—"}`);
+  if (typeof s.label === "string") bits.push(`object: ${s.label}`);
+  if (typeof s.prompt_used === "string" && s.prompt_used) bits.push(`prompt: “${s.prompt_used}”`);
+  if (Array.isArray(s.attempts)) {
+    bits.push(...(s.attempts as { prompt?: string; status?: unknown; frames?: unknown }[]).map((a) => `tried “${a.prompt}” → ${String(a.status)} (${String(a.frames)} frames)`));
+  }
+  for (const k of ["frames_seen", "frames_with_match", "distinct_count"] as const) {
+    if (s[k] != null) bits.push(`${k.replace(/_/g, " ")}: ${String(s[k])}`);
+  }
+  if (s.coverage != null) bits.push(`coverage: ${Math.round(Number(s.coverage) * 100)}%`);
+  if (s.margin != null) bits.push(`margin: ${Math.round(Number(s.margin) * 100)}%`);
+  if (s.best_confidence != null) bits.push(`best: ${Math.round(Number(s.best_confidence) * 100)}% @ frame ${String(s.best_frame ?? "?")}`);
+  if (s.best_bbox_norm) bits.push(`box: [${(s.best_bbox_norm as number[]).map((v) => Number(v).toFixed(2)).join(", ")}]`);
+  if (typeof s.text_chars === "number") bits.push(`transcript: ${s.text_chars} chars, ${String(s.segments)} segments`);
+  if (typeof s.markdown_chars === "number") bits.push(`guide: ${s.markdown_chars} chars, ${String(s.materials)} materials`);
+  if (typeof s.error === "string" && s.error) bits.push(`error: ${s.error}`);
+  if (typeof s.note === "string" && s.note) bits.push(s.note);
+  if (!bits.length) return null;
+  return <p className="muted small-text" style={{ margin: "2px 0 0" }}>{bits.join(" · ")}</p>;
 }
 
 async function getJob(id: string, token: string): Promise<TutJob> {
@@ -66,7 +104,7 @@ function Markdown({ text, resolveImage }: { text: string; resolveImage?: (src: s
   return <div>{blocks}</div>;
 }
 
-export default function TutorialMode({ onUseTranscript }: { onUseTranscript?: (text: string) => void }) {
+export default function TutorialMode({ onUseTranscript, onOpenReview }: { onUseTranscript?: (text: string) => void; onOpenReview?: (versionId: string) => void }) {
   const [phase, setPhase] = useState<"record" | "review" | "processing" | "guide">("record");
   const [uploadFailed, setUploadFailed] = useState(false);
   const [title, setTitle] = useState("How to reseat the trainer cable harness");
@@ -76,10 +114,20 @@ export default function TutorialMode({ onUseTranscript }: { onUseTranscript?: (t
   const [uploadPct, setUploadPct] = useState<number | null>(null);
   const [job, setJob] = useState<TutJob | null>(null);
   const [status, setStatus] = useState("");
-  const [tab, setTab] = useState<"guide" | "transcript" | "objects">("guide");
+  const [tab, setTab] = useState<"guide" | "transcript" | "objects" | "pipeline">("guide");
+  const [events, setEvents] = useState<ProcEvent[]>([]);
+  const [eventsTotal, setEventsTotal] = useState(0);
+  const [snaps, setSnaps] = useState<GuideSnap[]>([]);
+  const [snapId, setSnapId] = useState<string | null>(null);
+  const [snapMd, setSnapMd] = useState("");
+  const [draftBusy, setDraftBusy] = useState(false);
+  const [past, setPast] = useState<PastItem[]>([]);
+  const [pastTotal, setPastTotal] = useState(0);
+  const [pastQ, setPastQ] = useState("");
+  const [pastStatus, setPastStatus] = useState("");
+  const [pastShown, setPastShown] = useState(20);
   const [now, setNow] = useState(0);
   const [tapTarget, setTapTarget] = useState<number | null>(null);
-  const [past, setPast] = useState<{ id: string; title: string; status: string; access_token: string }[]>([]);
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const previewRef = useRef<HTMLVideoElement | null>(null);
@@ -96,10 +144,18 @@ export default function TutorialMode({ onUseTranscript }: { onUseTranscript?: (t
   const loadPast = useCallback(async () => {
     try {
       const idn = getIdentity();
-      const res = await fetch(`${API}/api/tutorial`, { headers: { "X-User": idn.user, "X-Role": idn.role } });
-      if (res.ok) setPast(await res.json());
+      const params = new URLSearchParams({ limit: "100", offset: "0" });
+      if (pastQ.trim()) params.set("q", pastQ.trim());
+      if (pastStatus) params.set("status", pastStatus);
+      const res = await fetch(`${API}/api/tutorial?${params}`, { headers: { "X-User": idn.user, "X-Role": idn.role } });
+      if (!res.ok) return;
+      const body = await res.json();
+      const items: PastItem[] = Array.isArray(body) ? body : body.items || [];
+      setPast(items);
+      setPastTotal(Array.isArray(body) ? items.length : body.total ?? items.length);
+      setPastShown(items.length);
     } catch { /* offline */ }
-  }, []);
+  }, [pastQ, pastStatus]);
   useEffect(() => { void loadPast(); }, [loadPast]);
 
   useEffect(() => () => {
@@ -248,10 +304,68 @@ export default function TutorialMode({ onUseTranscript }: { onUseTranscript?: (t
               const r = await authPost<{ guide_markdown: string }>(`/api/tutorial/${job.id}/refresh-guide`, {}, { "X-Tutorial-Token": job.access_token });
               setJob({ ...j, guide_markdown: r.guide_markdown });
             } catch { /* guide keeps its previous illustrations */ }
+            void loadPipeline();
           }
         } catch { window.clearInterval(t); }
       }, TUTORIAL.POLL_MS);
     } catch (e) { setStatus(e instanceof Error ? e.message : "Tap correction failed"); }
+  }
+
+  async function loadPipeline() {
+    if (!job) return;
+    try {
+      const res = await fetch(`${API}/api/processing/events?entity_type=tutorial&entity_id=${job.id}&limit=200`,
+        { headers: { "X-User": getIdentity().user, "X-Role": getIdentity().role } });
+      if (!res.ok) return;
+      const body = await res.json();
+      setEvents(body.items || []);
+      setEventsTotal(body.total || 0);
+    } catch { /* offline */ }
+  }
+
+  async function loadSnapshots() {
+    if (!job) return;
+    try {
+      const idn = getIdentity();
+      const res = await fetch(`${API}/api/tutorial/${job.id}/snapshots`, { headers: { "X-User": idn.user, "X-Role": idn.role, "X-Tutorial-Token": job.access_token } });
+      if (res.ok) setSnaps((await res.json()).snapshots || []);
+    } catch { /* offline */ }
+  }
+
+  async function openSnapshot(id: string) {
+    if (!job) return;
+    try {
+      const idn = getIdentity();
+      const res = await fetch(`${API}/api/tutorial/${job.id}/snapshots/${id}`, { headers: { "X-User": idn.user, "X-Role": idn.role, "X-Tutorial-Token": job.access_token } });
+      if (res.ok) { const s = await res.json(); setSnapId(id); setSnapMd(s.guide_markdown || ""); }
+    } catch { setStatus("Could not load that snapshot."); }
+  }
+
+  async function downloadDiagnostics() {
+    if (!job) return;
+    try {
+      const idn = getIdentity();
+      const res = await fetch(`${API}/api/tutorial/${job.id}/diagnostics`, { headers: { "X-User": idn.user, "X-Role": idn.role, "X-Tutorial-Token": job.access_token } });
+      if (!res.ok) throw new Error(`Diagnostics failed (${res.status})`);
+      const blob = await res.blob();
+      const a = document.createElement("a");
+      a.href = URL.createObjectURL(blob);
+      a.download = `tutorial-${job.id}-diagnostics.json`;
+      document.body.appendChild(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    } catch (e) { setStatus(e instanceof Error ? e.message : "Diagnostics download failed"); }
+  }
+
+  async function ensureDraft() {
+    if (!job || draftBusy) return;
+    setDraftBusy(true);
+    try {
+      const r = await authPost<{ version_id: string; created: boolean }>(`/api/tutorial/${job.id}/draft`, {}, { "X-Tutorial-Token": job.access_token });
+      const j = await getJob(job.id, job.access_token);
+      setJob(j);
+      setStatus(r.created ? "Review draft created — find it in the Review queue." : "Review draft already exists for this tutorial.");
+    } catch (e) { setStatus(e instanceof Error ? e.message : "Draft creation failed — retry when connected."); }
+    finally { setDraftBusy(false); }
   }
 
   const activeSeg = job?.timed_segments.find((s) => now >= s.start && now < s.end);
@@ -281,11 +395,30 @@ export default function TutorialMode({ onUseTranscript }: { onUseTranscript?: (t
           </div>
           {past.length > 0 && (
             <div style={{ marginTop: 14 }}>
-              <h3>Your tutorials</h3>
-              {past.map((p) => (
-                <p key={p.id} className="list-row"><strong>{p.title}</strong> <span className="tag">{p.status}</span>{" "}
+              <h3>Tutorial library {pastTotal > 0 && <span className="muted">({pastTotal})</span>}</h3>
+              <div className="row">
+                <input value={pastQ} onChange={(e) => setPastQ(e.target.value)} placeholder="Search tutorials…" aria-label="Search tutorials" style={{ flex: "2 1 160px" }} />
+                <select value={pastStatus} onChange={(e) => setPastStatus(e.target.value)} aria-label="Filter by status" style={{ flex: "1 1 140px" }}>
+                  <option value="">All statuses</option>
+                  <option value="done">Done</option>
+                  <option value="error">Error</option>
+                  <option value="uploaded">Uploaded</option>
+                  <option value="transcribing">Transcribing</option>
+                  <option value="understanding">Understanding</option>
+                  <option value="segmenting">Segmenting</option>
+                  <option value="generating">Generating</option>
+                  <option value="archived">Archived</option>
+                </select>
+              </div>
+              {past.slice(0, pastShown).map((p) => (
+                <p key={p.id} className="list-row">
+                  <strong>{p.title}</strong> <span className={`tag ${p.status === "done" ? "approved" : p.status === "error" ? "error" : ""}`}>{p.status}</span>{" "}
+                  {p.objects_unresolved > 0 && <span className="tag warn">{p.objects_unresolved} need{(p.objects_unresolved === 1 ? "s" : "")} tap</span>}{" "}
+                  {p.draft_version_id && <span className="tag ai">draft linked</span>}{" "}
+                  <span className="muted small-text">{p.created_at ? new Date(p.created_at).toLocaleDateString() : ""}</span>{" "}
                   <button className="btn small secondary" onClick={() => void openPast(p)}>Open</button></p>
               ))}
+              {pastShown < past.length && <button className="btn small secondary" onClick={() => setPastShown((n) => n + 20)}>Show more ({past.length - pastShown} remaining)</button>}
             </div>
           )}
         </div>
@@ -313,7 +446,7 @@ export default function TutorialMode({ onUseTranscript }: { onUseTranscript?: (t
           <h3>Building your guide…</h3>
           <p role="status">{STATUS_LABELS[job.status] || job.status}</p>
           <div className="progress" role="progressbar" aria-valuenow={job.progress} aria-valuemin={0} aria-valuemax={100}><div style={{ width: `${job.progress}%` }} /></div>
-          <p className="muted">{job.progress}% — you can leave this screen; the tutorial keeps processing on the server and appears under “Your tutorials”.</p>
+          <p className="muted">{job.progress}% — you can leave this screen; the tutorial keeps processing on the server and appears in the tutorial library.</p>
         </div>
       )}
 
@@ -355,9 +488,9 @@ export default function TutorialMode({ onUseTranscript }: { onUseTranscript?: (t
           </div>
           {tapTarget !== null && <p className="notice warn" role="status">Tap the object you meant on the video above to re-track it.</p>}
           <div className="row" role="group" aria-label="Guide sections" style={{ margin: "10px 0" }}>
-            {(["guide", "transcript", "objects"] as const).map((t) => (
-              <button key={t} className={`btn small ${tab === t ? "" : "secondary"}`} aria-pressed={tab === t} onClick={() => setTab(t)}>
-                {t === "guide" ? "Guide" : t === "transcript" ? "Transcript" : `Objects (${job.objects.length})`}
+            {(["guide", "transcript", "objects", "pipeline"] as const).map((t) => (
+              <button key={t} className={`btn small ${tab === t ? "" : "secondary"}`} aria-pressed={tab === t} onClick={() => { setTab(t); if (t === "pipeline") void loadPipeline(); if (t === "guide") void loadSnapshots(); }}>
+                {t === "guide" ? "Guide" : t === "transcript" ? "Transcript" : t === "objects" ? `Objects (${job.objects.length})` : "Pipeline"}
               </button>
             ))}
             <button className="btn small secondary" onClick={async () => { try { await navigator.clipboard.writeText(job.guide_markdown); setStatus("Guide Markdown copied."); } catch { setStatus("Copy failed in this browser — use Download .md."); } }}>Copy Markdown</button>
@@ -388,6 +521,17 @@ export default function TutorialMode({ onUseTranscript }: { onUseTranscript?: (t
 
           {tab === "guide" && (
             <div>
+              {job.draft_version_id ? (
+                <div className="notice ok" role="status">
+                  This tutorial created Review draft v{job.draft_version_id.slice(0, 8)} — it persists in the Review queue even if the tutorial is deleted.
+                  {onOpenReview && <div className="row" style={{ marginTop: 8 }}><button className="btn small" onClick={() => onOpenReview(job.draft_version_id!)}>Open in Review</button></div>}
+                </div>
+              ) : (
+                <div className="notice warn" role="status">
+                  No Review draft linked yet. Completed tutorials auto-create one; if this one finished before that feature, create it now.
+                  <div className="row" style={{ marginTop: 8 }}><button className="btn small" onClick={() => void ensureDraft()} disabled={draftBusy}>{draftBusy ? "Creating…" : "Send to Review as draft"}</button></div>
+                </div>
+              )}
               {job.steps.map((s) => {
                 const objs = (s.objects_used || []).map((id) => job.objects.find((o) => o.obj_id === id)).filter((o): o is TutObject => !!o?.overlay);
                 return (
@@ -437,6 +581,9 @@ export default function TutorialMode({ onUseTranscript }: { onUseTranscript?: (t
                   <div className="row" style={{ alignItems: "flex-start" }}>
                     {o.overlay && <img src={imgUrl(o.overlay)} alt={`${o.label} with segmentation overlay`} style={{ width: 160, borderRadius: 8 }} />}
                     {o.illustration && <img src={imgUrl(o.illustration)} alt={`${o.label} isolated`} style={{ width: 160, borderRadius: 8, background: "repeating-conic-gradient(#ddd 0 25%, #fff 0 50%) 0 0/16px 16px" }} />}
+                    {!o.overlay && !o.illustration && o.diagnostic_frame && (
+                      <img src={`${API}/api/tutorial/${job.id}/diagnostics/frame/${o.obj_id}?token=${encodeURIComponent(job.access_token)}`} alt={`Frame where “${o.label}” was first mentioned`} style={{ width: 160, borderRadius: 8 }} loading="lazy" />
+                    )}
                     <div>
                       <h4 style={{ margin: "0 0 6px" }}>{o.label}</h4>
                       <p>
@@ -446,8 +593,15 @@ export default function TutorialMode({ onUseTranscript }: { onUseTranscript?: (t
                         <button className="btn small secondary" onClick={() => seek(o.first_mentioned_at)}>First shown {fmt(o.first_mentioned_at)}</button>
                       </p>
                       {o.note && <p className="muted">{o.note}</p>}
-                      {o.attempts && o.attempts.length > 1 && (
-                        <p className="muted small-text">Tried: {o.attempts.map((a) => `“${a.prompt}” (${a.frames} frames)`).join(" → ")}</p>
+                      {(o.best_frame != null || o.distinct_count != null || o.coverage != null) && (
+                        <p className="muted small-text">
+                          {o.best_frame != null && <>Best frame {o.best_frame}{o.best_time != null ? ` (${fmt(o.best_time)})` : ""} · </>}
+                          {o.distinct_count != null && <>{o.distinct_count} candidate{o.distinct_count === 1 ? "" : "s"} on that frame{o.margin != null ? ` · margin ${Math.round(o.margin * 100)}%` : ""} · </>}
+                          {o.coverage != null && <>track coverage {Math.round(o.coverage * 100)}%</>}
+                        </p>
+                      )}
+                      {o.attempts && o.attempts.length > 0 && (
+                        <p className="muted small-text">Tried: {o.attempts.map((a) => `“${a.prompt}” (${a.frames} frames${a.simulated ? ", simulated" : ""})`).join(" → ")}</p>
                       )}
                       {o.status === "needs_tap" && <button className="btn small" onClick={() => { seek(o.first_mentioned_at); setTapTarget(o.obj_id); }}>Tap which one you meant</button>}
                       {o.status === "processing" && <p role="status"><span className="spinner" aria-hidden="true" /> Re-tracking from your tap…</p>}
@@ -455,6 +609,42 @@ export default function TutorialMode({ onUseTranscript }: { onUseTranscript?: (t
                   </div>
                 </div>
               ))}
+            </div>
+          )}
+
+          {tab === "pipeline" && (
+            <div>
+              <div className="row" style={{ justifyContent: "space-between" }}>
+                <h3 style={{ margin: 0 }}>Processing timeline {eventsTotal > 0 && <span className="muted">({eventsTotal})</span>}</h3>
+                <button className="btn small secondary" onClick={() => void downloadDiagnostics()}>Download diagnostics (.json)</button>
+              </div>
+              <p className="muted small-text">Every AI/model stage is logged with its inputs, outputs and timing — this is what lets us explain a SAM miss instead of guessing.</p>
+              {events.length === 0 && <div className="empty">No processing events recorded for this tutorial yet. Events appear as each stage runs.</div>}
+              {events.map((e) => (
+                <div key={e.id} className="list-row">
+                  <div className="row" style={{ justifyContent: "space-between" }}>
+                    <strong>{e.stage}</strong>
+                    <span className={`tag ${e.status === "succeeded" || e.status === "ok" ? "approved" : e.status === "failed" || e.status === "error" ? "error" : e.status === "no_match" || e.status === "needs_tap" ? "warn" : ""}`}>{e.status}</span>
+                  </div>
+                  <p className="muted small-text" style={{ margin: "4px 0" }}>
+                    {e.operation}{e.model ? ` · ${e.model}` : ""}{e.duration_ms != null ? ` · ${e.duration_ms} ms` : ""} · {new Date(e.created_at).toLocaleTimeString()}
+                    {e.correlation_id && <> · run <code>{e.correlation_id}</code></>}
+                  </p>
+                  <PipelineSummary summary={e.summary} />
+                </div>
+              ))}
+              <h3 style={{ marginTop: 14 }}>Guide snapshots ({snaps.length})</h3>
+              <p className="muted small-text">Every generated guide is kept, including refreshes — the live guide never overwrites history.</p>
+              {snaps.length === 0 && <p className="muted">No snapshots yet — open the Guide tab to load them.</p>}
+              {snaps.map((s) => (
+                <p key={s.id} className="list-row">
+                  <span className="tag">{s.trigger}</span> {new Date(s.created_at).toLocaleString()} · {s.markdown_chars} chars{s.simulated ? " · simulated" : ""}
+                  {" "}<button className="btn small secondary" onClick={() => void openSnapshot(s.id)}>{snapId === s.id ? "Hide" : "View"}</button>
+                </p>
+              ))}
+              {snapId && (
+                <div className="card"><h4>Snapshot {snapId.slice(0, 8)}…</h4><Markdown text={snapMd} resolveImage={resolveMdImage} /></div>
+              )}
             </div>
           )}
         </div>

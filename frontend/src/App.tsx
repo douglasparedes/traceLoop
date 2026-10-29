@@ -347,7 +347,7 @@ export default function App() {
           {view === "home" && <Home procs={procs} jobs={jobs} activeJob={activeJob} activeVersion={activeVersion} pending={pending} online={online} storageNote={storageNote} role={role} go={setView} openReview={async (vid) => { const v = await openVersion(vid); if (v) { setReviewVersion(v); setView("review"); } else notify("That version is not available offline yet.", "error"); }} continueJob={() => { if (activeJob) { openVersion(activeJob.procedure_version_id).then((v) => { if (v) { setActiveVersion(v); setView("job"); } else notify("Downloaded procedure not found on this device. Reconnect and open it from Procedures.", "error"); }); } }} />}
           {view === "library" && <Library procs={procs} cachedIds={cachedIds} reload={loadLists} startJob={startJob} openVersion={openDetail} cache={async (vid) => { const v = await openVersion(vid); notify(v ? "Saved for offline use — verified in local storage on this device." : "Download failed — check connection.", v ? "ok" : "error"); }} />}
           {view === "detail" && <ProcedureDetail title={(detailVersion && procs.find((x) => x.id === detailVersion.procedure_id)?.title) || ""} version={detailVersion} cached={detailVersion ? cachedIds.has(detailVersion.id) : false} startJob={() => { const p = detailVersion ? procs.find((x) => x.id === detailVersion.procedure_id) : undefined; if (p) startJob(p); else if (detailVersion) notify("Procedure record unavailable — reload the library.", "error"); }} cache={async () => { if (detailVersion) { const v = await openVersion(detailVersion.id); notify(v ? "Saved for offline use — verified in local storage on this device." : "Download failed — check connection.", v ? "ok" : "error"); } }} openReview={() => { if (detailVersion) { setReviewVersion(detailVersion); setView("review"); } }} go={setView} />}
-          {view === "capture" && <CaptureView done={(v) => { setReviewVersion(v); setView("review"); loadLists(); }} />}
+          {view === "capture" && <CaptureView done={(v) => { setReviewVersion(v); setView("review"); loadLists(); }} openReview={async (vid) => { const v = await openVersion(vid); if (v) { setReviewVersion(v); setView("review"); } else notify("That version is not available offline yet.", "error"); }} />}
           {view === "review" && <ReviewView version={reviewVersion} setVersion={setReviewVersion} procs={procs} openVersion={openVersion} role={role} reload={loadLists} notify={notify} />}
           {view === "job" && <JobView job={activeJob} version={activeVersion} queueEvent={queueEvent} setJob={handleSetJob} notify={notify} reload={loadLists} go={setView} pending={pending} online={online} offlineReady={activeVersion ? cachedIds.has(activeVersion.id) : false} />}
           {view === "activity" && <Activity jobs={jobs} pending={pending} pendingReview={pendingReview} reload={loadLists} go={setView} syncNow={() => void syncNow()} syncing={syncState === "syncing"} role={role} onProposeRevision={async (vid) => { const v = await openVersion(vid); if (v) { setReviewVersion(v); setView("review"); notify("Opened the job's exact revision. Use “Propose new revision” there — it goes through normal review."); } else notify("That revision is not available offline yet.", "error"); }} />}
@@ -483,6 +483,60 @@ function Home({ procs, jobs, activeJob, activeVersion, pending, online, storageN
   );
 }
 
+function ProcessingLog() {
+  const [items, setItems] = useState<ProcEventRow[]>([]);
+  const [total, setTotal] = useState(0);
+  const [entity, setEntity] = useState("");
+  const [model, setModel] = useState("");
+  const [status, setStatus] = useState("");
+  const [q, setQ] = useState("");
+  const [loading, setLoading] = useState(false);
+  async function load() {
+    setLoading(true);
+    try {
+      const params = new URLSearchParams({ limit: "50", offset: "0" });
+      if (entity) params.set("entity_type", entity);
+      if (model) params.set("model", model);
+      if (status) params.set("status", status);
+      if (q.trim()) params.set("q", q.trim());
+      const r = await api.get<{ total: number; items: ProcEventRow[] }>(`/api/processing/events?${params}`);
+      setItems(r.items || []); setTotal(r.total || 0);
+    } catch { /* offline: list stays */ }
+    setLoading(false);
+  }
+  useEffect(() => { void load(); }, []);
+  return (
+    <div className="card">
+      <h3>Processing log</h3>
+      <p className="muted small-text">Every AI/model stage across tutorials, capture and review — newest first. Same correlation IDs appear in the server logs.</p>
+      <div className="row">
+        <select value={entity} onChange={(e) => setEntity(e.target.value)} aria-label="Filter by entity" style={{ flex: "1 1 140px" }}>
+          <option value="">All entities</option><option value="tutorial">Tutorial</option><option value="capture">Capture</option><option value="procedure">Procedure</option>
+        </select>
+        <input value={model} onChange={(e) => setModel(e.target.value)} placeholder="Model (e.g. sam-3.1)" aria-label="Filter by model" style={{ flex: "1 1 140px" }} />
+        <select value={status} onChange={(e) => setStatus(e.target.value)} aria-label="Filter by status" style={{ flex: "1 1 140px" }}>
+          <option value="">Any status</option><option value="succeeded">Succeeded</option><option value="ok">OK</option><option value="failed">Failed</option><option value="error">Error</option><option value="simulated">Simulated</option><option value="no_match">No match</option><option value="needs_tap">Needs tap</option>
+        </select>
+        <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search prompt, note…" aria-label="Search processing log" style={{ flex: "2 1 160px" }} />
+        <button className="btn small" onClick={() => void load()} disabled={loading}>{loading ? "Loading…" : "Filter"}</button>
+      </div>
+      {items.length === 0 ? <div className="empty">No processing events match. Run a tutorial or capture to generate the first entries.</div>
+        : items.map((e) => (
+          <div key={e.id} className="list-row">
+            <div className="row" style={{ justifyContent: "space-between" }}>
+              <strong>{e.stage}</strong>
+              <span className={`tag ${e.status === "succeeded" || e.status === "ok" ? "approved" : e.status === "failed" || e.status === "error" ? "error" : "warn"}`}>{e.status}</span>
+            </div>
+            <p className="muted small-text" style={{ margin: "2px 0" }}>
+              {e.entity_type}:{e.entity_id.slice(0, 8)}…{e.operation ? ` · ${e.operation}` : ""}{e.model ? ` · ${e.model}` : ""}{e.duration_ms != null ? ` · ${e.duration_ms} ms` : ""} · {new Date(e.created_at).toLocaleString()}
+            </p>
+          </div>
+        ))}
+      {total > items.length && <p className="muted small-text">Showing {items.length} of {total} — refine the filters to narrow down.</p>}
+    </div>
+  );
+}
+
 function Activity({ jobs, pending, pendingReview, reload, go, syncNow, syncing, role, onProposeRevision }: { jobs: JobRow[]; pending: number; pendingReview: number; reload: () => void; go: (v: View) => void; syncNow: () => void; syncing: boolean; role: Role; onProposeRevision: (versionId: string) => void }) {
   return (
     <div>
@@ -496,6 +550,7 @@ function Activity({ jobs, pending, pendingReview, reload, go, syncNow, syncing, 
         </div>
       </div>
       <History jobs={jobs} reload={reload} role={role} onProposeRevision={onProposeRevision} />
+      <ProcessingLog />
     </div>
   );
 }
@@ -681,7 +736,7 @@ function loadCaptureDraft(): Record<string, string> {
   try { return JSON.parse(localStorage.getItem(CAPTURE_DRAFT_KEY) || "{}") as Record<string, string>; } catch { return {}; }
 }
 
-function CaptureView({ done }: { done: (v: Version) => void }) {
+function CaptureView({ done, openReview }: { done: (v: Version) => void; openReview: (vid: string) => void }) {
   const [mode, setMode] = useState<"photo" | "live" | "tutorial">("photo");
   const saved = useRef(loadCaptureDraft()).current;
   const [title, setTitle] = useState(saved.title || "Reseat the trainer cable harness");
@@ -928,7 +983,7 @@ function CaptureView({ done }: { done: (v: Version) => void }) {
             <div className="stat-tile"><span className="t"><Icon name="check" size={14} /> Audio demixing</span></div>
             <div className="stat-tile"><span className="t"><Icon name="check" size={14} /> Step segmentation</span></div>
           </div>
-          <TutorialMode onUseTranscript={(t) => { setTranscript(t); setMode("photo"); }} />
+          <TutorialMode onUseTranscript={(t) => { setTranscript(t); setMode("photo"); }} onOpenReview={openReview} />
         </div>
       ) : mode === "live" ? <LiveMode captureId={capId} onTranscript={(t) => setTranscript(t)} onEvidenceSaved={(id) => { setPhotoEvId(id); setMode("photo"); say("Live frame saved as photo evidence — run SAM or generate the draft in Quick capture.", "ok"); }} /> : (<>
       <section className="card" aria-label="Local capture draft">
@@ -1244,6 +1299,12 @@ interface EvidenceItem {
   id: string; evidence_type: string; description: string; source_reference: string;
   text_content?: string | null; image_url: string | null;
   segmentation: { id: string; geometry: SegGeometry; simulated: boolean; status: string; prompt: string; model?: string } | null;
+}
+
+interface ProcEventRow {
+  id: string; correlation_id: string; entity_type: string; entity_id: string; actor: string; stage: string;
+  operation: string; provider: string; model: string; status: string; duration_ms?: number | null;
+  summary: Record<string, unknown>; created_at: string;
 }
 
 function StepEvidence({ versionId, step }: { versionId: string; step: Step }) {
