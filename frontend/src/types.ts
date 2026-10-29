@@ -31,6 +31,7 @@ export interface ProcSummary {
   title: string;
   favorite: boolean;
   updated_at?: string | null;
+  asset_type?: string | null;
   versions: { id: string; version_number: number; status: string }[];
   approved_version_id: string | null;
   has_pending_review: boolean;
@@ -58,5 +59,5 @@ export interface LocalJob {
   finish_outcome?: string;
 }
 
-export type View = "home" | "library" | "capture" | "review" | "job" | "history" | "manuals" | "settings" | "activity";
+export type View = "home" | "library" | "detail" | "capture" | "review" | "job" | "history" | "manuals" | "settings" | "activity";
 export type Role = "technician" | "expert" | "reviewer";
