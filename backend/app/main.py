@@ -30,7 +30,16 @@ with engine.begin() as _conn:
             _conn.execute(_text(f"ALTER TABLE {_table} ADD COLUMN {_col} {_type}"))
 
 app = FastAPI(title="TraceLoop FieldGuard API", version="0.1.0")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+import os as _os
+
+# Same-origin in production (frontend served by this app); CORS only matters
+# for local dev servers. Override with CORS_ORIGINS (comma-separated).
+_cors_origins = [o.strip() for o in _os.getenv(
+    "CORS_ORIGINS",
+    "https://knowloop.online,http://localhost:5173,http://127.0.0.1:5173,http://localhost:8000,http://127.0.0.1:8000",
+).split(",") if o.strip()]
+app.add_middleware(CORSMiddleware, allow_origins=_cors_origins, allow_methods=["*"], allow_headers=["*"])
 
 MAX_PDF_BYTES = 15 * 1024 * 1024
 MAX_IMG_BYTES = 8 * 1024 * 1024
@@ -366,6 +375,7 @@ def list_procedures(db: Session = Depends(get_db)):
         approved = [v for v in vers if v.status == "approved"]
         out.append({"id": p.id, "title": p.title, "favorite": bool(p.favorite),
                     "updated_at": p.updated_at.isoformat() if p.updated_at else None,
+                    "asset_type": p.asset_type,
                     "versions": [{"id": v.id, "version_number": v.version_number, "status": v.status} for v in vers],
                     "approved_version_id": approved[-1].id if approved else None,
                     "has_pending_review": any(v.status == "pending_review" for v in vers)})
@@ -996,7 +1006,50 @@ def get_job(jid: str, db: Session = Depends(get_db)):
     return {"id": j.id, "status": j.status, "outcome": j.outcome, "procedure_version_id": j.procedure_version_id,
             "started_at": j.started_at.isoformat(), "ended_at": j.ended_at.isoformat() if j.ended_at else None,
             "events": [{"event_id": e.event_id, "event_type": e.event_type, "step_id": e.step_id,
-                        "payload": e.payload, "occurred_at": e.occurred_at.isoformat()} for e in evs]}
+                        "payload": e.payload, "occurred_at": e.occurred_at.isoformat()} for e in evs],
+            "evidence": job_evidence_list(jid, db)}
+
+
+def job_evidence_list(jid: str, db) -> list:
+    """Photos attached during a job (source_reference "job:{jid}" or "job:{jid}:{step}")."""
+    items = []
+    for e in db.scalars(select(M.Evidence).where(M.Evidence.source_reference.like(f"job:{jid}%")).order_by(M.Evidence.captured_at)).all():
+        has_file = bool(e.storage_key) and (Path(__file__).resolve().parent.parent / e.storage_key).is_file()
+        items.append({"id": e.id, "description": e.description, "step_id": (e.source_reference or "").split(":")[2] if (e.source_reference or "").count(":") >= 2 else None,
+                      "captured_at": e.captured_at.isoformat() if e.captured_at else None,
+                      "image_url": f"/api/evidence/{e.id}/image" if e.evidence_type == "image" and has_file else None})
+    return items
+
+
+@app.get("/api/jobs/{jid}/evidence")
+def get_job_evidence(jid: str, db: Session = Depends(get_db)):
+    if not db.get(M.JobSession, jid): raise HTTPException(404, "Job not found")
+    return {"job_id": jid, "evidence": job_evidence_list(jid, db)}
+
+
+@app.post("/api/jobs/{jid}/evidence")
+async def add_job_evidence(jid: str, file: UploadFile = File(...), description: str = Form(default="Job photo evidence"),
+                           step_id: str = Form(default=""), db: Session = Depends(get_db), who=Depends(actor)):
+    j = db.get(M.JobSession, jid)
+    if not j: raise HTTPException(404, "Job not found")
+    if j.status == "finished": raise HTTPException(409, "Job is finished; evidence can no longer be attached")
+    if file.content_type not in ("image/jpeg", "image/png", "image/webp"):
+        raise HTTPException(415, "Only JPEG, PNG or WebP images are supported")
+    data = await file.read()
+    if len(data) > MAX_IMG_BYTES: raise HTTPException(413, "Image too large (max 8 MB)")
+    digest = hashlib.sha256(data).hexdigest()[:16]
+    ref = f"job:{jid}" + (f":{step_id}" if step_id else "")
+    e = M.Evidence(capture_session_id=None, evidence_type="image", description=description or "Job photo evidence",
+                   source_reference=ref, created_by=who["id"], extra={"sha256_16": digest, "size": len(data)})
+    db.add(e); db.flush()
+    suffix = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}.get(file.content_type or "", ".jpg")
+    store_dir = Path(__file__).resolve().parent.parent / "data" / "evidence"
+    store_dir.mkdir(parents=True, exist_ok=True)
+    (store_dir / f"{e.id}{suffix}").write_bytes(data)
+    e.storage_key = f"data/evidence/{e.id}{suffix}"
+    audit(db, who["id"], "job.evidence", "evidence", e.id, {"job": jid})
+    db.commit(); db.refresh(e)
+    return {"id": e.id, "size": len(data)}
 
 
 @app.post("/api/jobs/{jid}/finish")
@@ -1085,3 +1138,35 @@ def seed(db: Session = Depends(get_db)):
     db.add(M.ManualChunk(manual_id=man.id, chunk_index=0, page_number=1, text=man.extracted_text))
     db.commit()
     return {"seeded": True, "procedure_id": proc.id, "version_id": ver.id}
+
+
+# ---------------------------------------------------------------------------
+# Frontend hosting (production): serve the built PWA from this same origin so
+# the manifest, service worker and /api calls share one scope. Skipped when no
+# dist exists (local dev uses the Vite server on :5173 with its /api proxy).
+# Registered last: API routes above always take precedence.
+# ---------------------------------------------------------------------------
+def _frontend_dist() -> Path | None:
+    env = _os.getenv("FRONTEND_DIST")
+    candidates = [Path(env)] if env else []
+    here = Path(__file__).resolve()
+    candidates += [here.parent.parent.parent / "frontend" / "dist", here.parent.parent / "frontend" / "dist"]
+    for c in candidates:
+        if (c / "index.html").is_file():
+            return c
+    return None
+
+
+_DIST = _frontend_dist()
+if _DIST is not None:
+    from fastapi.responses import FileResponse as _FileResponse
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    def _spa(full_path: str):
+        if full_path.startswith("api/") or full_path == "api":
+            raise HTTPException(404, "Not found")
+        candidate = (_DIST / full_path).resolve()
+        if candidate.is_file() and _DIST.resolve() in candidate.parents:
+            media = "application/manifest+json" if candidate.name == "manifest.webmanifest" else None
+            return _FileResponse(candidate, media_type=media)
+        return _FileResponse(_DIST / "index.html")

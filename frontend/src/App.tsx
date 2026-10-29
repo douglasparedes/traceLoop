@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, setIdentity } from "./api";
 import { idb, uuid } from "./db";
+import { Icon, type IconName } from "./icons";
 import LiveMode from "./LiveMode";
 import TutorialMode from "./TutorialMode";
 import LiveTranscribe from "./LiveTranscribe";
@@ -42,6 +43,7 @@ interface ManualRow { id: string; title: string; model: string | null; chunks: n
 
 interface PendingReg { job_id: string; procedure_id: string; procedure_version_id: string }
 interface PendingFinish { job_id: string; outcome: string }
+interface PendingPhoto { key: string; job_id: string; step_id: string | null; description: string }
 
 async function loadPending<T>(key: string): Promise<T[]> {
   return (await idb.get<T[]>("meta", key)) || [];
@@ -65,6 +67,8 @@ export default function App() {
   const [activeVersion, setActiveVersion] = useState<Version | null>(null);
   const [activeJob, setActiveJob] = useState<LocalJob | null>(null);
   const [reviewVersion, setReviewVersion] = useState<Version | null>(null);
+  const [detailVersion, setDetailVersion] = useState<Version | null>(null);
+  const [storageNote, setStorageNote] = useState<string | null>(null);
 
   const notify = useCallback((text: string, kind: "ok" | "error" | "info" = "ok") => { setMsg(text); setMsgKind(kind); }, []);
 
@@ -101,6 +105,28 @@ export default function App() {
           catch { remaining.push(reg); problems++; }
         }
         await savePending("pending-regs", remaining);
+      }
+      // 1b) Upload job photos queued while offline, so their events can
+      // reference real server-side evidence in step 2 below.
+      const pendingPhotos = await loadPending<PendingPhoto>("pending-photos");
+      if (pendingPhotos.length) {
+        const remainingPhotos: PendingPhoto[] = [];
+        for (const ph of pendingPhotos) {
+          try {
+            const blob = await idb.get<Blob>("media", ph.key);
+            if (!blob) continue; // orphaned record: drop it
+            const fd = new FormData();
+            fd.append("file", blob, "job-photo.jpg");
+            fd.append("description", ph.description);
+            if (ph.step_id) fd.append("step_id", ph.step_id);
+            const up = await api.upload<{ id: string }>(`/api/jobs/${ph.job_id}/evidence`, fd);
+            await idb.del("media", ph.key);
+            const evid = uuid();
+            await idb.put("events", evid, { event_id: evid, session_id: ph.job_id, step_id: ph.step_id, event_type: "evidence_attached", payload: { evidence_id: up.id, description: ph.description }, occurred_at: new Date().toISOString(), sync_status: "pending" });
+            await refreshPending();
+          } catch { remainingPhotos.push(ph); problems++; }
+        }
+        await savePending("pending-photos", remainingPhotos);
       }
       // 2) Sync queued events (server acknowledges or reports duplicates).
       const evs = (await idb.all<JobEventRec>("events")).filter((e) => e.sync_status === "pending");
@@ -166,6 +192,24 @@ export default function App() {
     }
   }
 
+  async function openDetail(vid: string) {
+    const v = await openVersion(vid);
+    if (v) { setDetailVersion(v); setView("detail"); }
+    else notify("That version is not available offline yet.", "error");
+  }
+
+  useEffect(() => {
+    let alive = true;
+    if (typeof navigator !== "undefined" && navigator.storage?.estimate) {
+      navigator.storage.estimate().then((e) => {
+        if (!alive || !e.quota) return;
+        const gb = e.quota / 1024 ** 3;
+        setStorageNote(gb >= 1 ? `Storage: Ready (${Math.round(gb * 1024)} MB)` : "Storage: Ready");
+      }).catch(() => { /* estimate unavailable — omit the badge */ });
+    }
+    return () => { alive = false; };
+  }, []);
+
   async function startJob(p: ProcSummary) {
     if (!p.approved_version_id) { notify("This procedure has no approved version yet.", "error"); return; }
     const v = await openVersion(p.approved_version_id);
@@ -192,14 +236,20 @@ export default function App() {
   }
 
   const pendingReview = procs.filter((p) => p.has_pending_review).length;
-  const deskNav: { view: View; label: string }[] = [
-    { view: "home", label: "Workbench" }, { view: "library", label: "Procedures" }, { view: "capture", label: "Capture" },
-    { view: "review", label: `Review${pendingReview ? ` (${pendingReview})` : ""}` }, { view: "job", label: "Guided job" }, { view: "activity", label: "Activity" },
+  const deskNav: { view: View; label: string; icon: IconName }[] = [
+    { view: "home", label: "Workbench", icon: "home" }, { view: "library", label: "Procedures", icon: "book" }, { view: "capture", label: "Capture", icon: "addBox" },
+    { view: "review", label: `Review${pendingReview ? ` (${pendingReview})` : ""}`, icon: "edit" }, { view: "job", label: "Guided job", icon: "play" }, { view: "activity", label: "Activity", icon: "schedule" },
+    { view: "history", label: "History", icon: "timer" }, { view: "manuals", label: "Manuals", icon: "library" }, { view: "settings", label: "Settings", icon: "cog" },
   ];
-  const mobileNav: { view: View; label: string }[] = [
-    { view: "home", label: "Home" }, { view: "library", label: "Procedures" }, { view: "capture", label: "Capture" }, { view: "activity", label: pending ? `Activity (${pending})` : "Activity" },
+  const mobileNav: { view: View; label: string; icon: IconName }[] = [
+    { view: "home", label: "Home", icon: "home" }, { view: "library", label: "Procedures", icon: "book" }, { view: "capture", label: "Capture", icon: "addBox" },
+    { view: "activity", label: pending ? `Activity (${pending})` : "Activity", icon: "schedule" },
   ];
-  const mobileCurrent: View = view === "home" || view === "library" || view === "capture" ? view : "activity";
+  const mobileCurrent: View = view === "home" || view === "library" || view === "capture" ? view : view === "detail" ? "library" : "activity";
+  const screenLabel: Record<View, string> = {
+    home: "Home", library: "Procedures", detail: "Procedure", capture: "Capture", review: "Review",
+    job: "Guided job", history: "History", manuals: "Manuals", settings: "Settings", activity: "Activity",
+  };
 
   async function handleSetJob(j: LocalJob | null) {
     if (!j) { setActiveJob(null); return; }
@@ -221,26 +271,35 @@ export default function App() {
     <div>
       <a className="skip-link" href="#main">Skip to content</a>
       <header className="topbar">
-        <h1 className="brand">TraceLoop FieldGuard<small>Capture · Approve · Guide · Verify — offline-first</small></h1>
-        <span className={`pill ${online ? "online" : "offline"}`}>{online ? "Online" : "Offline — working locally"}</span>
-        <span className="pill">{pending} pending sync</span>
-        {syncState === "failed" && <span className="pill error">Sync needs attention</span>}
-        <button className="btn small secondary" onClick={() => void syncNow()} disabled={syncState === "syncing"}>{syncState === "syncing" ? "Syncing…" : "Sync now"}</button>
+        <div className="app-header-inner">
+          <div className="app-brand">
+            <span className="app-logo" aria-hidden="true">T</span>
+            <h1 className="brand">TraceLoop<small>{screenLabel[view]}</small></h1>
+          </div>
+          <div className="app-header-side">
+            <span className={`sync-pill${online ? "" : " offline"}`} role="status">
+              <span className="sync-dot" aria-hidden="true" />{online ? (syncState === "syncing" ? "Syncing…" : `Online · ${pending} pending`) : "Offline · local"}
+            </span>
+            {syncState === "failed" && <span className="pill error">Sync needs attention</span>}
+            <span className="avatar" title={`Demo identity: ${role}`} aria-label={`Demo identity: ${role}`}>{role[0].toUpperCase()}</span>
+          </div>
+        </div>
       </header>
       <div className="shell">
         <nav className="nav" aria-label="Primary">
           {deskNav.map((n) => (
-            <button key={n.view} aria-current={view === n.view ? "page" : undefined} onClick={() => setView(n.view)}>{n.label}</button>
+            <button key={n.view} aria-current={view === n.view ? "page" : undefined} onClick={() => setView(n.view)}><Icon name={n.icon} size={18} /> {n.label}</button>
           ))}
         </nav>
         <main id="main">
           {msg && <div className={`notice ${msgKind === "error" ? "error" : msgKind === "info" ? "info" : "ok"}`} role={msgKind === "error" ? "alert" : "status"}>{msg} <button className="btn small secondary" onClick={() => setMsg("")}>Dismiss</button></div>}
           {listsLoading && procs.length === 0 && <div className="card" aria-label="Loading procedures"><div className="skeleton" /><div className="skeleton" /><div className="skeleton" /></div>}
-          {view === "home" && <Home procs={procs} jobs={jobs} activeJob={activeJob} pending={pending} role={role} go={setView} continueJob={() => { if (activeJob) { openVersion(activeJob.procedure_version_id).then((v) => { if (v) { setActiveVersion(v); setView("job"); } else notify("Downloaded procedure not found on this device. Reconnect and open it from Procedures.", "error"); }); } }} />}
-          {view === "library" && <Library procs={procs} cachedIds={cachedIds} reload={loadLists} startJob={startJob} openVersion={async (vid) => { const v = await openVersion(vid); if (v) { setReviewVersion(v); setView("review"); } else notify("That version is not available offline yet.", "error"); }} cache={async (vid) => { const v = await openVersion(vid); notify(v ? "Saved for offline use — verified in local storage on this device." : "Download failed — check connection.", v ? "ok" : "error"); }} />}
+          {view === "home" && <Home procs={procs} jobs={jobs} activeJob={activeJob} activeVersion={activeVersion} pending={pending} online={online} storageNote={storageNote} role={role} go={setView} openReview={async (vid) => { const v = await openVersion(vid); if (v) { setReviewVersion(v); setView("review"); } else notify("That version is not available offline yet.", "error"); }} continueJob={() => { if (activeJob) { openVersion(activeJob.procedure_version_id).then((v) => { if (v) { setActiveVersion(v); setView("job"); } else notify("Downloaded procedure not found on this device. Reconnect and open it from Procedures.", "error"); }); } }} />}
+          {view === "library" && <Library procs={procs} cachedIds={cachedIds} reload={loadLists} startJob={startJob} openVersion={openDetail} cache={async (vid) => { const v = await openVersion(vid); notify(v ? "Saved for offline use — verified in local storage on this device." : "Download failed — check connection.", v ? "ok" : "error"); }} />}
+          {view === "detail" && <ProcedureDetail title={(detailVersion && procs.find((x) => x.id === detailVersion.procedure_id)?.title) || ""} version={detailVersion} cached={detailVersion ? cachedIds.has(detailVersion.id) : false} startJob={() => { const p = detailVersion ? procs.find((x) => x.id === detailVersion.procedure_id) : undefined; if (p) startJob(p); else if (detailVersion) notify("Procedure record unavailable — reload the library.", "error"); }} cache={async () => { if (detailVersion) { const v = await openVersion(detailVersion.id); notify(v ? "Saved for offline use — verified in local storage on this device." : "Download failed — check connection.", v ? "ok" : "error"); } }} openReview={() => { if (detailVersion) { setReviewVersion(detailVersion); setView("review"); } }} go={setView} />}
           {view === "capture" && <CaptureView done={(v) => { setReviewVersion(v); setView("review"); loadLists(); }} />}
           {view === "review" && <ReviewView version={reviewVersion} setVersion={setReviewVersion} procs={procs} openVersion={openVersion} role={role} reload={loadLists} notify={notify} />}
-          {view === "job" && <JobView job={activeJob} version={activeVersion} queueEvent={queueEvent} setJob={handleSetJob} notify={notify} reload={loadLists} go={setView} />}
+          {view === "job" && <JobView job={activeJob} version={activeVersion} queueEvent={queueEvent} setJob={handleSetJob} notify={notify} reload={loadLists} go={setView} pending={pending} online={online} offlineReady={activeVersion ? cachedIds.has(activeVersion.id) : false} />}
           {view === "activity" && <Activity jobs={jobs} pending={pending} pendingReview={pendingReview} reload={loadLists} go={setView} syncNow={() => void syncNow()} syncing={syncState === "syncing"} role={role} onProposeRevision={async (vid) => { const v = await openVersion(vid); if (v) { setReviewVersion(v); setView("review"); notify("Opened the job's exact revision. Use “Propose new revision” there — it goes through normal review."); } else notify("That revision is not available offline yet.", "error"); }} />}
           {view === "history" && <History jobs={jobs} reload={loadLists} role={role} onProposeRevision={async (vid) => { const v = await openVersion(vid); if (v) { setReviewVersion(v); setView("review"); } }} />}
           {view === "manuals" && <Manuals notify={notify} />}
@@ -250,7 +309,7 @@ export default function App() {
       {view !== "job" && (
         <nav className="bottomnav" aria-label="Primary mobile">
           {mobileNav.map((n) => (
-            <button key={n.view} aria-current={mobileCurrent === n.view ? "page" : undefined} onClick={() => setView(n.view)}>{n.label}</button>
+            <button key={n.view} aria-current={mobileCurrent === n.view ? "page" : undefined} onClick={() => setView(n.view)}><Icon name={n.icon} size={22} />{n.label}</button>
           ))}
         </nav>
       )}
@@ -258,33 +317,117 @@ export default function App() {
   );
 }
 
-function Home({ procs, jobs, activeJob, pending, role, go, continueJob }: { procs: ProcSummary[]; jobs: JobRow[]; activeJob: LocalJob | null; pending: number; role: Role; go: (v: View) => void; continueJob: () => void }) {
+function Home({ procs, jobs, activeJob, activeVersion, pending, online, storageNote, role, go, openReview, continueJob }: {
+  procs: ProcSummary[]; jobs: JobRow[]; activeJob: LocalJob | null; activeVersion: Version | null;
+  pending: number; online: boolean; storageNote: string | null; role: Role; go: (v: View) => void;
+  openReview: (vid: string) => void; continueJob: () => void;
+}) {
   const approved = procs.filter((p) => p.approved_version_id);
-  const pendingReview = procs.filter((p) => p.has_pending_review).length;
+  const reviewQueue = procs.flatMap((p) => p.versions.filter((v) => v.status === "pending_review" || v.status === "draft" || v.status === "rejected").map((v) => ({ ...v, title: p.title })));
+  const pendingDrafts = reviewQueue.filter((v) => v.status === "pending_review");
+  const hour = new Date().getHours();
+  const greeting = hour < 12 ? "Good morning" : hour < 18 ? "Good afternoon" : "Good evening";
+  const roleLabel = role === "reviewer" ? "Reviewer" : role === "expert" ? "Expert" : "Technician";
+  const today = new Date().toLocaleDateString(undefined, { weekday: "long", month: "short", day: "numeric" });
+  const doneCount = activeJob && activeVersion
+    ? activeVersion.steps.filter((s) => activeJob.stepStates[s.id] === "done").length : 0;
+  const totalSteps = activeVersion?.steps.length || 0;
   return (
     <div>
-      <div className="card primary-action">
-        <h2>{activeJob ? "Continue your job" : "What needs doing?"}</h2>
-        {activeJob ? (<div><p><strong>{activeJob.title}</strong> — step {activeJob.current + 1} in progress since {new Date(activeJob.started_at).toLocaleString()}. Your progress is saved on this device.</p>
-          <button className="btn" onClick={continueJob}>Continue active job</button></div>)
-          : (<div><p className="muted">Start from an approved procedure, or capture new expert knowledge. Approved work keeps running without a connection.</p>
-            <div className="row"><button className="btn" onClick={() => go("library")}>Find an approved procedure</button><button className="btn secondary" onClick={() => go("capture")}>Capture knowledge</button></div></div>)}
+      <div style={{ marginBottom: 12 }}>
+        <h2 style={{ fontSize: "1.7rem", letterSpacing: "-0.01em" }}>{greeting}, {roleLabel}</h2>
+        <p className="muted"><Icon name="domain" size={15} /> {today} · Field operations</p>
+        <div className="panel" role="status" style={{ marginTop: 8 }}>
+          <div className="row" style={{ justifyContent: "space-between" }}>
+            <span className="eyebrow"><span className="sync-dot" style={{ display: "inline-block", width: 8, height: 8, borderRadius: "50%", background: online ? "var(--primary-container)" : "var(--warn)", marginRight: 6 }} />{online ? `Online · ${pending} update${pending === 1 ? "" : "s"} pending sync` : `Offline · ${pending} update${pending === 1 ? "" : "s"} stored on this device`}</span>
+            {storageNote && <span className="badge neutral">{storageNote}</span>}
+          </div>
+        </div>
       </div>
-      {(pending > 0 || (pendingReview > 0 && role === "reviewer")) && (
-        <div className="card"><h3>Needs attention</h3>
-          {pending > 0 && <p>{pending} event(s) saved on this device, waiting for server acknowledgment. Use <strong>Sync now</strong> when connected.</p>}
-          {pendingReview > 0 && role === "reviewer" && <p>{pendingReview} procedure(s) waiting for your review.</p>}
-          <div className="row">{pendingReview > 0 && role === "reviewer" && <button className="btn secondary" onClick={() => go("review")}>Open review queue</button>}<button className="btn secondary" onClick={() => go("activity")}>Open activity</button></div>
+      {activeJob ? (
+        <div className="card accent-edge">
+          <div className="row" style={{ justifyContent: "space-between" }}>
+            <span className="badge ok"><Icon name="play" size={13} /> In-progress field job</span>
+            <span className="muted small-text num">{new Date(activeJob.started_at).toLocaleString()}</span>
+          </div>
+          <h2 style={{ marginTop: 8 }}>{activeJob.title}</h2>
+          <p className="muted small-text">Rev {activeVersion?.version_number} ({activeVersion?.status}) · saved on this device</p>
+          {totalSteps > 0 && (
+            <div className="panel" style={{ marginTop: 10 }}>
+              <div className="row" style={{ justifyContent: "space-between" }}>
+                <span className="small-text">Step {Math.min(activeJob.current + 1, totalSteps)} of {totalSteps}</span>
+                <strong className="num">{Math.round((doneCount / totalSteps) * 100)}%</strong>
+              </div>
+              <div className="progress" role="progressbar" aria-valuenow={doneCount} aria-valuemin={0} aria-valuemax={totalSteps} aria-label={`${doneCount} of ${totalSteps} steps complete`} style={{ marginTop: 6 }}><div style={{ width: `${(doneCount / totalSteps) * 100}%` }} /></div>
+            </div>
+          )}
+          <button className="btn" style={{ width: "100%", marginTop: 12 }} onClick={continueJob}>Resume step {totalSteps ? Math.min(activeJob.current + 1, totalSteps) : ""} <Icon name="forward" size={18} /></button>
+        </div>
+      ) : (
+        <div className="card primary-action">
+          <h2>What needs doing?</h2>
+          <p className="muted">Start from an approved procedure, or capture new expert knowledge. Approved work keeps running without a connection.</p>
+          <div className="row"><button className="btn" onClick={() => go("library")}>Find an approved procedure</button><button className="btn secondary" onClick={() => go("capture")}>Capture knowledge</button></div>
         </div>
       )}
-      <div className="grid">
-        <div className="card"><h3>Approved procedures ({approved.length})</h3><p className="muted">Only human-approved versions can start a job.</p><button className="btn secondary" onClick={() => go("library")}>Open procedure library</button></div>
-        <div className="card"><h3>Capture expert knowledge</h3><p className="muted">Record, photograph, and generate a reviewable draft — never auto-approved.</p><button className="btn secondary" onClick={() => go("capture")}>New capture session</button></div>
-        <div className="card"><h3>Recent work</h3><p className="muted">{jobs.length ? `${jobs.length} job(s) on record. Latest: ${jobs[0].procedure_title} (${jobs[0].status}).` : "No jobs yet."}</p><button className="btn secondary" onClick={() => go("activity")}>View activity</button></div>
+      <div className="grid" style={{ marginBottom: 14 }}>
+        <button className="card" style={{ textAlign: "left", margin: 0 }} onClick={() => go("capture")}>
+          <span className="tool-pill" style={{ background: "var(--primary-container)", color: "#fff" }}><Icon name="mic" size={20} /></span>
+          <span className="panel-title" style={{ display: "block", marginTop: 8 }}>Capture Knowledge</span>
+          <span className="muted small-text">Voice dictate or photo sequence</span>
+        </button>
+        <button className="card" style={{ textAlign: "left", margin: 0 }} onClick={() => go("library")}>
+          <span className="tool-pill"><Icon name="book" size={20} /></span>
+          <span className="panel-title" style={{ display: "block", marginTop: 8 }}>Procedure Library</span>
+          <span className="muted small-text">{approved.length} approved guide{approved.length === 1 ? "" : "s"}</span>
+        </button>
       </div>
-      <div className="card"><h3>Recent procedures</h3>
-        {procs.length === 0 ? <div className="empty">No procedures yet. Seed demo data from Activity → Settings, or capture expert knowledge.</div>
-          : procs.slice(0, 5).map((p) => <p key={p.id} className="list-row"><strong>{p.title}</strong> {p.approved_version_id ? <span className="tag approved">Approved version available</span> : <span className="tag warn">No approved version</span>}</p>)}
+      {reviewQueue.length > 0 && (
+        <div style={{ marginBottom: 14 }}>
+          <div className="row" style={{ justifyContent: "space-between" }}>
+            <h3><Icon name="flag" size={17} /> Needs human sign-off</h3>
+            {pendingDrafts.length > 0 && <span className="badge review">{pendingDrafts.length} pending</span>}
+          </div>
+          <div className="card">
+            <div className="row" style={{ justifyContent: "space-between" }}>
+              <strong>{reviewQueue[0].title}</strong>
+              <span className="badge review">v{reviewQueue[0].version_number} · {reviewQueue[0].status.replace("_", " ")}</span>
+            </div>
+            <p className="muted small-text">AI drafts are never executable until a reviewer approves them.</p>
+            <div className="row" style={{ justifyContent: "space-between" }}>
+              <span className="muted small-text">{reviewQueue.length} version{reviewQueue.length === 1 ? "" : "s"} awaiting review</span>
+              <button className="btn secondary" onClick={() => openReview(reviewQueue[0].id)}>Review draft &amp; evidence <Icon name="chevronRight" size={17} /></button>
+            </div>
+          </div>
+        </div>
+      )}
+      <div>
+        <div className="row" style={{ justifyContent: "space-between" }}>
+          <h3>Recent field work</h3>
+          <span className="muted small-text">Job journal</span>
+        </div>
+        {jobs.length === 0 ? (
+          <div className="card"><div className="empty">No jobs yet. Start one from an approved procedure.</div></div>
+        ) : (
+          <div className="recent-grid">
+            {jobs.slice(0, 4).map((j) => (
+          <div key={j.id} className="card" style={{ marginBottom: 0 }}>
+            <div className="row" style={{ justifyContent: "space-between" }}>
+              <div style={{ minWidth: 0 }}>
+                <strong style={{ display: "block", overflow: "hidden", textOverflow: "ellipsis" }}>{j.procedure_title}</strong>
+                <span className="muted small-text num">{new Date(j.started_at).toLocaleString()} · {j.events} event{j.events === 1 ? "" : "s"} · server-confirmed</span>
+              </div>
+              {j.outcome === "completed"
+                ? <span className="badge ok"><Icon name="check" size={13} /> Pass</span>
+                : j.status === "finished"
+                  ? <span className="badge warn"><Icon name="flag" size={13} /> {j.outcome || "Finished"}</span>
+                  : <span className="badge info">Open</span>}
+            </div>
+          </div>
+            ))}
+          </div>
+        )}
+        {jobs.length > 0 && <button className="btn secondary" style={{ marginTop: 12 }} onClick={() => go("activity")}>View all activity</button>}
       </div>
     </div>
   );
@@ -293,13 +436,13 @@ function Home({ procs, jobs, activeJob, pending, role, go, continueJob }: { proc
 function Activity({ jobs, pending, pendingReview, reload, go, syncNow, syncing, role, onProposeRevision }: { jobs: JobRow[]; pending: number; pendingReview: number; reload: () => void; go: (v: View) => void; syncNow: () => void; syncing: boolean; role: Role; onProposeRevision: (versionId: string) => void }) {
   return (
     <div>
-      <div className="card"><h2>Activity</h2>
+      <div className="card"><h2><Icon name="schedule" size={20} /> Activity</h2>
         <p>{pending} event(s) pending synchronization. Events are only marked synced after the server acknowledges them.</p>
         <div className="row">
-          <button className="btn" onClick={syncNow} disabled={syncing}>{syncing ? "Syncing…" : "Sync now"}</button>
-          <button className="btn secondary" onClick={() => go("review")}>Review queue{pendingReview ? ` (${pendingReview})` : ""}</button>
-          <button className="btn secondary" onClick={() => go("manuals")}>Manuals</button>
-          <button className="btn secondary" onClick={() => go("settings")}>Settings</button>
+          <button className="btn" onClick={syncNow} disabled={syncing}><Icon name="sync" size={18} /> {syncing ? "Syncing…" : "Sync now"}</button>
+          <button className="btn secondary" onClick={() => go("review")}><Icon name="flag" size={17} /> Review queue{pendingReview ? ` (${pendingReview})` : ""}</button>
+          <button className="btn secondary" onClick={() => go("manuals")}><Icon name="book" size={17} /> Manuals</button>
+          <button className="btn secondary" onClick={() => go("settings")}><Icon name="cog" size={17} /> Settings</button>
         </div>
       </div>
       <History jobs={jobs} reload={reload} role={role} onProposeRevision={onProposeRevision} />
@@ -307,33 +450,174 @@ function Activity({ jobs, pending, pendingReview, reload, go, syncNow, syncing, 
   );
 }
 
+function ProcedureDetail({ title, version, cached, startJob, cache, openReview, go }: { title: string; version: Version | null; cached: boolean; startJob: () => void; cache: () => void; openReview: () => void; go: (v: View) => void }) {
+  if (!version) return <div className="card"><div className="empty"><h3>No procedure selected</h3><p>Pick a procedure from the library to inspect its approved revision, steps, and tooling.</p><button className="btn" onClick={() => go("library")}>Open procedure library</button></div></div>;
+  const tools = [...new Set(version.steps.flatMap((s) => s.required_tools || []))];
+  const safety = ((version.source_evidence as { safety_notes?: string[] }).safety_notes || []).filter(Boolean);
+  const canStart = version.status === "approved" && version.steps.length > 0;
+  return (
+    <div>
+      <button className="btn small secondary" onClick={() => go("library")}><Icon name="back" size={17} /> Library</button>
+      <div className="detail-layout" style={{ marginTop: 10 }}>
+      <div className="card" style={{ marginTop: 0 }}>
+        <div className="proc-badges">
+          {version.status === "approved"
+            ? <span className="badge ok"><Icon name="verified" size={13} /> Approved (Rev {version.version_number})</span>
+            : version.status === "pending_review"
+              ? <span className="badge review"><Icon name="warning" size={13} /> Pending review · Draft v{version.version_number}</span>
+              : <span className="badge neutral"><Icon name="note" size={13} /> {version.status} · v{version.version_number}</span>}
+          {cached ? <span className="badge ok"><Icon name="check" size={13} /> Offline cached</span> : <span className="badge neutral"><Icon name="cloudDone" size={13} /> Server only</span>}
+          {version.ai_simulated ? <span className="badge info">AI draft · simulated model</span> : version.ai_model ? <span className="badge info">AI draft · {version.ai_model}</span> : null}
+        </div>
+        <h2 style={{ marginTop: 8 }}>{title || "Procedure"}</h2>
+        <p className="muted">{version.summary}</p>
+        {version.prerequisites && <p><strong>Prerequisites:</strong> {version.prerequisites}</p>}
+        {safety.length > 0 && (
+          <div className="safety-banner"><Icon name="warning" size={20} /><div><strong>Mandatory safety</strong><p style={{ margin: "4px 0 0" }}>{safety.join(" ")}</p></div></div>
+        )}
+        {tools.length > 0 && (
+          <div style={{ marginTop: 10 }}>
+            <span className="eyebrow">Required field tooling</span>
+            <div className="tool-pills" style={{ marginTop: 6 }}>{tools.map((t) => <span key={t} className="tool-pill">{t}</span>)}</div>
+          </div>
+        )}
+        <div className="proc-actions" style={{ marginTop: 12 }}>
+          {canStart && <button className="btn" onClick={startJob}><Icon name="play" size={19} /> Start procedure</button>}
+          {version.status !== "approved" && <button className="btn review" onClick={openReview}><Icon name="flag" size={19} /> Open in review</button>}
+          <button className="btn secondary" onClick={cache}><Icon name="download" size={19} /> {cached ? "Update offline copy" : "Save for offline use"}</button>
+        </div>
+        {!canStart && version.status === "approved" && <p className="muted small-text">This approved version has no steps, so a guided job cannot start. Ask a reviewer to create a revision with steps.</p>}
+        {version.status !== "approved" && <p className="muted small-text">Drafts and pending versions cannot start jobs. Only human-approved versions are executable.</p>}
+      </div>
+      <div className="card">
+        <h3>Steps ({version.steps.length})</h3>
+        {version.steps.length === 0 && <div className="empty">No steps in this version yet.</div>}
+        {[...version.steps].sort((a, b) => a.step_order - b.step_order).map((s) => (
+          <div key={s.id} className="list-row">
+            <p style={{ margin: "0 0 4px" }}><strong>Step {s.step_order}: {s.title}</strong></p>
+            <p className="muted small-text" style={{ margin: "0 0 4px" }}>{s.instruction}</p>
+            {s.expected_result && <p className="small-text" style={{ margin: 0 }}><strong>Expected:</strong> {s.expected_result}</p>}
+          </div>
+        ))}
+      </div>
+      </div>
+    </div>
+  );
+}
+
 function Library({ procs, cachedIds, reload, startJob, openVersion, cache }: { procs: ProcSummary[]; cachedIds: Set<string>; reload: () => void; startJob: (p: ProcSummary) => void; openVersion: (id: string) => void; cache: (id: string) => void }) {
   const [q, setQ] = useState("");
-  const [filter, setFilter] = useState<"all" | "approved" | "offline">("all");
-  const list = procs.filter((p) => p.title.toLowerCase().includes(q.toLowerCase()))
-    .filter((p) => filter === "all" || (filter === "approved" ? !!p.approved_version_id : !!(p.approved_version_id && cachedIds.has(p.approved_version_id))));
+  const [filter, setFilter] = useState<"all" | "approved" | "offline" | "drafts" | "review">("all");
+  const [cat, setCat] = useState<string>("all");
+  const [sort, setSort] = useState<"updated" | "title">("updated");
+  const isOfflineReady = (p: ProcSummary) => !!(p.approved_version_id && cachedIds.has(p.approved_version_id));
+  const hasDraft = (p: ProcSummary) => p.versions.some((v) => v.status === "draft" || v.status === "rejected");
+  const needsReview = (p: ProcSummary) => p.versions.some((v) => v.status === "pending_review");
+  const counts = {
+    all: procs.length,
+    approved: procs.filter((p) => p.approved_version_id).length,
+    offline: procs.filter(isOfflineReady).length,
+    drafts: procs.filter(hasDraft).length,
+    review: procs.filter(needsReview).length,
+  };
+  const cats = [...new Set(procs.map((p) => (p.asset_type || "").trim()).filter(Boolean))].sort();
+  const list = procs
+    .filter((p) => (p.title + " " + (p.asset_type || "")).toLowerCase().includes(q.toLowerCase()))
+    .filter((p) => filter === "all" || (filter === "approved" ? !!p.approved_version_id : filter === "offline" ? isOfflineReady(p) : filter === "drafts" ? hasDraft(p) : needsReview(p)))
+    .filter((p) => cat === "all" || (p.asset_type || "").trim() === cat)
+    .sort((a, b) => sort === "title" ? a.title.localeCompare(b.title) : (b.updated_at || "").localeCompare(a.updated_at || ""));
+  const tab = (key: typeof filter, label: string) => (
+    <button key={key} className="filter-tab" aria-pressed={filter === key} onClick={() => setFilter(key)}>
+      {key === "offline" && <Icon name="download" size={15} />}{label} <span className="num">({counts[key]})</span>
+    </button>
+  );
+  const resetFilters = () => { setQ(""); setFilter("all"); setCat("all"); };
   return (
-    <div className="card">
-      <h2>Procedure library</h2>
-      <label htmlFor="proc-search">Search procedures</label>
-      <input id="proc-search" value={q} onChange={(e) => setQ(e.target.value)} placeholder="e.g. cable harness" />
-      <label htmlFor="proc-filter">Show</label>
-      <select id="proc-filter" value={filter} onChange={(e) => setFilter(e.target.value as typeof filter)}>
-        <option value="all">All procedures</option><option value="approved">Approved only</option><option value="offline">Offline-ready only</option>
-      </select>
-      <button className="btn small secondary" onClick={reload} style={{ margin: "10px 0" }}>Refresh from server</button>
-      {list.length === 0 && <div className="empty">No procedures match. Capture expert knowledge or seed the demo from Activity → Settings.</div>}
-      {list.map((p) => { const latest = p.versions[p.versions.length - 1]; const offlineReady = !!(p.approved_version_id && cachedIds.has(p.approved_version_id)); return (
-        <div key={p.id} className="card">
-          <h3>{p.title}</h3>
-          <p>{p.versions.map((v) => <span key={v.id} className={`tag ${v.status === "approved" ? "approved" : v.status === "pending_review" ? "warn" : ""}`}>v{v.version_number} · {v.status}</span>)}{offlineReady && <span className="tag approved">Offline ready</span>}</p>
-          {p.updated_at && <p className="muted small-text">Updated {new Date(p.updated_at).toLocaleDateString()}</p>}
-          <div className="row">
-            <button className="btn" disabled={!p.approved_version_id} onClick={() => startJob(p)}>Start guided job</button>
-            {p.approved_version_id && <button className="btn secondary" onClick={() => cache(p.approved_version_id!)}>{offlineReady ? "Update offline copy" : "Save for offline use"}</button>}
-            {latest && <button className="btn secondary" onClick={() => openVersion(latest.id)}>Inspect latest version</button>}
+    <div>
+      <section className="card">
+        <div className="row" style={{ justifyContent: "flex-start" }}>
+          <span className="tool-pill" style={{ background: "var(--primary-container)", color: "#fff" }}><Icon name="cloudDone" size={20} /></span>
+          <div>
+            <span className="eyebrow">Offline ready · sector storage</span>
+            <p className="small-text" style={{ margin: 0 }}>{counts.offline} procedure{counts.offline === 1 ? "" : "s"} cached with full content for zero-connectivity field zones.</p>
           </div>
-        </div> ); })}
+        </div>
+      </section>
+      <div className="row" style={{ justifyContent: "space-between" }}>
+        <div>
+          <h2>Procedure Library</h2>
+          <p className="muted" style={{ marginTop: -8 }}>Approved maintenance guides &amp; pending revisions</p>
+        </div>
+        <button className="btn small secondary icon-only" aria-label={sort === "updated" ? "Sorted by most recently updated. Activate to sort by title." : "Sorted by title. Activate to sort by most recently updated."} onClick={() => setSort(sort === "updated" ? "title" : "updated")}><Icon name="sort" size={18} /> {sort === "updated" ? "Updated" : "Title"}</button>
+      </div>
+      <div className="panel" style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+        <Icon name="search" size={20} />
+        <label htmlFor="proc-search" className="visually-hidden">Search procedures</label>
+        <input id="proc-search" value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search by equipment, tag, or ID..." style={{ border: 0, background: "transparent", minHeight: 40, padding: "6px 0" }} />
+        {q && <button className="btn small secondary icon-only" aria-label="Clear search" onClick={() => setQ("")}><Icon name="close" size={17} /></button>}
+      </div>
+      <div className="filter-tabs" role="group" aria-label="Status filter">
+        {tab("all", "All")}{tab("approved", "Approved")}{tab("offline", "Downloaded")}{tab("drafts", "Drafts")}{tab("review", "Review")}
+      </div>
+      {cats.length > 1 && (
+        <div className="cat-pills" role="group" aria-label="Equipment category">
+          <span className="eyebrow"><Icon name="grid" size={13} /> Category:</span>
+          <button className="cat-pill" aria-pressed={cat === "all"} onClick={() => setCat("all")}>All gear</button>
+          {cats.map((c) => <button key={c} className="cat-pill" aria-pressed={cat === c} onClick={() => setCat(c)}>{c}</button>)}
+        </div>
+      )}
+      <div className="proc-grid" style={{ marginTop: 10 }}>
+      {list.length === 0 && (
+        <div className="card"><div className="empty">
+          <p><strong>No matching procedures</strong></p>
+          <p>Try adjusting equipment tags or clearing the search query.</p>
+          <button className="btn secondary" style={{ marginTop: 8 }} onClick={resetFilters}>Clear filter</button>
+        </div></div>
+      )}
+      {list.map((p) => {
+        const offlineReady = isOfflineReady(p);
+        const review = p.versions.find((v) => v.status === "pending_review");
+        const draft = p.versions.find((v) => v.status === "draft" || v.status === "rejected");
+        const approvedV = p.versions.filter((v) => v.status === "approved").slice(-1)[0];
+        return (
+          <article key={p.id} className="proc-card">
+            <div className="proc-badges">
+              {approvedV
+                ? <span className="badge ok"><Icon name="verified" size={13} /> Approved (Rev {approvedV.version_number})</span>
+                : review ? <span className="badge review"><Icon name="warning" size={13} /> Pending review · Draft v{review.version_number}</span>
+                : draft ? <span className="badge neutral"><Icon name="note" size={13} /> Draft v{draft.version_number} · in progress</span>
+                : <span className="badge neutral">No approved version</span>}
+              {p.approved_version_id && (offlineReady
+                ? <span className="badge ok"><Icon name="check" size={13} /> Offline cached</span>
+                : <span className="badge neutral"><Icon name="cloudDone" size={13} /> Not downloaded</span>)}
+            </div>
+            <div>
+              <h3 style={{ marginBottom: 2 }}>{p.title}</h3>
+              <p className="muted small-text" style={{ margin: 0 }}>
+                {p.asset_type ? <>{p.asset_type} · </> : ""}{p.versions.length} version{p.versions.length === 1 ? "" : "s"}{p.updated_at ? <> · Updated {new Date(p.updated_at).toLocaleDateString()}</> : ""}
+              </p>
+            </div>
+            {review && (
+              <div className="panel">
+                <span className="small-text"><Icon name="bot" size={15} /> <strong>AI-generated draft.</strong> <span className="muted">Not executable in the field until reviewed by a Level-3 specialist.</span></span>
+              </div>
+            )}
+            <div className="proc-actions">
+              {p.approved_version_id
+                ? <><button className="btn" onClick={() => startJob(p)}><Icon name="play" size={19} /> Start Job</button>
+                  <button className="btn secondary" aria-label={offlineReady ? `Update offline copy of ${p.title}` : `Download ${p.title} for offline use`} onClick={() => p.approved_version_id && cache(p.approved_version_id)}><Icon name="download" size={19} /></button></>
+                : review
+                  ? <button className="btn review" onClick={() => openVersion(review.id)}><Icon name="flag" size={19} /> Review Draft</button>
+                  : draft
+                    ? <button className="btn secondary" onClick={() => openVersion(draft.id)}><Icon name="edit" size={19} /> Continue Editing</button>
+                    : null}
+              <button className="btn secondary" aria-label={`View details of ${p.title}`} onClick={() => openVersion((review || draft || approvedV || p.versions[p.versions.length - 1])?.id || "")}><Icon name="eye" size={19} /></button>
+            </div>
+          </article>
+        );
+      })}
+      </div>
+      <button className="btn small secondary" onClick={reload} style={{ marginTop: 10 }}><Icon name="sync" size={16} /> Refresh from server</button>
     </div>
   );
 }
@@ -370,6 +654,8 @@ function CaptureView({ done }: { done: (v: Version) => void }) {
   const [recoveryTap, setRecoveryTap] = useState<{ nx: number; ny: number } | null>(null);
   const dismissedPhraseRef = useRef("");
   const [capStep, setCapStep] = useState(0);
+  const [assets, setAssets] = useState<{ id: string; name: string }[]>([]);
+  const [photoCount, setPhotoCount] = useState(0);
   // Steps unlock once the session exists; evidence/transcript completeness
   // is shown per step but never blocks (drafts work without photos).
   const maxCapStep = capId ? 3 : 0;
@@ -392,6 +678,20 @@ function CaptureView({ done }: { done: (v: Version) => void }) {
     camStreamRef.current?.getTracks().forEach((t) => t.stop());
     camStreamRef.current = null; setCameraOpen(false);
   }
+  useEffect(() => {
+    api.get<{ id: string; name: string }[]>("/api/assets").then((rows) => {
+      const seen = new Set<string>();
+      setAssets(rows.filter((r) => (r.name || "").trim() && !seen.has(r.name.trim()) && (seen.add(r.name.trim()), true)));
+    }).catch(() => { /* offline: free-text asset still works */ });
+  }, []);
+  useEffect(() => {
+    if (!capId) { setPhotoCount(0); return; }
+    let alive = true;
+    api.get<{ evidence: { evidence_type: string }[] }>(`/api/capture-sessions/${capId}`)
+      .then((r) => { if (alive) setPhotoCount((r.evidence || []).filter((e) => e.evidence_type === "image").length); })
+      .catch(() => { /* offline: count stays */ });
+    return () => { alive = false; };
+  }, [capId, photoEvId]);
   useEffect(() => {
     if (cameraOpen && videoRef.current && camStreamRef.current) {
       videoRef.current.srcObject = camStreamRef.current;
@@ -550,15 +850,52 @@ function CaptureView({ done }: { done: (v: Version) => void }) {
     } catch (e) { say(e instanceof Error ? e.message : "Draft generation failed — your transcript stays saved.", "error"); } finally { setBusy(false); }
   }
 
+  function discardDraft() {
+    try { localStorage.removeItem(CAPTURE_DRAFT_KEY); } catch { /* ignore */ }
+    stopCamera();
+    if (photoUrlRef.current) { URL.revokeObjectURL(photoUrlRef.current); photoUrlRef.current = null; }
+    setCapId(null); setPhotoEvId(null); setPhotoUrl(null); setSeg(null); setSegAttempts([]); setSuggestions([]); setDetectedPhrase(null); setRecoveryTap(null);
+    setTranscript(""); setCapStep(0);
+    say("Local draft cleared. Any session already created on the server is untouched — start a new session when ready.", "ok");
+  }
+
   return (
-    <div className="card">
-      <h2>Knowledge capture</h2>
+    <div>
+      <span className="eyebrow"><Icon name="bot" size={14} /> Knowledge ingestion</span>
+      <h2>Capture Knowledge</h2>
+      <p className="muted" style={{ marginTop: -8 }}>Turn hands-on expertise into evidence-backed field procedures</p>
       <div className="row" role="group" aria-label="Capture mode" style={{ marginBottom: 12 }}>
-        <button className={`btn small ${mode === "photo" ? "" : "secondary"}`} aria-pressed={mode === "photo"} onClick={() => setMode("photo")}>Quick capture</button>
-        <button className={`btn small ${mode === "live" ? "" : "secondary"}`} aria-pressed={mode === "live"} onClick={() => setMode("live")}>Live</button>
-        <button className={`btn small ${mode === "tutorial" ? "" : "secondary"}`} aria-pressed={mode === "tutorial"} onClick={() => setMode("tutorial")}>Record a tutorial</button>
+        <button className={`btn small ${mode === "photo" ? "" : "secondary"}`} aria-pressed={mode === "photo"} onClick={() => setMode("photo")}><Icon name="mic" size={17} /> Quick capture</button>
+        <button className={`btn small ${mode === "live" ? "" : "secondary"}`} aria-pressed={mode === "live"} onClick={() => setMode("live")}><Icon name="videocam" size={17} /> Live</button>
+        <button className={`btn small ${mode === "tutorial" ? "" : "secondary"}`} aria-pressed={mode === "tutorial"} onClick={() => setMode("tutorial")}><Icon name="play" size={17} /> Record a tutorial</button>
       </div>
-      {mode === "tutorial" ? <TutorialMode onUseTranscript={(t) => { setTranscript(t); setMode("photo"); }} /> : mode === "live" ? <LiveMode captureId={capId} onTranscript={(t) => setTranscript(t)} onEvidenceSaved={(id) => { setPhotoEvId(id); setMode("photo"); say("Live frame saved as photo evidence — run SAM or generate the draft in Photo mode.", "ok"); }} /> : (<>
+      {mode === "tutorial" ? (
+        <div className="card">
+          <h3>Record video tutorial</h3>
+          <p className="muted small-text">Record continuous work video. AI extracts key frames, step boundaries, and component highlights for human review.</p>
+          <div className="stat-tiles" style={{ marginBottom: 10 }}>
+            <div className="stat-tile"><span className="t"><Icon name="check" size={14} /> Auto key-frames</span></div>
+            <div className="stat-tile"><span className="t"><Icon name="check" size={14} /> Audio demixing</span></div>
+            <div className="stat-tile"><span className="t"><Icon name="check" size={14} /> Step segmentation</span></div>
+          </div>
+          <TutorialMode onUseTranscript={(t) => { setTranscript(t); setMode("photo"); }} />
+        </div>
+      ) : mode === "live" ? <LiveMode captureId={capId} onTranscript={(t) => setTranscript(t)} onEvidenceSaved={(id) => { setPhotoEvId(id); setMode("photo"); say("Live frame saved as photo evidence — run SAM or generate the draft in Quick capture.", "ok"); }} /> : (<>
+      <section className="card" aria-label="Local capture draft">
+        <div className="row" style={{ justifyContent: "space-between" }}>
+          <span className="eyebrow"><Icon name="edit" size={14} /> {capId ? "Saved locally · ready for synthesis" : "New capture session"}</span>
+          <span className="badge neutral num">{photoCount} photo{photoCount === 1 ? "" : "s"} · {transcript.trim() ? transcript.trim().split(/\s+/).length : 0} words</span>
+        </div>
+        <p style={{ margin: "8px 0 2px" }}><strong>{title || "Untitled session"}</strong></p>
+        <p className="muted small-text" style={{ margin: 0 }}>Asset: {assetName || "—"}</p>
+        <div className="row" style={{ marginTop: 10 }}>
+          <button className="btn" style={{ flex: 1 }} onClick={generate} disabled={!capId || busy}><Icon name="forward" size={18} /> {busy ? "Working…" : "Generate procedure draft"}</button>
+        </div>
+        <div className="row" style={{ justifyContent: "space-between", marginTop: 8 }}>
+          <button className="btn small secondary" onClick={discardDraft} disabled={busy}><Icon name="trash" size={16} /> Discard draft</button>
+          <span className="muted small-text">Stored on device storage</span>
+        </div>
+      </section>
       <ol className="steps-indicator" aria-label="Capture progress">
         {(["Session", "Evidence", "Transcript", "Review & draft"] as const).map((label, i) => {
           const done = i === 0 ? !!capId : i === 1 ? !!photoEvId : i === 2 ? transcript.trim().length > 0 : false;
@@ -576,7 +913,9 @@ function CaptureView({ done }: { done: (v: Version) => void }) {
       {capStep === 0 && (<>
       <h3>1 · Session details</h3>
       <label htmlFor="cap-title">Session title</label><input id="cap-title" value={title} onChange={(e) => setTitle(e.target.value)} />
-      <label htmlFor="cap-asset">Training asset</label><input id="cap-asset" value={assetName} onChange={(e) => setAssetName(e.target.value)} />
+      <label htmlFor="cap-asset">Target equipment</label>
+      <input id="cap-asset" value={assetName} onChange={(e) => setAssetName(e.target.value)} list="asset-list" placeholder="e.g. Pump P-104 (Centrifugal Feed)" />
+      <datalist id="asset-list">{assets.map((a) => <option key={a.id} value={a.name} />)}</datalist>
       <label htmlFor="cap-desc">Task description</label><textarea id="cap-desc" rows={2} value={desc} onChange={(e) => setDesc(e.target.value)} />
       <div className="row" style={{ marginTop: 12 }}>
         <button className="btn" onClick={async () => { const id = await create(); if (id) setCapStep(1); }} disabled={!!capId || busy}>{capId ? "Session created" : busy ? "Creating..." : "Create capture session"}</button>
@@ -682,6 +1021,10 @@ function CaptureView({ done }: { done: (v: Version) => void }) {
       )}
       </>)}
       {status && <div className={`notice ${statusKind === "error" ? "error" : statusKind === "ok" ? "ok" : "warn"}`} role={statusKind === "error" ? "alert" : "status"}>{status}</div>}
+      <section className="card" aria-label="Privacy and safety" style={{ marginTop: 12 }}>
+        <p style={{ margin: "0 0 6px" }}><strong><Icon name="shield" size={17} /> TraceLoop privacy &amp; operational safety</strong></p>
+        <p className="muted small-text" style={{ margin: 0 }}>AI synthesizes draft procedures strictly for authorized reviewer sign-off. AI drafts cannot be executed without human approval. The Meta API key lives only on the server — recordings are sent for transcription only when connected and only after you press Record.</p>
+      </section>
       </>)}
     </div>
   );
@@ -760,6 +1103,13 @@ function ReviewView({ version, setVersion, procs, openVersion, role, reload, not
   const [confirmApprove, setConfirmApprove] = useState(false);
   const queue = procs.flatMap((p) => p.versions.filter((v) => v.status === "pending_review" || v.status === "draft" || v.status === "rejected").map((v) => ({ ...v, title: p.title })));
   const canReview = role === "reviewer" || role === "expert";
+  const autoOpened = useRef<string | null>(null);
+  useEffect(() => {
+    if (!version && queue.length > 0 && autoOpened.current !== queue[0].id) {
+      autoOpened.current = queue[0].id;
+      openVersion(queue[0].id).then((v) => { if (v) setVersion(v); else autoOpened.current = null; });
+    }
+  });
   async function act(path: string, ok: string) {
     if (!version) return;
     if (path === "reject" && !comment.trim()) { notify("Add a rejection reason first so the author knows what to fix.", "error"); return; }
@@ -775,16 +1125,30 @@ function ReviewView({ version, setVersion, procs, openVersion, role, reload, not
     setBusy(false);
   }
   return (
-    <div>
-      <div className="card"><h2>Review &amp; approvals</h2>
+    <div className="review-layout">
+      <div className="card"><h2><Icon name="flag" size={20} /> Review &amp; approvals</h2>
         <p className="muted">AI drafts are never approved automatically. {canReview ? "You can approve or reject versions pending review." : "Approval needs the Reviewer demo role (Activity → Settings) — the server enforces this."} Signed-in role: <strong>{role}</strong>.</p>
-        <div className="row">{queue.map((v) => <button key={v.id} className="btn small secondary" onClick={async () => { const ver = await openVersion(v.id); if (ver) setVersion(ver); else notify("That version is not available offline yet.", "error"); }}>{v.title} · v{v.version_number} · {v.status}</button>)}
-        {queue.length === 0 && <span className="muted">Queue empty — generate a draft in Capture.</span>}</div>
+        {queue.length === 0
+          ? <div className="empty">Queue empty — generate a draft in Capture.</div>
+          : queue.map((v) => (
+            <div key={v.id} className="list-row">
+              <div className="row" style={{ justifyContent: "space-between" }}>
+                <div style={{ minWidth: 0 }}>
+                  <strong style={{ display: "block" }}>{v.title}</strong>
+                  <span className="muted small-text">v{v.version_number} · {v.status.replace("_", " ")}</span>
+                </div>
+                <button className="btn small secondary" onClick={async () => { const ver = await openVersion(v.id); if (ver) setVersion(ver); else notify("That version is not available offline yet.", "error"); }}>Review draft &amp; evidence</button>
+              </div>
+            </div>
+          ))}
       </div>
       {version && (
         <div className="card">
-          <h3>{version.steps.length ? "Procedure draft" : "Procedure"} · v{version.version_number} <span className={`tag ${version.status === "approved" ? "approved" : "warn"}`}>{version.status}</span>
-            {version.ai_simulated ? <span className="tag ai">AI draft · simulated model (no Meta key)</span> : version.ai_model ? <span className="tag ai">AI draft · {version.ai_model}</span> : <span className="tag">Seeded demo data</span>}</h3>
+          <div className="proc-badges">
+            <span className={`badge ${version.status === "approved" ? "ok" : version.status === "pending_review" ? "review" : "neutral"}`}>{version.status.replace("_", " ")} · v{version.version_number}</span>
+            {version.ai_simulated ? <span className="badge info"><Icon name="bot" size={13} /> AI draft · simulated model (no Meta key)</span> : version.ai_model ? <span className="badge info"><Icon name="bot" size={13} /> AI draft · {version.ai_model}</span> : <span className="badge neutral">Seeded demo data</span>}
+          </div>
+          <h3 style={{ marginTop: 8 }}>{version.steps.length ? "Procedure draft" : "Procedure"}</h3>
           <label htmlFor="rv-sum">Summary</label><input id="rv-sum" value={version.summary} disabled={version.status === "approved"} onChange={(e) => setVersion({ ...version, summary: e.target.value })} />
           <label htmlFor="rv-pre">Prerequisites</label><textarea id="rv-pre" rows={2} value={version.prerequisites} disabled={version.status === "approved"} onChange={(e) => setVersion({ ...version, prerequisites: e.target.value })} />
           {Array.isArray((version.source_evidence as { uncertainties?: string[] }).uncertainties) && <div className="notice warn"><strong>Uncertainties to resolve:</strong> {((version.source_evidence as { uncertainties?: string[] }).uncertainties || []).join(" ")}</div>}
@@ -880,85 +1244,264 @@ function StepEvidence({ versionId, step }: { versionId: string; step: Step }) {
   );
 }
 
-function JobView({ job, version, queueEvent, setJob, notify, reload, go }: { job: LocalJob | null; version: Version | null; queueEvent: (e: Omit<JobEventRec, "sync_status">) => Promise<void>; setJob: (j: LocalJob | null) => Promise<void>; notify: (s: string, kind?: "ok" | "error" | "info") => void; reload: () => void; go: (v: View) => void }) {
+interface JobPhoto {
+  id: string; description: string; step_id: string | null; captured_at: string | null; image_url: string | null;
+}
+
+function JobView({ job, version, queueEvent, setJob, notify, reload, go, pending, online, offlineReady }: {
+  job: LocalJob | null; version: Version | null;
+  queueEvent: (e: Omit<JobEventRec, "sync_status">) => Promise<void>; setJob: (j: LocalJob | null) => Promise<void>;
+  notify: (s: string, kind?: "ok" | "error" | "info") => void; reload: () => void; go: (v: View) => void;
+  pending: number; online: boolean; offlineReady: boolean;
+}) {
   const [issueType, setIssueType] = useState(ISSUE_TYPES[0]);
   const [note, setNote] = useState("");
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [noteOpen, setNoteOpen] = useState(false);
+  const [fieldNote, setFieldNote] = useState("");
   const [askQ, setAskQ] = useState("");
   const [answer, setAnswer] = useState("");
   const [confirmFinish, setConfirmFinish] = useState(false);
+  const [acting, setActing] = useState(false);
+  const [photos, setPhotos] = useState<JobPhoto[]>([]);
+  const [pendingPhotos, setPendingPhotos] = useState(0);
+  const [uploading, setUploading] = useState(false);
+  const photoInputRef = useRef<HTMLInputElement | null>(null);
+  const steps = version ? [...version.steps].sort((a, b) => a.step_order - b.step_order) : [];
+  const step = job && steps.length ? steps[Math.min(job.current, steps.length - 1)] : undefined;
+  const doneCount = job ? steps.filter((s) => job.stepStates[s.id] === "done").length : 0;
+
+  async function loadPhotos() {
+    if (!job || !step) return;
+    try {
+      const r = await api.get<{ evidence: JobPhoto[] }>(`/api/jobs/${job.id}/evidence`);
+      setPhotos((r.evidence || []).filter((p) => !p.step_id || p.step_id === step.id));
+    } catch { /* offline: pending list shown instead */ }
+    try {
+      const pend = await loadPending<PendingPhoto>("pending-photos");
+      setPendingPhotos(pend.filter((p) => p.job_id === job.id && (!p.step_id || p.step_id === step.id)).length);
+    } catch { /* storage unavailable: counts stay */ }
+  }
+  useEffect(() => { void loadPhotos(); }, [job?.id, step?.id]);
+
   if (!job || !version) return <div className="card"><div className="empty"><h3>No active job</h3><p>Start one from an approved procedure. Downloaded procedures open here even in airplane mode.</p><button className="btn" onClick={() => go("library")}>Open procedure library</button></div></div>;
-  const steps = [...version.steps].sort((a, b) => a.step_order - b.step_order);
-  if (steps.length === 0) return <div className="card"><div className="empty"><h3>No steps in this version</h3><p>This procedure version has no steps, so a guided job cannot run. Ask a reviewer to create a revision with steps.</p><button className="btn" onClick={() => go("library")}>Open procedure library</button></div></div>;
-  const step = steps[Math.min(job.current, steps.length - 1)];
-  const doneCount = steps.filter((s) => job.stepStates[s.id] === "done").length;
+  if (steps.length === 0 || !step) return <div className="card"><div className="empty"><h3>No steps in this version</h3><p>This procedure version has no steps, so a guided job cannot run. Ask a reviewer to create a revision with steps.</p><button className="btn" onClick={() => go("library")}>Open procedure library</button></div></div>;
 
   async function mark(state: "done" | "skipped" | "blocked") {
-    if (!job || !step) return;
+    if (!job || !step || acting) return;
     if (job.stepStates[step.id] === state) { notify("Already recorded — no duplicate event created."); return; }
-    await queueEvent({ event_id: uuid(), session_id: job.id, step_id: step.id, event_type: state === "done" ? "step_completed" : state === "skipped" ? "step_skipped" : "step_blocked", payload: { step_order: step.step_order }, occurred_at: new Date().toISOString() });
-    const next = { ...job, stepStates: { ...job.stepStates, [step.id]: state }, current: Math.min(job.current + 1, steps.length - 1) };
-    await setJob(next); notify(state === "done" ? "Step completed and saved on this device." : `Step marked ${state} and saved on this device.`);
+    setActing(true);
+    try {
+      await queueEvent({ event_id: uuid(), session_id: job.id, step_id: step.id, event_type: state === "done" ? "step_completed" : state === "skipped" ? "step_skipped" : "step_blocked", payload: { step_order: step.step_order }, occurred_at: new Date().toISOString() });
+      const next = { ...job, stepStates: { ...job.stepStates, [step.id]: state }, current: Math.min(job.current + 1, steps.length - 1) };
+      await setJob(next); notify(state === "done" ? "Step completed and saved on this device." : `Step marked ${state} and saved on this device.`);
+    } finally { setActing(false); }
   }
   async function recordIssue() {
-    if (!job || !step) return;
-    await queueEvent({ event_id: uuid(), session_id: job.id, step_id: step.id, event_type: "issue_recorded", payload: { issue_type: issueType, note }, occurred_at: new Date().toISOString() });
-    setNote(""); notify("Issue recorded locally. It syncs when connectivity returns — nothing is lost offline.");
+    if (!job || !step || acting) return;
+    if (!note.trim()) { notify("Describe the anomaly first so the reviewer knows what to fix.", "error"); return; }
+    setActing(true);
+    try {
+      await queueEvent({ event_id: uuid(), session_id: job.id, step_id: step.id, event_type: "issue_recorded", payload: { issue_type: issueType, note }, occurred_at: new Date().toISOString() });
+      await mark("blocked");
+      setNote(""); setDrawerOpen(false); notify("Anomaly logged and step marked blocked. It syncs when connectivity returns — nothing is lost offline.");
+    } finally { setActing(false); }
+  }
+  async function saveFieldNote() {
+    if (!job || !step || acting) return;
+    if (!fieldNote.trim()) { notify("Write the note first.", "error"); return; }
+    setActing(true);
+    try {
+      await queueEvent({ event_id: uuid(), session_id: job.id, step_id: step.id, event_type: "field_note", payload: { note: fieldNote, step_order: step.step_order }, occurred_at: new Date().toISOString() });
+      setFieldNote(""); setNoteOpen(false); notify("Field note saved on this device. It syncs with your queued events.");
+    } finally { setActing(false); }
+  }
+  async function attachPhoto(f: File | undefined) {
+    if (!f || !job || !step || uploading) return;
+    if (!["image/jpeg", "image/png", "image/webp"].includes(f.type)) { notify("Only JPEG, PNG or WebP photos are supported.", "error"); return; }
+    if (f.size > 8 * 1024 * 1024) { notify("Photo is larger than 8 MB — pick a smaller file.", "error"); return; }
+    setUploading(true);
+    const desc = `Step ${step.step_order} field photo`;
+    try {
+      const fd = new FormData(); fd.append("file", f); fd.append("description", desc); fd.append("step_id", step.id);
+      const up = await api.upload<{ id: string }>(`/api/jobs/${job.id}/evidence`, fd);
+      await queueEvent({ event_id: uuid(), session_id: job.id, step_id: step.id, event_type: "evidence_attached", payload: { evidence_id: up.id, step_order: step.step_order, description: desc }, occurred_at: new Date().toISOString() });
+      notify("Photo attached to this step and queued for server confirmation."); void loadPhotos(); void reload();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "";
+      if (!online || /failed to fetch|network|load failed|upload failed/i.test(msg)) {
+        const key = uuid();
+        await idb.put("media", key, f);
+        const pend = await loadPending<PendingPhoto>("pending-photos");
+        pend.push({ key, job_id: job.id, step_id: step.id, description: desc });
+        await savePending("pending-photos", pend);
+        setPendingPhotos((n) => n + 1);
+        notify("Photo saved on this device — it uploads automatically on the next sync.", "info");
+      } else notify(msg || "Photo upload failed.", "error");
+    } finally { setUploading(false); }
   }
   async function finish() {
-    if (!job) return;
-    const outcome = doneCount === steps.length ? "completed" : "finished-with-exceptions";
-    await queueEvent({ event_id: uuid(), session_id: job.id, step_id: null, event_type: "job_finished", payload: { outcome }, occurred_at: new Date().toISOString() });
-    try { await api.post(`/api/jobs/${job.id}/finish`, { outcome, reason: "", summary: "" }); } catch { /* pending-finish sync will deliver it */ }
-    await setJob({ ...job, finished: true, finish_outcome: outcome }); await idb.del("jobs", "active"); reload();
-    notify("Job finished and saved on this device. Its finish state syncs with your queued events."); go("history");
+    if (!job || acting) return;
+    setActing(true);
+    try {
+      const outcome = doneCount === steps.length ? "completed" : "finished-with-exceptions";
+      await queueEvent({ event_id: uuid(), session_id: job.id, step_id: null, event_type: "job_finished", payload: { outcome }, occurred_at: new Date().toISOString() });
+      try { await api.post(`/api/jobs/${job.id}/finish`, { outcome, reason: "", summary: "" }); } catch { /* pending-finish sync will deliver it */ }
+      await setJob({ ...job, finished: true, finish_outcome: outcome }); await idb.del("jobs", "active"); reload();
+      notify("Job finished and saved on this device. Its finish state syncs with your queued events."); go("history");
+    } finally { setActing(false); }
   }
   async function ask() {
     if (!version) return;
     try { const r = await api.post<{ answer: string }>("/api/ask", { question: askQ, procedure_version_id: version.id }); setAnswer(r.answer); }
     catch { setAnswer("AI assistance is unavailable offline. The approved steps and cached manual text above remain fully usable."); }
   }
+  const safety = ((version.source_evidence as { safety_notes?: string[] }).safety_notes || []).filter(Boolean);
+  const hasRefs = (step.evidence_refs?.length || 0) + (step.visual_refs?.length || 0) > 0;
+  const skippedCount = steps.filter((s) => job.stepStates[s.id] === "skipped").length;
+  const blockedCount = steps.filter((s) => job.stepStates[s.id] === "blocked").length;
   return (
     <div>
-      <div className="card" aria-live="polite">
-        <p className="step-count">Step {step.step_order} of {steps.length} · {job.title} · v{version.version_number}</p>
-        <div className="progress" role="progressbar" aria-valuenow={doneCount} aria-valuemin={0} aria-valuemax={steps.length} aria-label={`${doneCount} of ${steps.length} steps complete`}><div style={{ width: `${(doneCount / steps.length) * 100}%` }} /></div>
-        <h2 className="step-hero">{step.title}</h2>
-        <p className="step-hero" style={{ fontSize: "1.1rem" }}>{step.instruction}</p>
-        {step.required_tools.length > 0 && <p><strong>Tools:</strong> {step.required_tools.join(", ")}</p>}
-        <p><strong>Expected result:</strong> {step.expected_result || "Confirm visually before continuing."}</p>
-        <p><span className="tag approved">Human-approved instruction</span>{step.evidence_refs.length > 0 && <span className="tag">Evidence: {step.evidence_refs.length} ref(s)</span>}{job.stepStates[step.id] && <span className="tag warn">Status: {job.stepStates[step.id]}</span>}</p>
-        <StepEvidence versionId={version.id} step={step} />
-        <div className="big-actions">
-          <button className="btn" onClick={() => mark("done")}>Mark complete</button>
-          <button className="btn secondary" onClick={() => mark("blocked")}>Mark blocked</button>
-        </div>
-        <div className="row" style={{ marginTop: 10 }}>
-          <button className="btn secondary" disabled={job.current === 0} onClick={() => setJob({ ...job, current: job.current - 1 })}>Previous</button>
-          <button className="btn secondary" disabled={job.current >= steps.length - 1} onClick={() => setJob({ ...job, current: job.current + 1 })}>Next</button>
-          <button className="btn secondary" onClick={() => mark("skipped")}>Skip step</button>
-          {!confirmFinish
-            ? <button className="btn danger" onClick={() => setConfirmFinish(true)}>Finish job</button>
-            : <><span><strong>Finish with {doneCount}/{steps.length} steps complete?</strong></span><button className="btn danger" onClick={finish}>Confirm finish</button><button className="btn secondary" onClick={() => setConfirmFinish(false)}>Keep working</button></>}
-        </div>
+      <div className="row" style={{ justifyContent: "space-between", marginBottom: 10 }}>
+        <button className="btn small secondary" onClick={() => go("home")} aria-label="Exit job and return home. Progress stays saved on this device."><Icon name="back" size={17} /> Exit</button>
+        <h2 style={{ margin: 0, fontSize: "1.05rem" }}>Procedure Execution</h2>
+        <span className={`sync-pill${online ? "" : " offline"}`} role="status"><span className="sync-dot" aria-hidden="true" />{online ? (pending ? `${pending} to sync` : "Synced") : "Offline"}</span>
       </div>
-      <div className="card">
+      <div className="job-layout"><div>
+      <section className="card" aria-live="polite">
+        <div className="proc-badges">
+          <span className="badge ok"><Icon name="verified" size={13} /> Rev {version.version_number} (Approved)</span>
+          {offlineReady && <span className="badge ok"><Icon name="cloudDone" size={13} /> Offline cache ready</span>}
+          {job.stepStates[step.id] && <span className="badge warn">Status: {job.stepStates[step.id]}</span>}
+        </div>
+        <h2 style={{ marginTop: 8 }}>{job.title}</h2>
+        <p className="muted small-text" style={{ marginTop: -6 }}>Asset job · step {step.step_order} of {steps.length}</p>
+        <div className="seg-progress" style={{ marginTop: 8 }} role="progressbar" aria-valuenow={doneCount} aria-valuemin={0} aria-valuemax={steps.length} aria-label={`${doneCount} of ${steps.length} steps complete`}>
+          <div className="row" style={{ justifyContent: "space-between" }}>
+            <strong>Step {step.step_order} of {steps.length}</strong>
+            <span className="muted small-text">{step.title}</span>
+          </div>
+          <div className="seg-progress-track" aria-hidden="true">
+            {steps.map((s, i) => <span key={s.id} className={job.stepStates[s.id] === "done" || i < job.current ? "on" : ""} />)}
+          </div>
+        </div>
+      </section>
+      <section className="card">
+        <div className="row">
+          <span className="tool-pill num" style={{ minWidth: 44, justifyContent: "center" }}>{String(step.step_order).padStart(2, "0")}</span>
+          <span className="eyebrow">Primary action</span>
+        </div>
+        <p className="step-hero" style={{ marginTop: 8 }}>{step.instruction}</p>
+      </section>
+      <section className="result-card">
+        <span className="result-check"><Icon name="check" size={15} /></span>
+        <div><span className="panel-title" style={{ color: "var(--primary-container)" }}>Expected physical result</span>
+        <p style={{ margin: "4px 0 0" }}>{step.expected_result || "Confirm visually before continuing."}</p></div>
+      </section>
+      </div><div>
+      <section className="card" style={{ marginTop: 12 }}>
+        <div className="row" style={{ justifyContent: "space-between" }}>
+          <h3 style={{ margin: 0 }}><Icon name="camera" size={18} /> Component reference</h3>
+        </div>
+        {hasRefs ? <StepEvidence versionId={version.id} step={step} />
+          : <p className="muted small-text">No reference photo linked to this step — follow the approved instruction above.</p>}
+        {(photos.length > 0 || pendingPhotos > 0) && (
+          <div style={{ marginTop: 10 }}>
+            <span className="eyebrow">Field photos on this step</span>
+            <div className="row" style={{ marginTop: 6 }}>
+              {photos.map((p) => p.image_url && (
+                <figure key={p.id} style={{ margin: 0, maxWidth: 160 }}>
+                  <img src={p.image_url} alt={p.description || "Field photo"} style={{ width: "100%", borderRadius: 8, border: "1px solid var(--line)" }} />
+                  <figcaption className="muted small-text">{p.description}{p.captured_at ? ` · ${new Date(p.captured_at).toLocaleTimeString()}` : ""}</figcaption>
+                </figure>
+              ))}
+              {pendingPhotos > 0 && <span className="badge warn">{pendingPhotos} photo{pendingPhotos === 1 ? "" : "s"} waiting to upload</span>}
+            </div>
+          </div>
+        )}
+      </section>
+      {(step.required_tools.length > 0 || safety.length > 0 || version.prerequisites) && (
+        <section style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 12 }}>
+          {safety.length > 0 && (
+            <div className="safety-banner" role="note"><Icon name="warning" size={20} /><div><strong>Mandatory safety step</strong><p style={{ margin: "4px 0 0" }}>{safety.join(" ")}</p></div></div>
+          )}
+          <div className="card" style={{ margin: 0 }}>
+            {version.prerequisites && <p className="small-text"><strong>Prerequisites:</strong> {version.prerequisites}</p>}
+            <span className="eyebrow">Required field tooling</span>
+            <div className="tool-pills" style={{ marginTop: 6 }}>
+              {step.required_tools.length > 0 ? step.required_tools.map((t) => <span key={t} className="tool-pill">{t}</span>) : <span className="muted small-text">No special tooling for this step.</span>}
+            </div>
+          </div>
+        </section>
+      )}
+      </div></div>
+      <section className="card" style={{ marginTop: 12 }}>
         <h3>Job summary so far</h3>
-        <p>{doneCount} completed · {steps.filter((s) => job.stepStates[s.id] === "blocked").length} blocked · {steps.filter((s) => job.stepStates[s.id] === "skipped").length} skipped of {steps.length} steps. Saved on this device; server confirmation happens on Sync.</p>
+        <p>{doneCount} completed · {blockedCount} blocked · {skippedCount} skipped of {steps.length} steps. {pending > 0 ? `${pending} event(s) saved on this device, waiting for server confirmation.` : "Everything is confirmed by the server."}</p>
+        <div className="row">
+          <button className="btn secondary" onClick={() => mark("skipped")} disabled={acting}>Skip step</button>
+          {!confirmFinish
+            ? <button className="btn danger" onClick={() => setConfirmFinish(true)} disabled={acting}>Finish job</button>
+            : <><span><strong>Finish with {doneCount}/{steps.length} steps complete?</strong></span><button className="btn danger" onClick={finish} disabled={acting}>Confirm finish</button><button className="btn secondary" onClick={() => setConfirmFinish(false)} disabled={acting}>Keep working</button></>}
+        </div>
+        <p className="muted small-text" style={{ marginTop: 8 }}>If a step is blocked on anything hazardous, stop work and follow your site procedure — this app never instructs you to bypass safety steps.</p>
+      </section>
+      <div className="action-dock">
+        <div className="aux-row">
+          <button className="btn secondary" disabled={job.current === 0 || acting} onClick={() => setJob({ ...job, current: job.current - 1 })}><Icon name="back" size={18} /> Previous</button>
+          <button className="btn secondary" disabled={uploading} onClick={() => photoInputRef.current?.click()}><Icon name="camera" size={18} /> {uploading ? "Uploading…" : "Attach Photo"}</button>
+          <button className="btn secondary" onClick={() => setNoteOpen(true)}><Icon name="note" size={18} /> Field Note</button>
+        </div>
+        <div className="action-dock-row">
+          <button className="btn danger" style={{ background: "var(--danger-bg)", borderColor: "var(--danger-bg)", color: "var(--danger)" }} onClick={() => setDrawerOpen(true)} disabled={acting}><Icon name="warning" size={20} /> Report Blocked</button>
+          <button className="btn" onClick={() => mark("done")} disabled={acting}><Icon name="check" size={20} /> Complete Step {step.step_order}</button>
+        </div>
       </div>
-      <div className="card">
-        <h3>Record an issue on this step</h3>
-        <label htmlFor="issue-type">Issue type</label>
-        <select id="issue-type" value={issueType} onChange={(e) => setIssueType(e.target.value)}>{ISSUE_TYPES.map((t) => <option key={t}>{t}</option>)}</select>
-        <label htmlFor="issue-note">Note</label><textarea id="issue-note" rows={2} value={note} onChange={(e) => setNote(e.target.value)} placeholder="What did you observe?" />
-        <button className="btn" style={{ marginTop: 10 }} onClick={recordIssue}>Record issue</button>
-        <p className="muted">If a step is blocked on anything hazardous, stop work and follow your site procedure — this app never instructs you to bypass safety steps. (Demo uses a harmless training assembly.)</p>
-      </div>
+      <input ref={photoInputRef} className="visually-hidden" type="file" accept="image/jpeg,image/png,image/webp" aria-label="Attach a field photo to this step" onChange={(e) => { void attachPhoto(e.target.files?.[0] || undefined); e.target.value = ""; }} />
       <div className="card">
         <h3>Ask about this procedure</h3>
         <label htmlFor="ask-q">Question</label><input id="ask-q" value={askQ} onChange={(e) => setAskQ(e.target.value)} placeholder="e.g. knob" />
         <button className="btn secondary" style={{ marginTop: 10 }} onClick={ask}>Search approved steps &amp; manuals</button>
         {answer && <div className="notice ok" role="status">{answer}</div>}
       </div>
+      {drawerOpen && (
+        <div className="scrim" onClick={(e) => { if (e.target === e.currentTarget) setDrawerOpen(false); }}>
+          <div className="sheet" role="dialog" aria-modal="true" aria-label="Report field anomaly">
+            <div className="row" style={{ justifyContent: "space-between" }}>
+              <h3><Icon name="warning" size={19} /> Report field anomaly</h3>
+              <button className="btn small secondary icon-only" aria-label="Close anomaly report" onClick={() => setDrawerOpen(false)}><Icon name="close" size={18} /></button>
+            </div>
+            <p className="muted">Select a blocking category for step {step.step_order}:</p>
+            <div className="issue-tags" role="group" aria-label="Anomaly category">
+              {ISSUE_TYPES.map((t) => (
+                <button key={t} className="issue-tag" aria-pressed={issueType === t} onClick={() => setIssueType(t)}>{t}</button>
+              ))}
+            </div>
+            <label htmlFor="drawer-note">Technician notes (required)</label>
+            <textarea id="drawer-note" rows={2} value={note} onChange={(e) => setNote(e.target.value)} placeholder="Briefly describe physical condition or binding resistance..." />
+            <div className="row" style={{ marginTop: 12 }}>
+              <button className="btn secondary" style={{ flex: 1 }} onClick={() => setDrawerOpen(false)}>Cancel</button>
+              <button className="btn danger" style={{ flex: 1, background: "var(--danger)", borderColor: "var(--danger)", color: "#fff" }} onClick={recordIssue} disabled={acting}>Log incident &amp; halt</button>
+            </div>
+          </div>
+        </div>
+      )}
+      {noteOpen && (
+        <div className="scrim" onClick={(e) => { if (e.target === e.currentTarget) setNoteOpen(false); }}>
+          <div className="sheet" role="dialog" aria-modal="true" aria-label="Add field note">
+            <div className="row" style={{ justifyContent: "space-between" }}>
+              <h3><Icon name="note" size={19} /> Field note · step {step.step_order}</h3>
+              <button className="btn small secondary icon-only" aria-label="Close field note" onClick={() => setNoteOpen(false)}><Icon name="close" size={18} /></button>
+            </div>
+            <label htmlFor="field-note-text">Note (saved on this device, syncs with events)</label>
+            <textarea id="field-note-text" rows={3} value={fieldNote} onChange={(e) => setFieldNote(e.target.value)} placeholder="e.g. Left clip needed extra force; right clip seated first try." />
+            <div className="row" style={{ marginTop: 12 }}>
+              <button className="btn secondary" style={{ flex: 1 }} onClick={() => setNoteOpen(false)}>Cancel</button>
+              <button className="btn" style={{ flex: 1 }} onClick={saveFieldNote} disabled={acting}>Save note</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -967,6 +1510,7 @@ interface JobDetail {
   id: string; status: string; outcome: string | null; procedure_version_id: string;
   started_at: string; ended_at: string | null;
   events: { event_id: string; event_type: string; step_id: string | null; payload: Record<string, unknown>; occurred_at: string }[];
+  evidence: JobPhoto[];
 }
 
 function History({ jobs, reload, role, onProposeRevision }: { jobs: JobRow[]; reload: () => void; role: Role; onProposeRevision: (versionId: string) => void }) {
@@ -979,11 +1523,18 @@ function History({ jobs, reload, role, onProposeRevision }: { jobs: JobRow[]; re
     try { setDetail(await api.get<JobDetail>(`/api/jobs/${j.id}`)); }
     catch { setDetailError("Job detail unavailable offline — the list above is the last server-confirmed state."); }
   }
-  return <div className="card"><h2>Job history</h2><button className="btn small secondary" onClick={reload}>Refresh</button>
+  return <div className="card"><h2><Icon name="schedule" size={20} /> Job history</h2><button className="btn small secondary" onClick={reload}><Icon name="sync" size={16} /> Refresh</button>
     {jobs.length === 0 ? <div className="empty">No jobs yet. Completed work, exceptions, and sync state will appear here.</div>
       : jobs.map((j) => (
         <div key={j.id} className="list-row">
-          <p><strong>{j.procedure_title}</strong> — {j.status}{j.outcome ? ` · ${j.outcome}` : ""} · {j.events} event(s) · {new Date(j.started_at).toLocaleString()}</p>
+          <div className="row" style={{ justifyContent: "space-between" }}>
+            <p style={{ margin: 0 }}><strong>{j.procedure_title}</strong> <span className="muted small-text num">{new Date(j.started_at).toLocaleString()}</span></p>
+            {j.outcome === "completed"
+              ? <span className="badge ok"><Icon name="check" size={13} /> Pass</span>
+              : j.status === "finished"
+                ? <span className="badge warn"><Icon name="flag" size={13} /> {j.outcome || "Finished"}</span>
+                : <span className="badge info">Open · {j.events} event{j.events === 1 ? "" : "s"}</span>}
+          </div>
           <button className="btn small secondary" aria-expanded={openId === j.id} onClick={() => void toggle(j)}>{openId === j.id ? "Hide details" : "View details"}</button>
           {openId === j.id && detailError && <p className="muted">{detailError}</p>}
           {openId === j.id && detail && (
@@ -994,11 +1545,26 @@ function History({ jobs, reload, role, onProposeRevision }: { jobs: JobRow[]; re
                 <p key={e.event_id} className="list-row">
                   <span className="tag">{e.event_type}</span> {new Date(e.occurred_at).toLocaleString()}
                   {e.event_type === "issue_recorded" && <> · {String((e.payload as { issue_type?: string }).issue_type || "Issue")}: {String((e.payload as { note?: string }).note || "")}</>}
+                  {e.event_type === "field_note" && <> · {String((e.payload as { note?: string }).note || "")}</>}
+                  {e.event_type === "evidence_attached" && <> · photo: {String((e.payload as { description?: string }).description || "")}</>}
                   {e.event_type === "issue_recorded" && (role === "reviewer" || role === "expert") && (
                     <> <button className="btn small secondary" onClick={() => onProposeRevision(detail.procedure_version_id)}>Propose revision from this feedback</button></>
                   )}
                 </p>
               ))}
+              {detail.evidence && detail.evidence.length > 0 && (
+                <div style={{ marginTop: 8 }}>
+                  <span className="eyebrow">Field photos ({detail.evidence.length})</span>
+                  <div className="row" style={{ marginTop: 6 }}>
+                    {detail.evidence.map((p) => p.image_url && (
+                      <figure key={p.id} style={{ margin: 0, maxWidth: 160 }}>
+                        <img src={p.image_url} alt={p.description || "Field photo"} style={{ width: "100%", borderRadius: 8, border: "1px solid var(--line)" }} />
+                        <figcaption className="muted small-text">{p.description}{p.captured_at ? ` · ${new Date(p.captured_at).toLocaleTimeString()}` : ""}</figcaption>
+                      </figure>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
           )}
         </div>
@@ -1021,7 +1587,7 @@ function Manuals({ notify }: { notify: (s: string, kind?: "ok" | "error" | "info
     catch (e) { notify(e instanceof Error ? e.message : "Upload failed", "error"); }
   }
   async function search() { try { setHits(await api.get("/api/manuals/search?q=" + encodeURIComponent(q))); } catch { notify("Search needs the server in this build; cached procedure text still works offline in Guided job.", "error"); } }
-  return <div className="card"><h2>Manuals</h2>
+  return <div className="card"><h2><Icon name="book" size={20} /> Manuals</h2>
     <p className="muted">Imported manuals are indexed on the server for search. They are not downloaded for offline use in this build — offline work uses downloaded approved procedures.</p>
     <label className="btn secondary">Import PDF manual (max 15 MB)<input className="visually-hidden" type="file" accept="application/pdf" aria-label="Import PDF manual" onChange={(e) => upload(e.target.files?.[0])} /></label>
     {manuals.length === 0 ? <div className="empty">No manuals imported. Import a PDF you are authorized to use.</div> : manuals.map((m) => <p key={m.id}><strong>{m.title}</strong> <span className="muted">{m.model || ""} · {m.chunks} chunk(s) indexed</span></p>)}
@@ -1042,7 +1608,7 @@ function Settings({ pending, role, setRole, clearCache }: { pending: number; rol
       setHealth(`API ${h.status} · database ${h.db ? "ok" : "unreachable"} · AI ${h.ai_live ? "live" : "simulated (no key)"} · Spark ${h.models.spark} · SAM ${h.models.segment} · Voice ${h.models.voice}`);
     } catch { setHealth("API unreachable from this browser. Queued work stays on this device."); }
   }
-  return <div className="card"><h2>Settings</h2>
+  return <div className="card"><h2><Icon name="cog" size={20} /> Settings</h2>
     <h3>Demo data</h3><p className="muted">Harmless Benchtop Cable Trainer scenario. Seeding is idempotent.</p>
     <button className="btn" onClick={seed}>Seed demo procedure</button>{note && <div className="notice ok" role="status">{note}</div>}
     <h3>Offline storage</h3><p>{pending} event(s) pending synchronization. Queued events and the active job survive reloads and airplane mode.</p>
