@@ -5,13 +5,21 @@
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
-  "background_color": "#eef2ef",
-  "theme_color": "#0a4a33",
+  "orientation": "any",
+  "lang": "en",
+  "dir": "ltr",
+  "background_color": "#f2fcf2",
+  "theme_color": "#005235",
   "description": "Offline-first maintenance copilot: capture expert knowledge, follow approved procedures, sync verified outcomes.",
+  "categories": ["business", "productivity", "utilities"],
   "icons": [
     { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
     { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
     { "src": "/icon-192-maskable.png", "sizes": "192x192", "type": "image/png", "purpose": "maskable" },
     { "src": "/icon-512-maskable.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ],
+  "screenshots": [
+    { "src": "/screenshots/mobile-workbench.png", "sizes": "780x1688", "type": "image/png", "form_factor": "narrow", "label": "Workbench — active job, review queue and recent work" },
+    { "src": "/screenshots/desktop-library.png", "sizes": "1440x900", "type": "image/png", "form_factor": "wide", "label": "Procedure library on desktop" }
   ]
 }
