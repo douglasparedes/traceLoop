@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { api, setIdentity } from "./api";
+import { api, setIdentity, authStatus, checkSession, login as apiLogin, clearToken, AUTH_REQUIRED_EVENT } from "./api";
 import { idb, uuid } from "./db";
+import { listCameras, setPreferredCameraId, getPreferredCameraId, cameraConstraints, type CameraDevice } from "./camera";
 import { Icon, type IconName } from "./icons";
 import LiveMode from "./LiveMode";
 import TutorialMode from "./TutorialMode";
@@ -54,7 +55,17 @@ async function savePending<T>(key: string, items: T[]): Promise<void> {
 
 export default function App() {
   const [view, setView] = useState<View>("home");
-  const [role, setRole] = useState<Role>("technician");
+  const [role, setRole] = useState<Role>(() => {
+    try {
+      const r = localStorage.getItem("fg-role");
+      return r === "reviewer" || r === "expert" ? r : "technician";
+    } catch { return "technician"; }
+  });
+  const [authChecked, setAuthChecked] = useState(false);
+  const [authRequired, setAuthRequired] = useState(false);
+  const [authBusy, setAuthBusy] = useState(false);
+  const [authError, setAuthError] = useState("");
+  const [authPassword, setAuthPassword] = useState("");
   const [online, setOnline] = useState(navigator.onLine);
   const [syncState, setSyncState] = useState<"idle" | "syncing" | "failed">("idle");
   const [pending, setPending] = useState(0);
@@ -157,6 +168,43 @@ export default function App() {
   }, [loadLists, notify, refreshPending]);
 
   useEffect(() => { setIdentity(role === "technician" ? "demo-tech" : role === "expert" ? "demo-expert" : "demo-reviewer", role); loadLists(); }, [role, loadLists]);
+  useEffect(() => {
+    try { localStorage.setItem("fg-role", role); } catch { /* private mode */ }
+  }, [role]);
+  // Passphrase gate: only enforced when the server enables it. Runs once at
+  // boot; any later 401 re-opens the lock without losing local work.
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const st = await authStatus();
+        if (!alive) return;
+        if (!st.auth_enabled) { setAuthRequired(false); }
+        else {
+          const ok = await checkSession();
+          if (alive) setAuthRequired(!ok);
+        }
+      } catch { if (alive) setAuthRequired(false); }
+      finally { if (alive) setAuthChecked(true); }
+    })();
+    const on401 = () => setAuthRequired(true);
+    window.addEventListener(AUTH_REQUIRED_EVENT, on401);
+    return () => { alive = false; window.removeEventListener(AUTH_REQUIRED_EVENT, on401); };
+  }, []);
+  async function doLogin() {
+    if (!authPassword || authBusy) return;
+    setAuthBusy(true); setAuthError("");
+    try {
+      const ok = await apiLogin(authPassword);
+      if (ok && await checkSession()) { setAuthPassword(""); setAuthRequired(false); notify("Signed in — loading server state.", "ok"); void loadLists(); }
+      else setAuthError("Wrong passphrase. Try again.");
+    } catch { setAuthError("Sign-in failed — check the connection and retry."); }
+    finally { setAuthBusy(false); }
+  }
+  function doLogout() {
+    clearToken(); setAuthRequired(true); setAuthPassword("");
+    notify("Signed out on this device. Queued work stays saved locally.", "info");
+  }
   useEffect(() => {
     loadLists(); refreshPending(); refreshCached();
     idb.get<{ procs: ProcSummary[]; jobs: JobRow[] }>("meta", "lists").then((l) => { if (l) { setProcs(l.procs); setJobs(l.jobs); } });
@@ -285,8 +333,9 @@ export default function App() {
   const mobileNav: { view: View; label: string; icon: IconName }[] = [
     { view: "home", label: "Home", icon: "home" }, { view: "library", label: "Procedures", icon: "book" }, { view: "capture", label: "Capture", icon: "addBox" },
     { view: "activity", label: pending ? `Activity (${pending})` : "Activity", icon: "schedule" },
+    { view: "settings", label: "Settings", icon: "cog" },
   ];
-  const mobileCurrent: View = view === "home" || view === "library" || view === "capture" ? view : view === "detail" ? "library" : "activity";
+  const mobileCurrent: View = view === "home" || view === "library" || view === "capture" || view === "settings" ? view : view === "detail" ? "library" : "activity";
   const screenLabel: Record<View, string> = {
     home: "Home", library: "Procedures", detail: "Procedure", capture: "Capture", review: "Review",
     job: "Guided job", history: "History", manuals: "Manuals", settings: "Settings", activity: "Activity",
@@ -308,6 +357,43 @@ export default function App() {
     setActiveJob(j); await idb.put("jobs", "active", j);
   }
 
+  if (!authChecked) {
+    return (
+      <div>
+        <a className="skip-link" href="#main">Skip to content</a>
+        <main id="main"><div className="card" aria-label="Loading"><div className="skeleton" /><div className="skeleton" /></div></main>
+      </div>
+    );
+  }
+  if (authRequired) {
+    return (
+      <div>
+        <a className="skip-link" href="#main">Skip to content</a>
+        <header className="topbar">
+          <div className="app-header-inner">
+            <div className="app-brand">
+              <span className="app-logo" aria-hidden="true">T</span>
+              <h1 className="brand">TraceLoop<small>Sign in</small></h1>
+            </div>
+          </div>
+        </header>
+        <main id="main">
+          <div className="card" style={{ maxWidth: 480, margin: "24px auto" }}>
+            <h2>Team sign-in</h2>
+            <p className="muted">This deployment is protected by a team passphrase. Your queued offline work stays on this device; nothing is uploaded until you sign in and sync.</p>
+            <form onSubmit={(e) => { e.preventDefault(); void doLogin(); }}>
+              <label htmlFor="team-pass">Team passphrase</label>
+              <input id="team-pass" type="password" autoComplete="current-password" value={authPassword} onChange={(e) => setAuthPassword(e.target.value)} placeholder="Enter team passphrase" />
+              {authError && <div className="notice error" role="alert">{authError}</div>}
+              <div className="row" style={{ marginTop: 12 }}>
+                <button className="btn" type="submit" disabled={authBusy || !authPassword}>{authBusy ? "Checking…" : "Sign in"}</button>
+              </div>
+            </form>
+          </div>
+        </main>
+      </div>
+    );
+  }
   return (
     <div>
       <a className="skip-link" href="#main">Skip to content</a>
@@ -353,7 +439,7 @@ export default function App() {
           {view === "activity" && <Activity jobs={jobs} pending={pending} pendingReview={pendingReview} reload={loadLists} go={setView} syncNow={() => void syncNow()} syncing={syncState === "syncing"} role={role} onProposeRevision={async (vid) => { const v = await openVersion(vid); if (v) { setReviewVersion(v); setView("review"); notify("Opened the job's exact revision. Use “Propose new revision” there — it goes through normal review."); } else notify("That revision is not available offline yet.", "error"); }} />}
           {view === "history" && <History jobs={jobs} reload={loadLists} role={role} onProposeRevision={async (vid) => { const v = await openVersion(vid); if (v) { setReviewVersion(v); setView("review"); } }} />}
           {view === "manuals" && <Manuals notify={notify} />}
-          {view === "settings" && <Settings pending={pending} role={role} setRole={setRole} clearCache={async () => { await idb.clear("versions"); await refreshCached(); notify("Offline procedure cache cleared. Downloaded jobs and queued events were kept."); }} />}
+          {view === "settings" && <Settings pending={pending} role={role} setRole={setRole} onSignOut={doLogout} clearCache={async () => { await idb.clear("versions"); await refreshCached(); notify("Offline procedure cache cleared. Downloaded jobs and queued events were kept."); }} />}
         </main>
       </div>
       {view !== "job" && (
@@ -491,6 +577,7 @@ function ProcessingLog() {
   const [status, setStatus] = useState("");
   const [q, setQ] = useState("");
   const [loading, setLoading] = useState(false);
+  const [live, setLive] = useState(false);
   async function load() {
     setLoading(true);
     try {
@@ -505,6 +592,26 @@ function ProcessingLog() {
     setLoading(false);
   }
   useEffect(() => { void load(); }, []);
+  // Live tail: poll newest-first while enabled. Pauses itself on failure.
+  useEffect(() => {
+    if (!live) return;
+    let alive = true;
+    const tick = async () => {
+      try {
+        const params = new URLSearchParams({ limit: "50", offset: "0" });
+        if (entity) params.set("entity_type", entity);
+        if (model) params.set("model", model);
+        if (status) params.set("status", status);
+        if (q.trim()) params.set("q", q.trim());
+        const r = await api.get<{ total: number; items: ProcEventRow[] }>(`/api/processing/events?${params}`);
+        if (!alive) return;
+        setItems(r.items || []); setTotal(r.total || 0);
+      } catch { if (alive) setLive(false); }
+    };
+    void tick();
+    const t = window.setInterval(tick, 3000);
+    return () => { alive = false; window.clearInterval(t); };
+  }, [live]); // eslint-disable-line react-hooks/exhaustive-deps
   return (
     <div className="card">
       <h3>Processing log</h3>
@@ -519,6 +626,7 @@ function ProcessingLog() {
         </select>
         <input value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search prompt, note…" aria-label="Search processing log" style={{ flex: "2 1 160px" }} />
         <button className="btn small" onClick={() => void load()} disabled={loading}>{loading ? "Loading…" : "Filter"}</button>
+        <button className="btn small secondary" aria-pressed={live} onClick={() => setLive((v) => !v)}>{live ? "⏸ Pause live" : "▶ Live tail"}</button>
       </div>
       {items.length === 0 ? <div className="empty">No processing events match. Run a tutorial or capture to generate the first entries.</div>
         : items.map((e) => (
@@ -749,6 +857,8 @@ function CaptureView({ done, openReview }: { done: (v: Version) => void; openRev
   const [busy, setBusy] = useState(false);
   const [camState, setCamState] = useState<"unknown" | "ready" | "blocked">("unknown");
   const [cameraOpen, setCameraOpen] = useState(false);
+  const [cameras, setCameras] = useState<CameraDevice[]>([]);
+  const [cameraId, setCameraId] = useState<string | null>(() => getPreferredCameraId());
   const [photoUrl, setPhotoUrl] = useState<string | null>(null);
   const [segPrompt, setSegPrompt] = useState(saved.segPrompt || "blue adjustment knob");
   const [photoEvId, setPhotoEvId] = useState<string | null>(saved.photoEvId || null);
@@ -833,14 +943,21 @@ function CaptureView({ done, openReview }: { done: (v: Version) => void; openRev
     if (cameraOpen) { stopCamera(); return; }
     try {
       const md = mediaDevicesOrFail("camera");
+      void listCameras().then(setCameras).catch(() => undefined);
       const cams = await countDevices("videoinput");
       if (cams === 0) { setCamState("blocked"); setStatus("No camera found. Connect/enable a camera in Windows Settings > Privacy > Camera, then try again — or use Attach photo."); return; }
       let stream: MediaStream;
       try {
-        stream = await md.getUserMedia({ video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } }, audio: false });
+        stream = await md.getUserMedia(cameraConstraints(cameraId, "environment"));
       } catch (e) {
         if (e instanceof DOMException && (e.name === "OverconstrainedError" || e.name === "NotFoundError")) {
-          stream = await md.getUserMedia({ video: true, audio: false });
+          if (cameraId) {
+            // Saved device gone (e.g. unplugged dock camera): forget it and retry with any camera.
+            setCameraId(null); setPreferredCameraId(null);
+            stream = await md.getUserMedia(cameraConstraints(null, "environment"));
+          } else {
+            stream = await md.getUserMedia({ video: true, audio: false });
+          }
         } else throw e;
       }
       camStreamRef.current = stream; setCamState("ready"); setCameraOpen(true);
@@ -1032,6 +1149,12 @@ function CaptureView({ done, openReview }: { done: (v: Version) => void; openRev
       <p className="muted small-text">Attach at least one photo. Highlighting it with SAM 3.1 below is optional but helps reviewers verify the procedure.</p>
       <div className="row" style={{ marginTop: 12 }}>
         <button className="btn secondary" onClick={openCamera}>{cameraOpen ? "Close camera" : camState === "blocked" ? "Retry camera" : "Use camera"}</button>
+        <label className="btn secondary" style={{ margin: 0 }} aria-label="Choose camera">Camera
+          <select value={cameraId || ""} aria-label="Choose camera" disabled={cameraOpen} onChange={(e) => { const id = e.target.value || null; setCameraId(id); setPreferredCameraId(id); }} style={{ width: "auto", minHeight: 0, border: 0, background: "transparent", marginLeft: 6, font: "inherit", color: "inherit" }}>
+            <option value="">Auto</option>
+            {cameras.map((c) => <option key={c.id} value={c.id}>{c.label}</option>)}
+          </select>
+        </label>
         <label className="btn secondary">Attach photo<input className="visually-hidden" type="file" accept="image/jpeg,image/png,image/webp" aria-label="Attach photo" onChange={(e) => onPhoto(e.target.files?.[0])} /></label>
       </div>
       <p className="muted">Camera: {camState === "ready" ? "available" : camState === "blocked" ? "blocked/unavailable — details below" : "not tested yet (click Use camera)"}. Media needs http://localhost or HTTPS and browser permission.</p>
@@ -1708,7 +1831,40 @@ function Manuals({ notify }: { notify: (s: string, kind?: "ok" | "error" | "info
   </div>;
 }
 
-function Settings({ pending, role, setRole, clearCache }: { pending: number; role: Role; setRole: (r: Role) => void; clearCache: () => void }) {
+function PwaDiagnostics() {
+  const [info, setInfo] = useState<string | null>(null);
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      const parts: string[] = [];
+      try {
+        parts.push(`Display mode: ${window.matchMedia("(display-mode: standalone)").matches ? "standalone (installed)" : "browser (open tab — install the app for fullscreen)"}`);
+      } catch { parts.push("Display mode: unknown"); }
+      try {
+        if (!("serviceWorker" in navigator)) parts.push("Service worker: unsupported in this browser");
+        else {
+          const reg = await navigator.serviceWorker.getRegistration();
+          if (!reg) parts.push("Service worker: not registered yet (reload once)");
+          else if (reg.active) parts.push(`Service worker: active (${reg.scope})`);
+          else if (reg.waiting || reg.installing) parts.push("Service worker: new version ready — accept the in-app update banner, then reload");
+          else parts.push("Service worker: registered, activating…");
+          parts.push(`Controlled by worker: ${navigator.serviceWorker.controller ? "yes" : "no"}`);
+        }
+      } catch { parts.push("Service worker: check failed"); }
+      try {
+        const r = await fetch("manifest.webmanifest", { headers: { Accept: "application/manifest+json" } });
+        parts.push(`Manifest: ${r.ok ? "served" : `HTTP ${r.status}`} · start_url ${new URL((await r.clone().json() as { start_url?: string }).start_url || "/", window.location.origin).pathname}`);
+      } catch {
+        parts.push("Manifest: not fetchable offline");
+      }
+      if (alive) setInfo(parts.join(" · "));
+    })();
+    return () => { alive = false; };
+  }, []);
+  return <p className="muted small-text" role="status">{info || "Checking install state…"}</p>;
+}
+
+function Settings({ pending, role, setRole, clearCache, onSignOut }: { pending: number; role: Role; setRole: (r: Role) => void; clearCache: () => void; onSignOut: () => void }) {
   const [note, setNote] = useState("");
   const [health, setHealth] = useState("");
   async function seed() { try { const r = await api.post<{ seeded: boolean }>("/api/seed", {}); setNote(r.seeded ? "Demo data seeded: approved harness procedure + operator notes. Open Procedures to start." : "Demo data already present."); } catch (e) { setNote(e instanceof Error ? e.message : "Seed failed — is the backend running?"); } }
@@ -1724,14 +1880,20 @@ function Settings({ pending, role, setRole, clearCache }: { pending: number; rol
     <button className="btn" onClick={seed}>Seed demo procedure</button>{note && <div className="notice ok" role="status">{note}</div>}
     <h3>Offline storage</h3><p>{pending} event(s) pending synchronization. Queued events and the active job survive reloads and airplane mode.</p>
     <button className="btn secondary" onClick={clearCache}>Clear downloaded procedure cache</button>
-    <h3>Identity (demo)</h3><p className="muted">This build uses header-based demo identity — the server still enforces reviewer-only approval, but it is not production authentication. Switching role here only changes the demo identity sent to the server; it cannot grant real permissions.</p>
+    <h3>Identity (demo)</h3><p className="muted">This build uses header-based demo identity — the server still enforces reviewer-only approval, but it is not production authentication. Switching role here only changes the demo identity sent to the server; it cannot grant real permissions. Your role choice is remembered on this device.</p>
     <label htmlFor="demo-role">Demo role</label>
     <select id="demo-role" value={role} onChange={(e) => setRole(e.target.value as Role)}>
       <option value="technician">Technician</option><option value="expert">Expert</option><option value="reviewer">Reviewer</option>
     </select>
+    <div className="row" style={{ marginTop: 10 }}>
+      <button className="btn secondary" onClick={onSignOut}>Sign out on this device</button>
+    </div>
     <h3>Privacy</h3><p className="muted">The Meta API key lives only on the backend and never reaches this browser. Recordings are sent for transcription only when connected and only after you press Record. Delete local data any time by clearing site storage; server records follow your team retention policy.</p>
     <h3>Diagnostics</h3><p className="muted">Check the real API, database, and AI status. No secrets are shown.</p>
     <button className="btn secondary" onClick={checkHealth}>Check connection</button>{health && <div className="notice info" role="status">{health}</div>}
+    <h3>Install &amp; display</h3>
+    <p className="muted">Use this to diagnose the address-bar issue: in the installed app this should read <strong>standalone</strong> with a controlled service worker. In a browser tab it reads <strong>browser</strong> — install the app (Share/Add to Home Screen) for fullscreen.</p>
+    <PwaDiagnostics />
   </div>;
 }
 

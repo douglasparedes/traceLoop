@@ -16,10 +16,8 @@ interface Props {
   autoStart?: boolean;
 }
 
-function wsUrl(): string {
-  const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
-  return `${proto}//${window.location.host}/api/voice/realtime`;
-}
+import { wsUrl } from "./api";
+
 
 /**
  * Live transcription via the backend Muse Voice realtime proxy (PCM over
@@ -238,7 +236,7 @@ export default function LiveTranscribe({ captureId, disabled, compact, onFinal, 
       const ctx = new AC({ sampleRate: 24000 });
       ctxRef.current = ctx;
       await ctx.audioWorklet.addModule("/pcm-worklet.js");
-      const ws = new WebSocket(wsUrl());
+      const ws = new WebSocket(wsUrl("/api/voice/realtime"));
       ws.binaryType = "arraybuffer";
       wsRef.current = ws;
       const ready = await new Promise<boolean>((resolve) => {

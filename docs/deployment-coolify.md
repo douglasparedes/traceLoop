@@ -17,13 +17,25 @@ worker and `/api` calls share one scope. No CORS or separate frontend service.
    |---|---|---|
    | `META_API_KEY` | your Meta key | Server-only, never in the image. Without it the app runs with labelled simulated AI. |
    | `DATABASE_URL` | `sqlite:////data/fieldguard.db` | Already the image default; set explicitly anyway. |
-   | `CORS_ORIGINS` | `https://knowloop.online` | Optional; same-origin traffic doesn't need CORS. |
+   | `CORS_ORIGINS` | `https://app.knowloop.online` | Optional; same-origin traffic doesn't need CORS. |
+   | `APP_PASSWORD` | team passphrase | **Set this before going public.** Enables the sign-in gate; empty = open (local dev only). |
+   | `SECRET_KEY` | long random string | Signs auth tokens. If unset, derived from the password — set it explicitly in production. |
    | `PORT` | _(leave to Coolify)_ | Coolify injects this (e.g. `3000`); the image's CMD and healthcheck both follow `$PORT`. Do **not** set it manually unless you also change the port mapping. |
 5. **Persistent volumes** (both required, or data dies on redeploy):
    - `/data` — SQLite database.
    - `/app/backend/data` — uploaded evidence, tutorial videos, live chunks.
-6. Deploy. First boot: `POST https://knowloop.online/api/seed` once
+6. Deploy. First boot: `POST https://app.knowloop.online/api/seed` once
    (idempotent) to load the demo procedure.
+
+### Access control (demo-grade)
+
+With `APP_PASSWORD` set, every `/api/*` route except `/api/health`,
+`/api/auth/status`, `/api/auth/login` and `/api/auth/me` requires the
+`X-Auth-Token` from sign-in (30-day expiry, HMAC-signed). The WebSocket voice
+proxy takes the same token as `?token=`. Identity headers (`X-User`/`X-Role`)
+remain demo self-declared roles — the gate proves team membership, not
+individual identity. Per-user accounts with password hashes are the planned
+follow-up; until then treat all data on the public URL as shared demo data.
 
 ## 2. PWA verification
 

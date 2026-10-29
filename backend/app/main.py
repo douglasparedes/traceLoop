@@ -5,7 +5,8 @@ import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Header, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, Header, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import JSONResponse
 from fastapi.concurrency import run_in_threadpool
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
@@ -81,6 +82,47 @@ def health(db: Session = Depends(get_db)):
     return {"status": "ok" if db_ok else "degraded", "db": db_ok, "ai_live": ai.live_enabled(), "models": {"spark": ai.SPARK_MODEL, "segment": ai.SAM_MODEL, "voice": ai.VOICE_MODEL}}
 
 
+@app.get("/api/auth/status")
+def auth_status():
+    from . import auth as _auth
+    return {"auth_enabled": _auth.enabled()}
+
+
+@app.post("/api/auth/login")
+async def auth_login(request: Request):
+    from . import auth as _auth
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    if not _auth.enabled():
+        return {"ok": True, "token": "", "demo_open": True}
+    if _auth.check_password(str(body.get("password", ""))):
+        return {"ok": True, "token": _auth.create_token()}
+    raise HTTPException(401, "Wrong team passphrase")
+
+
+@app.get("/api/auth/me")
+def auth_me(request: Request):
+    from . import auth as _auth
+    if not _auth.enabled():
+        return {"ok": True, "demo_open": True}
+    if _auth.verify_token(request.headers.get("X-Auth-Token", "")):
+        return {"ok": True}
+    raise HTTPException(401, "Not signed in")
+
+
+@app.middleware("http")
+async def _auth_gate(request: Request, call_next):
+    from . import auth as _auth
+    if _auth.enabled() and request.url.path.startswith("/api/") and request.url.path not in (
+            "/api/health", "/api/auth/status", "/api/auth/login", "/api/auth/me"):
+        # /api/auth/me answers 401 itself when the token is missing/invalid.
+        if not _auth.verify_token(request.headers.get("X-Auth-Token", "")):
+            return JSONResponse({"detail": "Not signed in — enter the team passphrase."}, status_code=401)
+    return await call_next(request)
+
+
 @app.get("/api/assets")
 def list_assets(db: Session = Depends(get_db)):
     return [{"id": a.id, "name": a.name, "asset_type": a.asset_type, "model": a.model, "description": a.description}
@@ -146,6 +188,12 @@ async def voice_realtime(ws: WebSocket):
     speechComplete events verbatim.
     """
     await ws.accept()
+    from . import auth as _auth
+    if _auth.enabled() and not _auth.verify_token(dict(ws.query_params).get("token", "")):
+        await ws.send_json({"type": "error", "simulated": True,
+                            "message": "Not signed in — enter the team passphrase and try again."})
+        await ws.close()
+        return
     if not ai.live_enabled():
         await ws.send_json({"type": "error", "simulated": True,
                             "message": "No META_API_KEY configured; live transcription unavailable. Use Stop-and-transcribe or type the transcript."})
