@@ -566,15 +566,25 @@ export default function TutorialMode({ onUseTranscript, onOpenReview }: { onUseT
         </div>
       )}
 
-      {job?.status === "error" && (
-        <div className="notice error" role="alert">
-          <strong>Processing failed.</strong> {job.error}
-          <div className="row" style={{ marginTop: 8 }}>
-            <button className="btn small" onClick={async () => { await authPost(`/api/tutorial/${job.id}/retry`, {}, { "X-Tutorial-Token": job.access_token }); setJob({ ...job, status: "uploaded", progress: 2, error: "" }); setPhase("processing"); }}>Retry processing</button>
-            <button className="btn small secondary" onClick={() => setPhase("record")}>Record again</button>
+      {job?.status === "error" && (() => {
+        const noAudio = /no audio track/i.test(job.error || "");
+        return (
+          <div className="notice error" role="alert">
+            <strong>Processing failed.</strong> {job.error}
+            {noAudio && (
+              <p className="muted small-text" style={{ margin: "6px 0 0" }}>
+                This recording captured video but no sound — check the microphone is on and not muted at the OS/browser level, then record again while narrating each step out loud. Retrying this file cannot work: it contains no audio to transcribe.
+              </p>
+            )}
+            <div className="row" style={{ marginTop: 8 }}>
+              {!noAudio && (
+                <button className="btn small" onClick={async () => { await authPost(`/api/tutorial/${job.id}/retry`, {}, { "X-Tutorial-Token": job.access_token }); setJob({ ...job, status: "uploaded", progress: 2, error: "" }); setPhase("processing"); }}>Retry processing</button>
+              )}
+              <button className="btn small secondary" onClick={() => setPhase("record")}>{noAudio ? "Record again with microphone" : "Record again"}</button>
+            </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
 
       {phase === "guide" && job && job.status === "done" && (
         <div>

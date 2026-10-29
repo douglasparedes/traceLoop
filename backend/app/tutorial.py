@@ -57,6 +57,13 @@ def _run(args: list[str], timeout: int = 300) -> subprocess.CompletedProcess:
     return subprocess.run(args, capture_output=True, timeout=timeout)
 
 
+class NoAudioTrackError(RuntimeError):
+    """The uploaded video carries no audio stream — there is nothing to transcribe."""
+
+
+_AUDIO_STREAM_RE = re.compile(r"Stream #\d+:\d+.*Audio:", re.S)
+
+
 def probe_video(path: Path) -> dict:
     proc = _run([_ffmpeg(), "-i", str(path)], timeout=60)
     err = proc.stderr.decode("utf-8", "replace")
@@ -68,13 +75,33 @@ def probe_video(path: Path) -> dict:
     vm = re.search(r"Video:.*?(\d{2,5})x(\d{2,5})", err)
     if vm:
         w, h = int(vm.group(1)), int(vm.group(2))
-    return {"duration": dur, "width": w, "height": h}
+    return {"duration": dur, "width": w, "height": h,
+            "has_audio": bool(_AUDIO_STREAM_RE.search(err))}
+
+
+def _ffmpeg_tail(proc: subprocess.CompletedProcess, limit: int = 400) -> str:
+    try:
+        err = proc.stderr.decode("utf-8", "replace")
+    except Exception:
+        err = ""
+    lines = [ln.strip() for ln in err.strip().splitlines() if ln.strip()]
+    return " ".join(lines[-4:])[-limit:]
 
 
 def extract_audio_wav(source: Path, out: Path) -> None:
     proc = _run([_ffmpeg(), "-y", "-i", str(source), "-vn", "-ac", "1", "-ar", "24000", "-c:a", "pcm_s16le", str(out)])
-    if proc.returncode != 0 or not out.exists():
-        raise RuntimeError("Could not extract an audio track from the video")
+    if proc.returncode == 0 and out.exists() and out.stat().st_size > 0:
+        return
+    tail = _ffmpeg_tail(proc)
+    if ("matches no streams" in tail or "does not contain any stream" in tail
+            or "Stream map" in tail and "matches no streams" in tail):
+        raise NoAudioTrackError(
+            "This video has no audio track, so there is nothing to transcribe. "
+            "Record again with the microphone on and narrate each step as you show it.")
+    raise RuntimeError(
+        "Could not read the audio track in this video"
+        + (f" (ffmpeg: {tail})" if tail else "")
+        + ". Try recording again, or convert the file to MP4 with AAC audio.")
 
 
 def make_tracking_copy(source: Path, out: Path, max_width: int = TRACKING_MAX_WIDTH) -> dict:
@@ -635,11 +662,32 @@ def run_job(job_id: str) -> None:
                 raise RuntimeError("Could not read the uploaded video (unsupported format?)")
             if info["duration"] > MAX_VIDEO_SEC + 5:
                 raise RuntimeError(f"Video is {info['duration']:.0f}s — tutorials are limited to {MAX_VIDEO_SEC}s (10 minutes)")
+            if not info.get("has_audio", True):
+                # Fail fast with an actionable message: retrying a silent video
+                # can never succeed, and transcribing silence is not an option.
+                proc.safe_record(db, "tutorial", job_id, "extract_audio", "failed",
+                                 operation="extract_audio_wav", duration_ms=0, actor=actor,
+                                 summary={"has_audio": False,
+                                          "note": "probe found no audio stream; failing before transcription"})
+                raise NoAudioTrackError(
+                    "This video has no audio track, so there is nothing to transcribe. "
+                    "Record again with the microphone on and narrate each step as you show it.")
             _set(db, job, duration_sec=info["duration"], width=info["width"], height=info["height"], progress=8)
 
             _set(db, job, status="transcribing", progress=12)
             wav = job_dir / "audio.wav"
-            extract_audio_wav(source, wav)
+            try:
+                extract_audio_wav(source, wav)
+            except NoAudioTrackError:
+                proc.safe_record(db, "tutorial", job_id, "extract_audio", "failed",
+                                 operation="extract_audio_wav", duration_ms=0, actor=actor,
+                                 summary={"has_audio": False})
+                raise
+            except RuntimeError as ee:
+                proc.safe_record(db, "tutorial", job_id, "extract_audio", "failed",
+                                 operation="extract_audio_wav", duration_ms=0, actor=actor,
+                                 summary={"error_type": "RuntimeError", "ffmpeg": str(ee)[-300:]})
+                raise
             with proc.timed() as t:
                 tr = ai.transcribe_timed("audio.wav", wav.read_bytes(), duration_sec=info["duration"])
             proc.safe_record(
