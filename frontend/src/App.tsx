@@ -8,6 +8,7 @@ import TutorialMode from "./TutorialMode";
 import LiveTranscribe from "./LiveTranscribe";
 import { extractObjectPhrase, promptVariants } from "./speechPrompt";
 import type { JobEventRec, LocalJob, ProcSummary, Role, Step, Version, View } from "./types";
+import { checkAssetLinks, usePwaInstall, type AssetLinksStatus } from "./pwaInstall";
 
 const ISSUE_TYPES = ["Component not found", "Instructions unclear", "Expected result not observed", "Tool unavailable", "Manual mismatch", "Unexpected condition", "Other"];
 
@@ -81,6 +82,7 @@ export default function App() {
   const [reviewVersion, setReviewVersion] = useState<Version | null>(null);
   const [detailVersion, setDetailVersion] = useState<Version | null>(null);
   const [storageNote, setStorageNote] = useState<string | null>(null);
+  const pwa = usePwaInstall();
 
   const notify = useCallback((text: string, kind: "ok" | "error" | "info" = "ok") => { setMsg(text); setMsgKind(kind); }, []);
 
@@ -430,7 +432,7 @@ export default function App() {
           )}
           {msg && <div className={`notice ${msgKind === "error" ? "error" : msgKind === "info" ? "info" : "ok"}`} role={msgKind === "error" ? "alert" : "status"}>{msg} <button className="btn small secondary" onClick={() => setMsg("")}>Dismiss</button></div>}
           {listsLoading && procs.length === 0 && <div className="card" aria-label="Loading procedures"><div className="skeleton" /><div className="skeleton" /><div className="skeleton" /></div>}
-          {view === "home" && <Home procs={procs} jobs={jobs} activeJob={activeJob} activeVersion={activeVersion} pending={pending} online={online} storageNote={storageNote} role={role} go={setView} openReview={async (vid) => { const v = await openVersion(vid); if (v) { setReviewVersion(v); setView("review"); } else notify("That version is not available offline yet.", "error"); }} continueJob={() => { if (activeJob) { openVersion(activeJob.procedure_version_id).then((v) => { if (v) { setActiveVersion(v); setView("job"); } else notify("Downloaded procedure not found on this device. Reconnect and open it from Procedures.", "error"); }); } }} />}
+          {view === "home" && <Home procs={procs} jobs={jobs} activeJob={activeJob} activeVersion={activeVersion} pending={pending} online={online} storageNote={storageNote} role={role} go={setView} pwa={pwa} openReview={async (vid) => { const v = await openVersion(vid); if (v) { setReviewVersion(v); setView("review"); } else notify("That version is not available offline yet.", "error"); }} continueJob={() => { if (activeJob) { openVersion(activeJob.procedure_version_id).then((v) => { if (v) { setActiveVersion(v); setView("job"); } else notify("Downloaded procedure not found on this device. Reconnect and open it from Procedures.", "error"); }); } }} />}
           {view === "library" && <Library procs={procs} cachedIds={cachedIds} reload={loadLists} startJob={startJob} openVersion={openDetail} cache={async (vid) => { const v = await openVersion(vid); notify(v ? "Saved for offline use — verified in local storage on this device." : "Download failed — check connection.", v ? "ok" : "error"); }} />}
           {view === "detail" && <ProcedureDetail title={(detailVersion && procs.find((x) => x.id === detailVersion.procedure_id)?.title) || ""} version={detailVersion} cached={detailVersion ? cachedIds.has(detailVersion.id) : false} startJob={() => { const p = detailVersion ? procs.find((x) => x.id === detailVersion.procedure_id) : undefined; if (p) startJob(p); else if (detailVersion) notify("Procedure record unavailable — reload the library.", "error"); }} cache={async () => { if (detailVersion) { const v = await openVersion(detailVersion.id); notify(v ? "Saved for offline use — verified in local storage on this device." : "Download failed — check connection.", v ? "ok" : "error"); } }} openReview={() => { if (detailVersion) { setReviewVersion(detailVersion); setView("review"); } }} go={setView} />}
           {view === "capture" && <CaptureView done={(v) => { setReviewVersion(v); setView("review"); loadLists(); }} openReview={async (vid) => { const v = await openVersion(vid); if (v) { setReviewVersion(v); setView("review"); } else notify("That version is not available offline yet.", "error"); }} />}
@@ -439,7 +441,7 @@ export default function App() {
           {view === "activity" && <Activity jobs={jobs} pending={pending} pendingReview={pendingReview} reload={loadLists} go={setView} syncNow={() => void syncNow()} syncing={syncState === "syncing"} role={role} onProposeRevision={async (vid) => { const v = await openVersion(vid); if (v) { setReviewVersion(v); setView("review"); notify("Opened the job's exact revision. Use “Propose new revision” there — it goes through normal review."); } else notify("That revision is not available offline yet.", "error"); }} />}
           {view === "history" && <History jobs={jobs} reload={loadLists} role={role} onProposeRevision={async (vid) => { const v = await openVersion(vid); if (v) { setReviewVersion(v); setView("review"); } }} />}
           {view === "manuals" && <Manuals notify={notify} />}
-          {view === "settings" && <Settings pending={pending} role={role} setRole={setRole} onSignOut={doLogout} clearCache={async () => { await idb.clear("versions"); await refreshCached(); notify("Offline procedure cache cleared. Downloaded jobs and queued events were kept."); }} />}
+          {view === "settings" && <Settings pending={pending} role={role} setRole={setRole} onSignOut={doLogout} pwa={pwa} clearCache={async () => { await idb.clear("versions"); await refreshCached(); notify("Offline procedure cache cleared. Downloaded jobs and queued events were kept."); }} />}
         </main>
       </div>
       {view !== "job" && (
@@ -453,10 +455,11 @@ export default function App() {
   );
 }
 
-function Home({ procs, jobs, activeJob, activeVersion, pending, online, storageNote, role, go, openReview, continueJob }: {
+function Home({ procs, jobs, activeJob, activeVersion, pending, online, storageNote, role, go, openReview, continueJob, pwa }: {
   procs: ProcSummary[]; jobs: JobRow[]; activeJob: LocalJob | null; activeVersion: Version | null;
   pending: number; online: boolean; storageNote: string | null; role: Role; go: (v: View) => void;
   openReview: (vid: string) => void; continueJob: () => void;
+  pwa: { canInstall: boolean; installed: boolean; outcome: string | null; install: () => Promise<void> };
 }) {
   const approved = procs.filter((p) => p.approved_version_id);
   const reviewQueue = procs.flatMap((p) => p.versions.filter((v) => v.status === "pending_review" || v.status === "draft" || v.status === "rejected").map((v) => ({ ...v, title: p.title })));
@@ -480,6 +483,17 @@ function Home({ procs, jobs, activeJob, activeVersion, pending, online, storageN
           </div>
         </div>
       </div>
+      {pwa.canInstall && !pwa.installed && (
+        <div className="notice info" role="status" style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", marginBottom: 12 }}>
+          <span><strong>Install TraceLoop</strong> for fullscreen field use — no address bar, works offline.</span>
+          <span className="row" style={{ marginLeft: "auto" }}>
+            <button className="btn small" onClick={() => void pwa.install()}>Install app</button>
+          </span>
+        </div>
+      )}
+      {pwa.outcome === "dismissed" && (
+        <p className="muted small-text" role="status">Install dismissed — use Settings → Install &amp; display to try again.</p>
+      )}
       {activeJob ? (
         <div className="card accent-edge">
           <div className="row" style={{ justifyContent: "space-between" }}>
@@ -1837,8 +1851,9 @@ function Manuals({ notify }: { notify: (s: string, kind?: "ok" | "error" | "info
   </div>;
 }
 
-function PwaDiagnostics() {
+function PwaDiagnostics({ pwa }: { pwa: { canInstall: boolean; installed: boolean } }) {
   const [info, setInfo] = useState<string | null>(null);
+  const [links, setLinks] = useState<AssetLinksStatus | null>(null);
   useEffect(() => {
     let alive = true;
     (async () => {
@@ -1863,14 +1878,29 @@ function PwaDiagnostics() {
       } catch {
         parts.push("Manifest: not fetchable offline");
       }
+      parts.push(`Install prompt: ${pwa.installed ? "installed (running standalone or install event seen)" : pwa.canInstall ? "ready — use the Install button below" : "not offered by this browser right now (already installed, or iOS — use Share → Add to Home Screen)"}`);
       if (alive) setInfo(parts.join(" · "));
     })();
     return () => { alive = false; };
+  }, [pwa.canInstall, pwa.installed]);
+  useEffect(() => {
+    let alive = true;
+    void checkAssetLinks().then((s) => { if (alive) setLinks(s); });
+    return () => { alive = false; };
   }, []);
-  return <p className="muted small-text" role="status">{info || "Checking install state…"}</p>;
+  return (
+    <div>
+      <p className="muted small-text" role="status">{info || "Checking install state…"}</p>
+      {links && (
+        <p className="muted small-text" role="status">
+          App links (APK/TWA): {links.detail}
+        </p>
+      )}
+    </div>
+  );
 }
 
-function Settings({ pending, role, setRole, clearCache, onSignOut }: { pending: number; role: Role; setRole: (r: Role) => void; clearCache: () => void; onSignOut: () => void }) {
+function Settings({ pending, role, setRole, clearCache, onSignOut, pwa }: { pending: number; role: Role; setRole: (r: Role) => void; clearCache: () => void; onSignOut: () => void; pwa: { canInstall: boolean; installed: boolean; outcome: string | null; install: () => Promise<void> } }) {
   const [note, setNote] = useState("");
   const [health, setHealth] = useState("");
   async function seed() { try { const r = await api.post<{ seeded: boolean }>("/api/seed", {}); setNote(r.seeded ? "Demo data seeded: approved harness procedure + operator notes. Open Procedures to start." : "Demo data already present."); } catch (e) { setNote(e instanceof Error ? e.message : "Seed failed — is the backend running?"); } }
@@ -1899,7 +1929,13 @@ function Settings({ pending, role, setRole, clearCache, onSignOut }: { pending: 
     <button className="btn secondary" onClick={checkHealth}>Check connection</button>{health && <div className="notice info" role="status">{health}</div>}
     <h3>Install &amp; display</h3>
     <p className="muted">Use this to diagnose the address-bar issue: in the installed app this should read <strong>standalone</strong> with a controlled service worker. In a browser tab it reads <strong>browser</strong> — install the app (Share/Add to Home Screen) for fullscreen.</p>
-    <PwaDiagnostics />
+    {pwa.canInstall && !pwa.installed && (
+      <div className="row" style={{ marginBottom: 8 }}>
+        <button className="btn" onClick={() => void pwa.install()}>Install app on this device</button>
+      </div>
+    )}
+    {pwa.outcome && <p className="muted small-text" role="status">Install prompt result: {pwa.outcome}.</p>}
+    <PwaDiagnostics pwa={pwa} />
   </div>;
 }
 

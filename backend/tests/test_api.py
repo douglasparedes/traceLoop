@@ -15,6 +15,29 @@ def _clean_db():
     yield
 
 c = TestClient(app)
+
+
+def test_assetlinks_served_as_json_for_twa_verification():
+    import json as _json
+    r = c.get("/.well-known/assetlinks.json")
+    assert r.status_code == 200, r.text[:200]
+    assert "application/json" in r.headers.get("content-type", "")
+    body = _json.loads(r.text)
+    assert isinstance(body, list) and body
+    assert body[0]["relation"] == ["delegate_permission/common.handle_all_urls"]
+    assert body[0]["target"]["namespace"] == "android_app"
+    assert body[0]["target"]["package_name"]
+    fps = body[0]["target"]["sha256_cert_fingerprints"]
+    assert isinstance(fps, list) and fps and all(isinstance(f, str) for f in fps)
+    # Must be real fingerprints: Android ignores placeholders and the TWA
+    # falls back to a Custom Tab with the address bar. Skipped (not failed)
+    # until the signing key is available — the key lives with whoever built
+    # the APK, so CI cannot provide it. See docs/deployment-coolify.md.
+    if any("REPLACE" in f for f in fps):
+        pytest.skip("assetlinks.json still has the placeholder fingerprint — paste the APK signing key (docs/deployment-coolify.md §3)")
+    import re as _re
+    for f in fps:
+        assert _re.fullmatch(r"[0-9A-Fa-f]{2}(:[0-9A-Fa-f]{2}){31}", f), f"not a SHA-256 fingerprint: {f}"
 REV = {"X-User": "rev-1", "X-Role": "reviewer"}
 TECH = {"X-User": "tech-1", "X-Role": "technician"}
 
