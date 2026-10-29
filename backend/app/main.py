@@ -1168,5 +1168,6 @@ if _DIST is not None:
         candidate = (_DIST / full_path).resolve()
         if candidate.is_file() and _DIST.resolve() in candidate.parents:
             media = "application/manifest+json" if candidate.name == "manifest.webmanifest" else None
-            return _FileResponse(candidate, media_type=media)
+            headers = {"Cache-Control": "no-store"} if candidate.name == "sw.js" else None
+            return _FileResponse(candidate, media_type=media, headers=headers)
         return _FileResponse(_DIST / "index.html")

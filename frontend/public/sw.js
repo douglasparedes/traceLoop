@@ -1,12 +1,13 @@
-// FieldGuard service worker v4.
+// FieldGuard service worker v5.
 // Shell: precached at build time (hashed list injected into SHELL), network-first
-// at runtime with navigation fallback so the app opens offline.
+// at runtime with navigation preload + navigation fallback so the app opens fast
+// online and still opens offline.
 // Media: runtime cache-first for evidence/reference images and tutorial/live
 // videos. App JSON (/api/*) is NEVER cached here — procedure/job state syncs
 // through IndexedDB + explicit sync events, and a stale cached response would
 // corrupt that flow. Media URLs carry per-session ?token= params, so cache keys
 // are normalized to the bare pathname.
-const CACHE = "fieldguard-shell-v4";
+const CACHE = "fieldguard-shell-v5";
 const MEDIA_CACHE = "fieldguard-media-v1";
 const MEDIA_MAX_ENTRIES = 120;
 
@@ -52,9 +53,17 @@ self.addEventListener("install", (e) => {
 
 self.addEventListener("activate", (e) => {
   e.waitUntil(
-    caches.keys()
-      .then((ks) => Promise.all(ks.filter((k) => k !== CACHE && k !== MEDIA_CACHE).map((k) => caches.delete(k))))
-      .then(() => self.clients.claim())
+    (async () => {
+      const ks = await caches.keys();
+      await Promise.all(ks.filter((k) => k !== CACHE && k !== MEDIA_CACHE).map((k) => caches.delete(k)));
+      // Navigation preload: the browser fetches the navigation in parallel
+      // while the worker boots, cutting online navigation latency. Offline it
+      // simply rejects and the cache fallback below takes over.
+      try {
+        if ("navigationPreload" in self.registration) await self.registration.navigationPreload.enable();
+      } catch { /* unsupported: plain network-first still applies */ }
+      await self.clients.claim();
+    })()
   );
 });
 
@@ -75,6 +84,27 @@ self.addEventListener("fetch", (e) => {
   }
   if (url.pathname.startsWith("/api")) return;
   const isNavigation = e.request.mode === "navigate";
+  if (isNavigation) {
+    // Adapted from the PWABuilder "Offline page" template pattern, pointed at
+    // our functional app shell instead of a dead-end offline page.
+    e.respondWith(
+      (async () => {
+        try {
+          const preloadResp = await e.preloadResponse;
+          if (preloadResp) return preloadResp;
+          const networkResp = await fetch(e.request);
+          if (networkResp.ok) {
+            const copy = networkResp.clone();
+            caches.open(CACHE).then((c) => c.put(e.request, copy));
+          }
+          return networkResp;
+        } catch (error) {
+          return (await caches.match(e.request)) || (await caches.match("/index.html")) || Response.error();
+        }
+      })()
+    );
+    return;
+  }
   e.respondWith(
     fetch(e.request).then((r) => {
       if (r.ok) {
