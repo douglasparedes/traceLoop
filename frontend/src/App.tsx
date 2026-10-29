@@ -66,6 +66,7 @@ export default function App() {
   const [cachedIds, setCachedIds] = useState<Set<string>>(new Set());
   const [activeVersion, setActiveVersion] = useState<Version | null>(null);
   const [activeJob, setActiveJob] = useState<LocalJob | null>(null);
+  const [updateReady, setUpdateReady] = useState(false);
   const [reviewVersion, setReviewVersion] = useState<Version | null>(null);
   const [detailVersion, setDetailVersion] = useState<Version | null>(null);
   const [storageNote, setStorageNote] = useState<string | null>(null);
@@ -175,6 +176,46 @@ export default function App() {
     const h = document.querySelector<HTMLElement>("main h2");
     if (h) { h.tabIndex = -1; h.focus({ preventScroll: true }); }
   }, [view]);
+
+  // Service-worker update flow: a waiting worker means a new build is ready.
+  // Never force-activate mid-session; the tech reloads when safe instead.
+  useEffect(() => {
+    if (!("serviceWorker" in navigator)) return;
+    let alive = true;
+    let onVis: (() => void) | undefined;
+    navigator.serviceWorker.getRegistration().then((reg) => {
+      if (!reg || !alive) return;
+      const checkWaiting = () => {
+        if (reg.waiting && navigator.serviceWorker.controller) setUpdateReady(true);
+      };
+      checkWaiting();
+      reg.addEventListener("updatefound", () => {
+        const sw = reg.installing;
+        if (!sw) { checkWaiting(); return; }
+        sw.addEventListener("statechange", () => {
+          if (sw.state === "installed") checkWaiting();
+        });
+      });
+      onVis = () => { void reg.update().then(checkWaiting).catch(() => undefined); };
+      document.addEventListener("visibilitychange", onVis);
+      // Check for a waiting worker again after the page settles (covers a
+      // worker that finished installing between load and registration).
+      setTimeout(() => { void reg.update().then(checkWaiting).catch(() => undefined); }, 5000);
+    }).catch(() => undefined);
+    return () => { alive = false; if (onVis) document.removeEventListener("visibilitychange", onVis); };
+  }, []);
+
+  function applyUpdate() {
+    navigator.serviceWorker.getRegistration().then((reg) => {
+      if (reg?.waiting) {
+        const done = () => window.location.reload();
+        navigator.serviceWorker.addEventListener("controllerchange", done, { once: true });
+        reg.waiting.postMessage({ type: "SKIP_WAITING" });
+        // Safety net: if activation stalls, reload anyway after 3s.
+        setTimeout(done, 3000);
+      } else window.location.reload();
+    }).catch(() => window.location.reload());
+  }
 
   async function queueEvent(ev: Omit<JobEventRec, "sync_status">) {
     await idb.put("events", ev.event_id, { ...ev, sync_status: "pending" });
@@ -292,6 +333,15 @@ export default function App() {
           ))}
         </nav>
         <main id="main">
+          {updateReady && (
+            <div className="notice info" role="status" style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
+              <span><strong>App update ready.</strong> Reload when safe — your queued work is stored on this device and survives the reload.</span>
+              <span className="row" style={{ marginLeft: "auto" }}>
+                <button className="btn small" onClick={applyUpdate}>Reload now</button>
+                <button className="btn small secondary" onClick={() => setUpdateReady(false)}>Later</button>
+              </span>
+            </div>
+          )}
           {msg && <div className={`notice ${msgKind === "error" ? "error" : msgKind === "info" ? "info" : "ok"}`} role={msgKind === "error" ? "alert" : "status"}>{msg} <button className="btn small secondary" onClick={() => setMsg("")}>Dismiss</button></div>}
           {listsLoading && procs.length === 0 && <div className="card" aria-label="Loading procedures"><div className="skeleton" /><div className="skeleton" /><div className="skeleton" /></div>}
           {view === "home" && <Home procs={procs} jobs={jobs} activeJob={activeJob} activeVersion={activeVersion} pending={pending} online={online} storageNote={storageNote} role={role} go={setView} openReview={async (vid) => { const v = await openVersion(vid); if (v) { setReviewVersion(v); setView("review"); } else notify("That version is not available offline yet.", "error"); }} continueJob={() => { if (activeJob) { openVersion(activeJob.procedure_version_id).then((v) => { if (v) { setActiveVersion(v); setView("job"); } else notify("Downloaded procedure not found on this device. Reconnect and open it from Procedures.", "error"); }); } }} />}

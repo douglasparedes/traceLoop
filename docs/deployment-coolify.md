@@ -32,8 +32,13 @@ worker and `/api` calls share one scope. No CORS or separate frontend service.
 2. Run the URL through [PWABuilder](https://www.pwabuilder.com/) — manifest,
    service worker and security cards should be green. The repo already ships:
    192/512 `any` + maskable icons, `screenshots` (narrow + wide, real captures),
-   `categories`, precached app shell (service worker skips `/api/*`; app data
-   syncs via IndexedDB, not the HTTP cache).
+   `categories`, `display_override`, precached app shell. The service worker
+   (`public/sw.js`, v4) also runtime-caches evidence/reference images and
+   tutorial/live videos (cache-first, ~120-entry cap, token URLs normalized),
+   while `/api/*` JSON stays network-only — app data syncs via IndexedDB, so a
+   stale cached response could never corrupt it. SW updates are user-approved:
+   a waiting worker shows an "App update ready" toast and only activates on
+   Reload, never mid-job.
 3. Install prompt: Chrome desktop (⊕ icon) and Android (“Install app”).
    Smoke test: install → airplane mode → app opens, queued work syncs later.
 
