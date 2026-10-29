@@ -122,14 +122,33 @@ def auth_me(request: Request):
     raise HTTPException(401, "Not signed in")
 
 
+import re as _re_gate
+
+# Headerless media: <video>/<img>/<a download> tags cannot send X-Auth-Token,
+# so these GETs carry a ?token= bearer instead, verified endpoint-side (403 on
+# mismatch). The evidence image URL is an unguessable UUID, as it was before
+# the team gate existed.
+MEDIA_GATE_EXEMPT_RE = _re_gate.compile(
+    r"^/api/(tutorial/[^/]+/(video|bundle\.zip|illustrations/[^/]+|diagnostics/frame/[^/]+)"
+    r"|visuals/[^/]+/file"
+    r"|live-recordings/[^/]+/chunks/[^/]+/video"
+    r"|evidence/[^/]+/image)$")
+
+
 @app.middleware("http")
 async def _auth_gate(request: Request, call_next):
     from . import auth as _auth
+    # Headerless media: <video>/<img>/<a download> tags cannot send
+    # X-Auth-Token, so these GETs carry a ?token= bearer instead, verified
+    # endpoint-side (403 on mismatch). The evidence image URL is an
+    # unguessable UUID, as it was before the team gate existed.
+    _MEDIA_RE = MEDIA_GATE_EXEMPT_RE
     if _auth.enabled() and request.url.path.startswith("/api/") and request.url.path not in (
             "/api/health", "/api/auth/status", "/api/auth/login", "/api/auth/me"):
         # /api/auth/me answers 401 itself when the token is missing/invalid.
-        if not _auth.verify_token(request.headers.get("X-Auth-Token", "")):
-            return JSONResponse({"detail": "Not signed in — enter the team passphrase."}, status_code=401)
+        if not (request.method in ("GET", "HEAD") and _MEDIA_RE.match(request.url.path)):
+            if not _auth.verify_token(request.headers.get("X-Auth-Token", "")):
+                return JSONResponse({"detail": "Not signed in — enter the team passphrase."}, status_code=401)
     return await call_next(request)
 
 
@@ -2009,7 +2028,14 @@ if _DIST is not None:
             raise HTTPException(404, "Not found")
         candidate = (_DIST / full_path).resolve()
         if candidate.is_file() and _DIST.resolve() in candidate.parents:
-            media = "application/manifest+json" if candidate.name == "manifest.webmanifest" else None
+            if candidate.name == "manifest.webmanifest":
+                media = "application/manifest+json"
+            elif candidate.name == "assetlinks.json":
+                # Android's asset-link verifier requires application/json;
+                # system mimetypes tables map .json inconsistently.
+                media = "application/json"
+            else:
+                media = None
             headers = {"Cache-Control": "no-store"} if candidate.name == "sw.js" else None
             return _FileResponse(candidate, media_type=media, headers=headers)
         return _FileResponse(_DIST / "index.html")
