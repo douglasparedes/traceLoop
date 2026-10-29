@@ -668,6 +668,8 @@ function ProcedureDetail({ title, version, cached, startJob, cache, openReview, 
   const tools = [...new Set(version.steps.flatMap((s) => s.required_tools || []))];
   const safety = ((version.source_evidence as { safety_notes?: string[] }).safety_notes || []).filter(Boolean);
   const canStart = version.status === "approved" && version.steps.length > 0;
+  const guideFormat = typeof (version.source_evidence as { guide_format?: unknown }).guide_format === "string" ? (version.source_evidence as { guide_format: string }).guide_format : "";
+  const isInteractive = guideFormat === "interactive";
   return (
     <div>
       <button className="btn small secondary" onClick={() => go("library")}><Icon name="back" size={17} /> Library</button>
@@ -681,6 +683,7 @@ function ProcedureDetail({ title, version, cached, startJob, cache, openReview, 
               : <span className="badge neutral"><Icon name="note" size={13} /> {version.status} · v{version.version_number}</span>}
           {cached ? <span className="badge ok"><Icon name="check" size={13} /> Offline cached</span> : <span className="badge neutral"><Icon name="cloudDone" size={13} /> Server only</span>}
           {version.ai_simulated ? <span className="badge info">AI draft · simulated model</span> : version.ai_model ? <span className="badge info">AI draft · {version.ai_model}</span> : null}
+          {guideFormat ? <span className="badge info"><Icon name="note" size={13} /> {({ work_instruction: "Work instruction", reference_manual: "Reference manual", interactive: "Interactive guided execution" } as Record<string, string>)[guideFormat] || guideFormat}</span> : null}
         </div>
         <h2 style={{ marginTop: 8 }}>{title || "Procedure"}</h2>
         <p className="muted">{version.summary}</p>
@@ -695,7 +698,7 @@ function ProcedureDetail({ title, version, cached, startJob, cache, openReview, 
           </div>
         )}
         <div className="proc-actions" style={{ marginTop: 12 }}>
-          {canStart && <button className="btn" onClick={startJob}><Icon name="play" size={19} /> Start procedure</button>}
+          {canStart && <button className="btn" onClick={startJob}><Icon name="play" size={19} /> {isInteractive ? "Start guided execution" : "Start procedure"}</button>}
           {version.status !== "approved" && <button className="btn review" onClick={openReview}><Icon name="flag" size={19} /> Open in review</button>}
           <button className="btn secondary" onClick={cache}><Icon name="download" size={19} /> {cached ? "Update offline copy" : "Save for offline use"}</button>
         </div>
@@ -1375,6 +1378,9 @@ function ReviewView({ version, setVersion, procs, openVersion, role, reload, not
           <div className="proc-badges">
             <span className={`badge ${version.status === "approved" ? "ok" : version.status === "pending_review" ? "review" : "neutral"}`}>{version.status.replace("_", " ")} · v{version.version_number}</span>
             {version.ai_simulated ? <span className="badge info"><Icon name="bot" size={13} /> AI draft · simulated model (no Meta key)</span> : version.ai_model ? <span className="badge info"><Icon name="bot" size={13} /> AI draft · {version.ai_model}</span> : <span className="badge neutral">Seeded demo data</span>}
+            {typeof (version.source_evidence as { guide_format?: unknown }).guide_format === "string" && (version.source_evidence as { guide_format?: string }).guide_format ? (
+              <span className="badge info"><Icon name="note" size={13} /> {({ work_instruction: "Work instruction", reference_manual: "Reference manual", interactive: "Interactive guided execution" } as Record<string, string>)[(version.source_evidence as { guide_format: string }).guide_format] || (version.source_evidence as { guide_format: string }).guide_format}{(version.source_evidence as { format_source?: string }).format_source === "user" ? " · chosen" : " · suggested"}</span>
+            ) : null}
           </div>
           <h3 style={{ marginTop: 8 }}>{version.steps.length ? "Procedure draft" : "Procedure"}</h3>
           <label htmlFor="rv-sum">Summary</label><input id="rv-sum" value={version.summary} disabled={version.status === "approved"} onChange={(e) => setVersion({ ...version, summary: e.target.value })} />

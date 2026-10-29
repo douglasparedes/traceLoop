@@ -28,7 +28,16 @@ with engine.begin() as _conn:
                                 ("live_chunks", "start_ms", "INTEGER DEFAULT 0"), ("live_chunks", "end_ms", "INTEGER DEFAULT 0"),
                                 ("live_chunks", "prompt_source", "TEXT DEFAULT ''"), ("live_chunks", "speech_phrase", "TEXT DEFAULT ''"),
                                 ("tutorial_jobs", "draft_procedure_id", "VARCHAR DEFAULT ''"),
-                                ("tutorial_jobs", "draft_version_id", "VARCHAR DEFAULT ''")):
+                                ("tutorial_jobs", "draft_version_id", "VARCHAR DEFAULT ''"),
+                                ("tutorial_jobs", "guide_format", "VARCHAR DEFAULT ''"),
+                                ("tutorial_jobs", "format_source", "VARCHAR DEFAULT ''"),
+                                ("tutorial_jobs", "format_rationale", "TEXT DEFAULT ''"),
+                                ("guide_snapshots", "guide_format", "VARCHAR DEFAULT ''"),
+                                ("guide_snapshots", "format_source", "VARCHAR DEFAULT ''"),
+                                ("guide_snapshots", "format_rationale", "TEXT DEFAULT ''"),
+                                ("visual_assets", "idempotency_key", "VARCHAR DEFAULT ''"),
+                                ("procedure_steps", "start_sec", "FLOAT"),
+                                ("procedure_steps", "end_sec", "FLOAT")):
         if _insp.has_table(_table) and _col not in {c["name"] for c in _insp.get_columns(_table)}:
             _conn.execute(_text(f"ALTER TABLE {_table} ADD COLUMN {_col} {_type}"))
 
@@ -69,7 +78,8 @@ def ver_out(v: M.ProcedureVersion) -> dict:
         "steps": [{"id": s.id, "step_order": s.step_order, "title": s.title, "instruction": s.instruction,
                    "expected_result": s.expected_result, "required_tools": s.required_tools or [],
                    "evidence_refs": s.evidence_refs or [], "visual_refs": s.visual_refs or [],
-                   "verification_notes": s.verification_notes} for s in v.steps],
+                   "verification_notes": s.verification_notes,
+                   "start_sec": s.start_sec, "end_sec": s.end_sec} for s in v.steps],
     }
 
 
@@ -501,7 +511,8 @@ def edit_version(vid: str, body: S.VersionEdit, db: Session = Depends(get_db), w
             db.add(M.ProcedureStep(procedure_version_id=v.id, step_order=i, title=s.title, instruction=s.instruction,
                                    expected_result=s.expected_result, required_tools=s.required_tools,
                                    evidence_refs=s.evidence_refs, visual_refs=s.visual_refs,
-                                   verification_notes=s.verification_notes))
+                                   verification_notes=s.verification_notes,
+                                   start_sec=s.start_sec, end_sec=s.end_sec))
     db.commit(); db.refresh(v)
     return ver_out(v)
 
@@ -519,7 +530,7 @@ def new_revision(vid: str, db: Session = Depends(get_db), who=Depends(actor)):
         db.add(M.ProcedureStep(procedure_version_id=nv.id, step_order=s.step_order, title=s.title, instruction=s.instruction,
                                expected_result=s.expected_result, required_tools=s.required_tools or [],
                                evidence_refs=s.evidence_refs or [], visual_refs=s.visual_refs or [],
-                               verification_notes=s.verification_notes))
+                               verification_notes=s.verification_notes, start_sec=s.start_sec, end_sec=s.end_sec))
     db.commit(); db.refresh(nv)
     return ver_out(nv)
 
@@ -655,6 +666,8 @@ def _tutorial_out(job: M.TutorialJob) -> dict:
             "full_transcript": job.full_transcript, "timed_segments": job.timed_segments or [],
             "objects": job.objects or [], "steps": job.steps or [], "materials": job.materials or [],
             "guide_markdown": job.guide_markdown, "created_at": job.created_at.isoformat(),
+            "guide_format": job.guide_format or "", "format_source": job.format_source or "",
+            "format_rationale": job.format_rationale or "",
             "draft_procedure_id": job.draft_procedure_id or None,
             "draft_version_id": job.draft_version_id or None}
 
@@ -718,6 +731,13 @@ def list_tutorials(q: str = "", status: str = "", limit: int = 50, offset: int =
                        "has_guide": bool(j.guide_markdown)} for j in page]}
 
 
+@app.get("/api/tutorial/formats")
+def tutorial_formats():
+    """The three selectable guide presentations (shared canonical content)."""
+    from . import tutorial as tut
+    return {"formats": [{"id": fid, **meta} for fid, meta in tut.GUIDE_FORMATS.items()]}
+
+
 @app.get("/api/tutorial/{jid}")
 def get_tutorial(jid: str, x_tutorial_token: str = Header(default=""), db: Session = Depends(get_db), who=Depends(actor)):
     return _tutorial_out(_get_tutorial(db, jid, x_tutorial_token))
@@ -742,6 +762,162 @@ def tutorial_illustration(jid: str, name: str, token: str = "", db: Session = De
     path = Path(__file__).resolve().parent.parent / "data" / "tutorials" / jid / safe
     if not path.is_file(): raise HTTPException(404, "Illustration not found")
     return FileResponse(path, media_type="image/png", filename=safe)
+
+
+@app.get("/api/tutorial/{jid}/recommendation")
+def tutorial_recommendation(jid: str, x_tutorial_token: str = Header(default=""), db: Session = Depends(get_db)):
+    from . import tutorial as tut
+    job = _get_tutorial(db, jid, x_tutorial_token)
+    rec = tut.recommend_format(job)
+    if job.guide_format in tut.GUIDE_FORMATS:
+        return {"format": job.guide_format, "source": job.format_source or "user",
+                "rationale": job.format_rationale or "Selected explicitly; kept as-is.",
+                "scores": rec["scores"],
+                "recommendation": {"format": rec["format"], "rationale": rec["rationale"]}}
+    return {"format": rec["format"], "source": "recommended", "rationale": rec["rationale"], "scores": rec["scores"],
+            "recommendation": {"format": rec["format"], "rationale": rec["rationale"]},
+            "explicit": bool(job.guide_format in tut.GUIDE_FORMATS)}
+
+
+@app.put("/api/tutorial/{jid}/format")
+def tutorial_set_format(jid: str, body: dict, x_tutorial_token: str = Header(default=""), db: Session = Depends(get_db), who=Depends(actor)):
+    """Explicitly select a presentation format without generating yet.
+
+    The choice is recorded with source=user; generation keeps it unless the
+    user changes it again. Never touches prior versions.
+    """
+    from . import tutorial as tut
+    from . import processing as proc
+    job = _get_tutorial(db, jid, x_tutorial_token)
+    fmt = str((body or {}).get("format", "") or "").strip()
+    if fmt not in tut.GUIDE_FORMATS:
+        raise HTTPException(422, f"Unknown format '{fmt}'. Choose from: {', '.join(sorted(tut.GUIDE_FORMATS))}")
+    job.guide_format = fmt
+    job.format_source = "user"
+    job.format_rationale = str((body or {}).get("rationale", "") or "") or "Selected explicitly by the user."
+    db.commit(); db.refresh(job)
+    proc.safe_record(db, "tutorial", job.id, "format", "user", operation="select_format", actor=who["id"],
+                     summary={"format": fmt, "rationale": job.format_rationale})
+    return {"ok": True, "format": fmt, "format_source": "user", "rationale": job.format_rationale}
+
+
+@app.post("/api/tutorial/{jid}/guide")
+def tutorial_generate_guide(jid: str, body: dict, x_tutorial_token: str = Header(default=""), db: Session = Depends(get_db), who=Depends(actor)):
+    """Generate a NEW persisted guide version in the requested (or recommended) format.
+
+    Never mutates prior snapshots. When instructions/illustrations also change
+    (always true for a fresh generation), the linked Review draft is synced:
+    editable drafts are updated in place; locked versions get a new revision
+    via the normal revision flow. Approved procedures are never touched.
+    """
+    from . import tutorial as tut
+    from . import processing as proc
+    job = _get_tutorial(db, jid, x_tutorial_token)
+    if job.status != "done":
+        raise HTTPException(409, "The tutorial has not finished processing yet")
+    fmt = str((body or {}).get("format", "") or "").strip()
+    if not fmt and job.guide_format in tut.GUIDE_FORMATS:
+        # Explicit user choice persists: generating without a format keeps it,
+        # never silently switches to a new recommendation.
+        fmt, source, rationale = job.guide_format, job.format_source or "user", job.format_rationale or "Selected explicitly by the user."
+    elif not fmt:
+        rec = tut.recommend_format(job)
+        fmt, source, rationale = rec["format"], "recommended", rec["rationale"]
+    elif fmt not in tut.GUIDE_FORMATS:
+        raise HTTPException(422, f"Unknown format '{fmt}'. Choose from: {', '.join(sorted(tut.GUIDE_FORMATS))}")
+    else:
+        source, rationale = "user", "Selected explicitly by the user."
+    same_as_current = bool(job.guide_format) and fmt == job.guide_format
+    objects = job.objects or []
+    steps = job.steps or []
+    # Idempotency: an identical format generation completed moments ago
+    # (double-click / retry) returns the existing snapshot, no new version.
+    try:
+        latest = db.scalars(select(M.GuideSnapshot).where(M.GuideSnapshot.tutorial_id == job.id).order_by(M.GuideSnapshot.created_at.desc())).first()
+    except Exception:
+        latest = None
+    if latest is not None and latest.trigger == "format" and (latest.guide_format or "") == fmt:
+        try:
+            import datetime as _dt
+            age = (_dt.datetime.now(_dt.timezone.utc) - latest.created_at.replace(tzinfo=_dt.timezone.utc)).total_seconds()
+        except Exception:
+            age = 10 ** 9
+        if age < 120 and (latest.object_statuses or []) == [{"obj_id": o.get("obj_id"), "label": o.get("label"), "status": o.get("status"), "confidence": o.get("confidence")} for o in objects]:
+            return {"ok": True, "snapshot_id": latest.id, "format": fmt,
+                    "format_source": latest.format_source or source,
+                    "rationale": latest.format_rationale or rationale,
+                    "draft_version_id": job.draft_version_id or None,
+                    "draft_status": "unchanged", "markdown_chars": len(job.guide_markdown or ""),
+                    "duplicate": True}
+    with proc.timed() as t:
+        guide = ai.generate_guide(job.title, steps, objects, job.timed_segments or [], guide_format=fmt)
+    md = guide.get("guide_markdown") or ai.fallback_guide_markdown(job.title, steps, objects)
+    md = tut.inject_illustrations(md, steps, objects)
+    proc.safe_record(db, "tutorial", job.id, "guide", "simulated" if guide.get("simulated") else "succeeded",
+                     operation="generate_guide_format", provider="meta", model=guide.get("model", ""),
+                     duration_ms=t.ms, actor=who["id"],
+                     summary={"format": fmt, "format_source": source, "same_as_current": same_as_current,
+                              "markdown_chars": len(md),
+                              "note": guide.get("note", "")})
+    snap = tut.snapshot_guide(db, job, "format", md, objects, model=guide.get("model", ""),
+                              simulated=bool(guide.get("simulated", True)), materials=guide.get("materials", []),
+                              guide_format=fmt, format_source=source, format_rationale=rationale)
+    job.guide_format = fmt
+    job.format_source = source
+    job.format_rationale = rationale
+    job.guide_markdown = md
+    job.materials = guide.get("materials", [])
+    db.commit(); db.refresh(job)
+    draft = tut._ensure_review_draft(db, job, steps, objects, md, guide.get("materials", []),
+                                     model=guide.get("model", ""), simulated=bool(guide.get("simulated", True)),
+                                     actor=who["id"])
+    draft_status = draft.status if draft is not None else None
+    if draft is not None and draft.status in ("draft", "rejected"):
+        # Same canonical content, new presentation: record which snapshot and
+        # format this draft reflects without touching its reviewable content.
+        try:
+            se = dict(draft.source_evidence or {})
+            se.update({"tutorial_id": job.id, "guide_snapshot_id": snap.id,
+                       "guide_format": fmt, "format_source": source})
+            draft.source_evidence = se
+            from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+            _flag_modified(draft, "source_evidence")
+            db.commit()
+        except Exception:
+            db.rollback()
+    if draft is not None and draft.status in ("pending_review", "approved", "superseded"):
+        # Content changed under a locked draft: fork a new revision so the
+        # locked version stays byte-identical, per the normal review flow.
+        draft = None
+        base = db.get(M.ProcedureVersion, job.draft_version_id) if job.draft_version_id else None
+        if base is not None:
+            nxt = (db.scalar(select(func.max(M.ProcedureVersion.version_number)).where(M.ProcedureVersion.procedure_id == base.procedure_id)) or 0) + 1
+            nv = M.ProcedureVersion(procedure_id=base.procedure_id, version_number=nxt, status="draft",
+                                    summary=base.summary, prerequisites=base.prerequisites,
+                                    source_evidence=dict(base.source_evidence or {}, tutorial_id=job.id,
+                                                          guide_snapshot_id=snap.id, guide_format=fmt),
+                                    ai_model=guide.get("model", ""), ai_simulated=1 if guide.get("simulated", True) else 0,
+                                    created_by=who["id"])
+            db.add(nv); db.flush()
+            for s in base.steps:
+                db.add(M.ProcedureStep(procedure_version_id=nv.id, step_order=s.step_order, title=s.title,
+                                       instruction=s.instruction, expected_result=s.expected_result,
+                                       required_tools=list(s.required_tools or []),
+                                       evidence_refs=list(s.evidence_refs or []),
+                                       visual_refs=list(s.visual_refs or []),
+                                       verification_notes=s.verification_notes,
+                                       start_sec=s.start_sec, end_sec=s.end_sec))
+            job.draft_version_id = nv.id
+            db.commit(); db.refresh(nv)
+            audit(db, who["id"], "procedure.draft", "procedure_version", nv.id,
+                  {"tutorial_id": job.id, "from_format_change": True, "snapshot_id": snap.id})
+            proc.safe_record(db, "tutorial", job.id, "draft", "succeeded", operation="new_revision_from_format",
+                             actor=who["id"], summary={"version_id": nv.id, "version_number": nxt})
+            draft = nv
+            draft_status = "new_revision"
+    return {"ok": True, "snapshot_id": snap.id, "format": fmt, "format_source": source,
+            "rationale": rationale, "draft_version_id": job.draft_version_id,
+            "draft_status": draft_status, "markdown_chars": len(md)}
 
 
 @app.post("/api/tutorial/{jid}/objects/{obj_id}/tap")
@@ -879,6 +1055,442 @@ def tutorial_ensure_draft(jid: str, x_tutorial_token: str = Header(default=""), 
                          actor=who["id"], summary={"error_type": type(e).__name__, "error": str(e)[:300]})
         raise HTTPException(500, f"Draft creation failed: {type(e).__name__}: {str(e)[:200]}")
     return {"ok": True, "procedure_id": ver.procedure_id, "version_id": ver.id, "created": True}
+
+
+def _visual_out(a: M.VisualAsset) -> dict:
+    return {"id": a.id, "tutorial_id": a.tutorial_id, "parent_id": a.parent_id, "kind": a.kind,
+            "status": a.status, "step_id": a.step_id or None, "version_id": a.version_id or None,
+            "image_url": f"/api/visuals/{a.id}/file" if a.storage_key else None,
+            "mime_type": a.mime_type, "width": a.width, "height": a.height,
+            "instruction": a.instruction, "model": a.model, "simulated": bool(a.simulated),
+            "provenance": a.provenance or {}, "created_by": a.created_by,
+            "created_at": a.created_at.isoformat()}
+
+
+def _visual_source_bytes(db: Session, job: M.TutorialJob, spec: dict) -> tuple[bytes, str, str, str]:
+    """Resolve {kind: evidence|asset|illustration|frame|diagnostic, id|name|obj_id}
+    to (bytes, mime, parent_id, label). Validates ownership and type."""
+    from PIL import Image as _Image
+    kind = str(spec.get("kind", ""))
+    job_dir = Path(__file__).resolve().parent.parent / "data" / "tutorials" / job.id
+    if kind == "evidence":
+        e = db.get(M.Evidence, str(spec.get("id", "")))
+        if not e or e.evidence_type != "image" or not e.storage_key:
+            raise HTTPException(404, "Source image evidence not found")
+        # Ownership: tutorial-linked evidence or same capture family is fine;
+        # anything else is rejected.
+        if e.source_reference != f"tutorial:{job.id}" and not str(e.source_reference or "").startswith("tutorial:"):
+            raise HTTPException(403, "That evidence does not belong to this tutorial")
+        path = Path(__file__).resolve().parent.parent / e.storage_key
+        if not path.is_file():
+            raise HTTPException(404, "Source image file missing")
+        return path.read_bytes(), "image/" + path.suffix.lstrip(".").lower().replace("jpg", "jpeg"), f"evidence:{e.id}", e.description or "evidence"
+    if kind == "asset":
+        a = db.get(M.VisualAsset, str(spec.get("id", "")))
+        if not a or a.tutorial_id != job.id or not a.storage_key:
+            raise HTTPException(404, "Source visual asset not found")
+        path = Path(__file__).resolve().parent.parent / a.storage_key
+        if not path.is_file():
+            raise HTTPException(404, "Source visual file missing")
+        return path.read_bytes(), a.mime_type or "image/png", f"asset:{a.id}", a.instruction or a.kind
+    if kind in ("illustration", "frame", "diagnostic"):
+        name = str(spec.get("name", ""))
+        if kind == "diagnostic":
+            obj_id = int(spec.get("obj_id", -1))
+            obj = next((o for o in (job.objects or []) if int(o.get("obj_id", -1)) == obj_id), None)
+            if obj is None or not obj.get("diagnostic_frame"):
+                raise HTTPException(404, "No diagnostic frame for that object")
+            name = str(obj["diagnostic_frame"])
+        safe = Path(name).name
+        if not safe or safe != name or Path(safe).suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp"):
+            raise HTTPException(400, "Invalid source image name")
+        if kind == "diagnostic":
+            job_dir = job_dir
+        path = job_dir / safe
+        if not path.is_file():
+            # Illustrations live at data/tutorials/{jid}/; evidence elsewhere is rejected.
+            raise HTTPException(404, "Source image file missing")
+        media = {"png": "image/png", "jpg": "image/jpeg", "jpeg": "image/jpeg", "webp": "image/webp"}[Path(safe).suffix.lower().lstrip(".")]
+        return path.read_bytes(), media, f"file:{safe}", safe
+    raise HTTPException(422, "source.kind must be evidence|asset|illustration|frame|diagnostic")
+
+
+def _check_image_quota(db: Session, actor: str) -> None:
+    import datetime as _dt
+    try:
+        limit = int(_os.getenv("MAX_IMAGE_OPS_PER_DAY", "50"))
+    except ValueError:
+        limit = 50
+    if limit <= 0:
+        return
+    today = _dt.datetime.now(_dt.timezone.utc).date().isoformat()
+    n = 0
+    for a in db.scalars(select(M.VisualAsset).where(
+            M.VisualAsset.created_by == actor,
+            M.VisualAsset.kind.in_(["enhanced", "illustrative_alternative"]))).all():
+        if (a.created_at.isoformat() if hasattr(a.created_at, "isoformat") else "")[:10] >= today:
+            n += 1
+    if n >= limit:
+        raise HTTPException(429, f"Daily image-generation limit reached ({limit}). Try again tomorrow.")
+
+
+def _store_visual(db: Session, job: M.TutorialJob, kind: str, raw: bytes, mime: str,
+                  instruction: str, model: str, parent_id: str, actor: str,
+                  provenance: dict | None = None, status: str = "review",
+                  idempotency_key: str = "") -> M.VisualAsset:
+    from PIL import Image as _Image
+    import io as _io
+    try:
+        with _Image.open(_io.BytesIO(raw)) as im:
+            im.verify()
+    except Exception:
+        raise HTTPException(422, "Generated file is not a valid image")
+    with _Image.open(_io.BytesIO(raw)) as im:
+        w, h = im.size
+    ext = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp"}.get(mime, ".png")
+    store_dir = Path(__file__).resolve().parent.parent / "data" / "tutorials" / job.id / "visuals"
+    store_dir.mkdir(parents=True, exist_ok=True)
+    name = f"{uuid.uuid4().hex}{ext}"
+    (store_dir / name).write_bytes(raw)
+    a = M.VisualAsset(tutorial_id=job.id, parent_id=parent_id, kind=kind, status=status,
+                      storage_key=f"data/tutorials/{job.id}/visuals/{name}",
+                      mime_type=mime, width=w, height=h, instruction=instruction or "",
+                      model=model, simulated=False, provenance=provenance or {},
+                      created_by=actor, idempotency_key=idempotency_key or "")
+    db.add(a)
+    db.flush()
+    return a
+
+
+@app.get("/api/tutorial/{jid}/visuals")
+def tutorial_visuals(jid: str, kind: str = "", x_tutorial_token: str = Header(default=""), db: Session = Depends(get_db)):
+    job = _get_tutorial(db, jid, x_tutorial_token)
+    stmt = select(M.VisualAsset).where(M.VisualAsset.tutorial_id == job.id).order_by(M.VisualAsset.created_at.desc())
+    if kind:
+        stmt = stmt.where(M.VisualAsset.kind == kind)
+    return {"tutorial_id": job.id, "items": [_visual_out(a) for a in db.scalars(stmt).all()]}
+
+
+@app.get("/api/visuals/{aid}/file")
+def visual_file(aid: str, token: str = "", x_tutorial_token: str = Header(default=""), db: Session = Depends(get_db)):
+    from fastapi.responses import FileResponse
+    tok = token or x_tutorial_token
+    a = db.get(M.VisualAsset, aid)
+    if not a or not a.storage_key:
+        raise HTTPException(404, "Visual not found")
+    job = db.get(M.TutorialJob, a.tutorial_id)
+    if not job or not tok:
+        raise HTTPException(403, "Invalid tutorial token")
+    import secrets as _secrets
+    if not _secrets.compare_digest(job.access_token, tok):
+        raise HTTPException(403, "Invalid tutorial token")
+    path = Path(__file__).resolve().parent.parent / a.storage_key
+    if not path.is_file():
+        raise HTTPException(404, "Visual file missing")
+    media = {"image/png": "image/png", "image/jpeg": "image/jpeg", "image/svg+xml": "image/svg+xml",
+             "image/webp": "image/webp"}.get(a.mime_type, "application/octet-stream")
+    return FileResponse(path, media_type=media, filename=path.name)
+
+
+@app.post("/api/tutorial/{jid}/visuals/improve")
+def visual_improve(jid: str, body: dict, x_tutorial_token: str = Header(default=""), db: Session = Depends(get_db), who=Depends(actor)):
+    """Muse Image edit of a source visual (crop/clarity/detail).
+
+    Source pixels are NEVER overwritten: output is a new VisualAsset
+    (kind=enhanced) that must be accepted before use. Deterministic ops
+    (plain crop/resize) should use the annotate/crop path instead.
+    """
+    from . import processing as proc
+    job = _get_tutorial(db, jid, x_tutorial_token)
+    source = (body or {}).get("source") or {}
+    prompt = str((body or {}).get("prompt") or "").strip()
+    if_kind = str((body or {}).get("intent") or "improve")
+    idem = str((body or {}).get("idempotency_key") or "")
+    if idem:
+        dup = db.scalar(select(M.VisualAsset).where(M.VisualAsset.tutorial_id == job.id,
+                                                   M.VisualAsset.idempotency_key == idem))
+        if dup is not None:
+            return {"ok": True, "asset": _visual_out(dup), "duplicate": True}
+    _check_image_quota(db, who["id"])
+    raw, mime, parent_id, label = _visual_source_bytes(db, job, source)
+    if len(raw) > 15 * 1024 * 1024:
+        raise HTTPException(413, "Source image too large (max 15 MB)")
+    instruction = prompt or f"Improve this reference photo for a technical guide: keep the same component and viewpoint, make the subject clearer and better framed ({label})."
+    try:
+        linked_obj = int((body or {}).get("obj_id", 0) or 0)
+    except (TypeError, ValueError):
+        linked_obj = 0
+    with proc.timed() as t:
+        res = ai.image_edit(raw, instruction, mime=mime if mime in ("image/png", "image/jpeg", "image/webp") else "image/png")
+    proc.safe_record(db, "tutorial", job.id, "image_edit", "succeeded" if res.get("ok") else str(res.get("status", "error")),
+                     operation="muse_image_edit", provider="meta", model=res.get("model", ""), duration_ms=t.ms, actor=who["id"],
+                     summary={"parent": parent_id, "prompt_chars": len(instruction),
+                              "usage": res.get("usage", {}), "note": res.get("note", "")})
+    if not res.get("ok"):
+        raise HTTPException(502 if res.get("status") == "retryable" else 500,
+                            res.get("note") or "Image improvement failed")
+    import base64 as _b64
+    out = _b64.b64decode(res["image_b64"])
+    a = _store_visual(db, job, "enhanced", out, "image/" + (res.get("output_format") or "png"),
+                      instruction, res.get("model", ""), parent_id, who["id"],
+                      {"intent": if_kind, "source_label": label, "obj_id": linked_obj, "usage": res.get("usage", {}),
+                       "attempts": res.get("attempts", 1),
+                       "warning": "AI reconstruction may not reflect true detail — verify against the source before approving."},
+                      status="review", idempotency_key=idem)
+    db.commit(); db.refresh(a)
+    return {"ok": True, "asset": _visual_out(a), "duplicate": False}
+
+
+@app.post("/api/tutorial/{jid}/visuals/alternative")
+def visual_alternative(jid: str, body: dict, x_tutorial_token: str = Header(default=""), db: Session = Depends(get_db), who=Depends(actor)):
+    """Generate an AI ILLUSTRATIVE alternative (never evidence).
+
+    The result is always labelled illustrative, linked to (not replacing) the
+    source, and requires human review before any guide use.
+    """
+    from . import processing as proc
+    job = _get_tutorial(db, jid, x_tutorial_token)
+    prompt = str((body or {}).get("prompt") or "").strip()
+    intent = str((body or {}).get("intent") or "similar")
+    idem = str((body or {}).get("idempotency_key") or "")
+    try:
+        linked_obj = int((body or {}).get("obj_id", 0) or 0)
+    except (TypeError, ValueError):
+        linked_obj = 0
+    refs = []
+    ref_ids = []
+    for r in ((body or {}).get("references") or [])[:3]:
+        try:
+            raw, mime, pid, label = _visual_source_bytes(db, job, r if isinstance(r, dict) else {})
+        except HTTPException as e:
+            raise e
+        if len(raw) > 15 * 1024 * 1024:
+            raise HTTPException(413, "Reference image too large (max 15 MB)")
+        refs.append((raw, mime if mime in ("image/png", "image/jpeg", "image/webp") else "image/png"))
+        ref_ids.append(pid)
+    _check_image_quota(db, who["id"])
+    if idem:
+        dup = db.scalar(select(M.VisualAsset).where(M.VisualAsset.tutorial_id == job.id,
+                                                   M.VisualAsset.idempotency_key == idem))
+        if dup is not None:
+            return {"ok": True, "asset": _visual_out(dup), "duplicate": True}
+    full_prompt = (prompt + " (AI-generated illustrative alternative for documentation; "
+                   "conceptual reference only, not a verified photograph of the actual object.)").strip()
+    if not prompt:
+        raise HTTPException(422, "A description is required")
+    with proc.timed() as t:
+        res = ai.image_generate(full_prompt, refs or None)
+    proc.safe_record(db, "tutorial", job.id, "image_generate", "succeeded" if res.get("ok") else str(res.get("status", "error")),
+                     operation="muse_image_generate", provider="meta", model=res.get("model", ""),
+                     duration_ms=t.ms, actor=who["id"],
+                     summary={"intent": intent, "references": ref_ids, "prompt_chars": len(full_prompt),
+                              "usage": res.get("usage", {}), "note": res.get("note", "")})
+    if not res.get("ok"):
+        raise HTTPException(502 if res.get("status") == "retryable" else 500,
+                            res.get("note") or "Illustrative generation failed")
+    import base64 as _b64
+    out = _b64.b64decode(res["image_b64"])
+    a = _store_visual(db, job, "illustrative_alternative", out, "image/" + (res.get("output_format") or "png"),
+                      prompt, res.get("model", ""), ref_ids[0] if ref_ids else f"tutorial:{job.id}",
+                      who["id"],
+                      {"intent": intent, "references": ref_ids, "obj_id": linked_obj, "usage": res.get("usage", {}),
+                       "attempts": res.get("attempts", 1),
+                       "illustrative": True, "not_evidence": True,
+                       "warning": "AI-generated illustration. Must not be treated as verified evidence of exact model features; applicability requires human verification."},
+                      status="review", idempotency_key=idem)
+    db.commit(); db.refresh(a)
+    return {"ok": True, "asset": _visual_out(a), "duplicate": False}
+
+
+_ALLOWED_ANNOTATION_SHAPES = {"point", "circle", "rect", "arrow", "label", "dimension"}
+_ALLOWED_DIM_UNITS = {"mm", "cm", "m", "inch", "in", "px"}
+
+
+def _validate_annotation_shapes(shapes: object) -> list[dict]:
+    if not isinstance(shapes, list) or not shapes:
+        raise HTTPException(422, "Provide at least one annotation shape")
+    if len(shapes) > 50:
+        raise HTTPException(422, "Too many annotation shapes (max 50)")
+    clean: list[dict] = []
+    for i, s in enumerate(shapes):
+        if not isinstance(s, dict):
+            raise HTTPException(422, f"Shape {i} must be an object")
+        kind = str(s.get("type", ""))
+        if kind not in _ALLOWED_ANNOTATION_SHAPES:
+            raise HTTPException(422, f"Shape {i}: type must be one of point|circle|rect|arrow|label|dimension")
+        pts = s.get("points")
+        if kind in ("rect", "arrow"):
+            if not (isinstance(pts, list) and len(pts) == 2 and all(isinstance(p, list) and len(p) == 2 for p in pts)):
+                raise HTTPException(422, f"Shape {i} ({kind}) needs exactly 2 [x,y] points in 0..1 coordinates")
+        elif kind in ("point", "circle"):
+            if not (isinstance(pts, list) and len(pts) == 1 and isinstance(pts[0], list) and len(pts[0]) == 2):
+                raise HTTPException(422, f"Shape {i} ({kind}) needs exactly 1 [x,y] point in 0..1 coordinates")
+        for p in (pts or []):
+            for v in p:
+                if not isinstance(v, (int, float)) or not (0.0 <= float(v) <= 1.0):
+                    raise HTTPException(422, f"Shape {i}: coordinates must be numbers in 0..1")
+        text = str(s.get("text", "") or "")[:200]
+        dim = s.get("dimension")
+        if kind == "dimension":
+            if not isinstance(dim, dict):
+                raise HTTPException(422, "Dimension annotations need {value, unit}")
+            try:
+                value = float(dim.get("value"))
+            except (TypeError, ValueError):
+                raise HTTPException(422, "Dimension value must be a number")
+            if not (value > 0):
+                raise HTTPException(422, "Dimension value must be positive")
+            unit = str(dim.get("unit", "") or "")
+            if unit not in _ALLOWED_DIM_UNITS:
+                raise HTTPException(422, "Dimension unit must be one of mm|cm|m|inch|in|px")
+        elif dim is not None:
+            raise HTTPException(422, "Only dimension shapes carry a dimension")
+        clean.append({"type": kind, "points": [[float(v) for v in p] for p in (pts or [])],
+                      "text": text, **({"dimension": {"value": float(dim["value"]), "unit": str(dim["unit"])}} if kind == "dimension" else {})})
+    return clean
+
+
+def _annotation_svg(shapes: list[dict], w: int, h: int) -> str:
+    def X(x: float) -> float:
+        return round(float(x) * w, 1)
+
+    def Y(y: float) -> float:
+        return round(float(y) * h, 1)
+
+    parts = [f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {w} {h}" width="{w}" height="{h}">']
+    for i, s in enumerate(shapes):
+        t, pts, text = s["type"], s["points"], s.get("text", "")
+        tag = f" data-shape=\"{t}\" data-index=\"{i}\""
+        if t == "point":
+            x, y = X(pts[0][0]), Y(pts[0][1])
+            parts.append(f'<g{tag}><circle cx="{x}" cy="{y}" r="10" fill="none" stroke="#ffb020" stroke-width="4"/><circle cx="{x}" cy="{y}" r="3" fill="#ffb020"/></g>')
+        elif t == "circle":
+            x, y = X(pts[0][0]), Y(pts[0][1])
+            parts.append(f'<g{tag}><circle cx="{x}" cy="{y}" r="26" fill="rgba(255,176,32,.15)" stroke="#ffb020" stroke-width="4"/></g>')
+        elif t == "rect":
+            x1, y1, x2, y2 = X(pts[0][0]), Y(pts[0][1]), X(pts[1][0]), Y(pts[1][1])
+            x, y = min(x1, x2), min(y1, y2)
+            parts.append(f'<g{tag}><rect x="{x}" y="{y}" width="{abs(x2-x1)}" height="{abs(y2-y1)}" fill="rgba(255,176,32,.12)" stroke="#ffb020" stroke-width="4" rx="6"/></g>')
+        elif t == "arrow":
+            x1, y1, x2, y2 = X(pts[0][0]), Y(pts[0][1]), X(pts[1][0]), Y(pts[1][1])
+            parts.append(f'<g{tag}><defs><marker id="ah{i}" markerWidth="10" markerHeight="8" refX="8" refY="4" orient="auto"><path d="M0,0 L9,4 L0,8 Z" fill="#ffb020"/></marker></defs><line x1="{x1}" y1="{y1}" x2="{x2}" y2="{y2}" stroke="#ffb020" stroke-width="5" marker-end="url(#ah{i})"/></g>')
+        if (text or t == "dimension") and t in ("label", "dimension", "point", "arrow"):
+            ax, ay = (X(pts[-1][0]) + 12, Y(pts[-1][1]) - 12) if pts else (12, 24)
+            label = text if t != "dimension" else f"{s['dimension']['value']} {s['dimension']['unit']} (required — unverified)"
+            esc = label.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+            parts.append(f'<g{tag}><rect x="{ax-6}" y="{ay-20}" width="{max(60, len(esc) * 8.5)}" height="28" rx="6" fill="#201600"/><text x="{ax}" y="{ay}" font-size="17" font-family="sans-serif" fill="#ffb020">{esc}</text></g>')
+    parts.append("</svg>")
+    return "".join(parts)
+
+
+@app.post("/api/tutorial/{jid}/visuals/annotate")
+def visual_annotate(jid: str, body: dict, x_tutorial_token: str = Header(default=""), db: Session = Depends(get_db), who=Depends(actor)):
+    """Deterministic annotation overlay (SVG, no AI): exact callouts stay exact.
+
+    Dimensions are stored exactly as the user states them and labelled as
+    user requirements — never measured, never invented.
+    """
+    from . import processing as proc
+    job = _get_tutorial(db, jid, x_tutorial_token)
+    source = (body or {}).get("source") or {}
+    shapes = _validate_annotation_shapes((body or {}).get("shapes"))
+    note = str((body or {}).get("note") or "")[:500]
+    # Base dimensions come from the source file so the SVG aligns 1:1.
+    raw, mime, parent_id, label = _visual_source_bytes(db, job, source)
+    from PIL import Image as _Image
+    import io as _io
+    try:
+        with _Image.open(_io.BytesIO(raw)) as im:
+            w, h = im.size
+    except Exception:
+        raise HTTPException(422, "Source image could not be read")
+    svg = _annotation_svg(shapes, max(1, w), max(1, h))
+    store_dir = Path(__file__).resolve().parent.parent / "data" / "tutorials" / job.id / "visuals"
+    store_dir.mkdir(parents=True, exist_ok=True)
+    name = f"{uuid.uuid4().hex}.svg"
+    (store_dir / name).write_text(svg, encoding="utf-8")
+    a = M.VisualAsset(tutorial_id=job.id, parent_id=parent_id, kind="annotation", status="review",
+                      storage_key=f"data/tutorials/{job.id}/visuals/{name}",
+                      mime_type="image/svg+xml", width=w, height=h,
+                      instruction=str((body or {}).get("label") or note or "Annotation overlay"),
+                      model="deterministic-svg", simulated=False,
+                      provenance={"shapes": shapes, "source": parent_id, "source_label": label,
+                                  "note": "Deterministic overlay — geometry is exact, imagery unchanged."},
+                      created_by=who["id"])
+    db.add(a)
+    db.flush()
+    proc.safe_record(db, "tutorial", job.id, "annotate", "succeeded", operation="annotate_overlay",
+                     model="deterministic-svg", actor=who["id"],
+                     summary={"shapes": len(shapes), "parent": parent_id, "svg_chars": len(svg)})
+    db.commit(); db.refresh(a)
+    return {"ok": True, "asset": _visual_out(a)}
+
+
+@app.post("/api/visuals/{aid}/accept")
+def visual_accept(aid: str, body: dict, db: Session = Depends(get_db), who=Depends(actor)):
+    """Accept a derivative/annotation for guide use. Never rewrites the source.
+
+    Optionally links it to an editable procedure step: the asset becomes an
+    Evidence row and its id is appended to step.visual_refs (presentation).
+    Locked versions are refused with 409 — create a new revision first.
+    """
+    from . import processing as proc
+    a = db.get(M.VisualAsset, aid)
+    if not a:
+        raise HTTPException(404, "Visual asset not found")
+    if a.status == "accepted":
+        return {"ok": True, "asset": _visual_out(a), "already": True}
+    if a.status not in ("review",):
+        raise HTTPException(409, f"Only visuals under review can be accepted (status={a.status})")
+    step_id = str((body or {}).get("step_id") or "")
+    version_id = str((body or {}).get("version_id") or "")
+    evidence_id: str | None = None
+    if step_id or version_id:
+        if not (step_id and version_id):
+            raise HTTPException(422, "Linking needs both step_id and version_id")
+        v = db.get(M.ProcedureVersion, version_id)
+        if not v:
+            raise HTTPException(404, "Procedure version not found")
+        if v.status not in ("draft", "rejected"):
+            raise HTTPException(409, "That version is locked. Create a new revision first, then attach the visual there.")
+        step = next((s for s in v.steps if s.id == step_id), None)
+        if step is None:
+            raise HTTPException(404, "Step not found in that version")
+        e = M.Evidence(capture_session_id=None, evidence_type="image",
+                       storage_key=a.storage_key, description=f"Accepted {a.kind}: {a.instruction or a.id[:8]}",
+                       source_reference=f"tutorial:{a.tutorial_id}" if a.tutorial_id else "visual-asset",
+                       created_by=who["id"],
+                       extra={"visual_asset_id": a.id, "kind": a.kind, "model": a.model})
+        db.add(e)
+        db.flush()
+        evidence_id = e.id
+        refs = list(step.visual_refs or [])
+        if e.id not in refs:
+            refs.append(e.id)
+        step.visual_refs = refs
+        a.step_id = step_id
+        a.version_id = version_id
+    a.status = "accepted"
+    db.flush()
+    proc.safe_record(db, "tutorial", a.tutorial_id or "-", "accept_visual", "succeeded",
+                     operation="accept_visual", actor=who["id"],
+                     summary={"asset": aid, "kind": a.kind, "step_id": step_id or None,
+                              "version_id": version_id or None, "evidence_id": evidence_id})
+    db.commit(); db.refresh(a)
+    return {"ok": True, "asset": _visual_out(a), "evidence_id": evidence_id}
+
+
+@app.post("/api/visuals/{aid}/reject")
+def visual_reject(aid: str, db: Session = Depends(get_db), who=Depends(actor)):
+    """Reject a derivative. Originals stay untouched and usable."""
+    a = db.get(M.VisualAsset, aid)
+    if not a:
+        raise HTTPException(404, "Visual asset not found")
+    if a.status == "accepted":
+        raise HTTPException(409, "Accepted visuals cannot be rejected; archive the guide instead")
+    a.status = "rejected"
+    db.commit()
+    return {"ok": True, "asset": _visual_out(a)}
 
 
 @app.post("/api/tutorial/{jid}/archive")

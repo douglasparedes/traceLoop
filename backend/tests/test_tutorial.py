@@ -39,7 +39,7 @@ def _patch_pipeline(monkeypatch):
                                              "image_size": [320, 240], "confidence": 0.9, "mask": None}]}],
         "simulated": False, "status": "ok"})
     monkeypatch.setattr(tutorial, "make_illustrations", _fake_illustrations)
-    monkeypatch.setattr(ai, "generate_guide", lambda title, steps, objects, segs: {
+    monkeypatch.setattr(ai, "generate_guide", lambda title, steps, objects, segs, guide_format="work_instruction", **kw: {
         "guide_markdown": "# Guide\n\n## Steps\n\n### 1. Show the flag (0s-8s)", "materials": ["flag"], "simulated": False})
 
 

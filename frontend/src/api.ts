@@ -116,8 +116,8 @@ export async function checkSession(): Promise<boolean> {
 
 export const api = {
   get: <T,>(p: string) => req<T>(p),
-  post: <T,>(p: string, body?: unknown) => req<T>(p, { method: "POST", body: body ? JSON.stringify(body) : undefined }),
-  put: <T,>(p: string, body: unknown) => req<T>(p, { method: "PUT", body: JSON.stringify(body) }),
+  post: <T,>(p: string, body?: unknown, extraHeaders: Record<string, string> = {}) => req<T>(p, { method: "POST", body: body ? JSON.stringify(body) : undefined, headers: extraHeaders }),
+  put: <T,>(p: string, body: unknown, extraHeaders: Record<string, string> = {}) => req<T>(p, { method: "PUT", body: JSON.stringify(body), headers: extraHeaders }),
   upload: async <T,>(p: string, form: FormData, extraHeaders: Record<string, string> = {}): Promise<T> => {
     const res = await fetch(`${API}${p}`, { method: "POST", headers: baseHeaders(extraHeaders), body: form });
     if (res.status === 401) { emitAuthRequired(); }
