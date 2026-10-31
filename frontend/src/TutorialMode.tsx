@@ -236,7 +236,10 @@ export default function TutorialMode({ onUseTranscript, onOpenReview }: { onUseT
       const items: PastItem[] = Array.isArray(body) ? body : body.items || [];
       setPast(items);
       setPastTotal(Array.isArray(body) ? items.length : body.total ?? items.length);
-      setPastShown(items.length);
+      // Keep the list paged at 20, preserving the user's expansion across
+      // reloads (capped to the new result size) — previously this always
+      // reset to items.length, so "Show more" could never appear.
+      setPastShown((n) => Math.min(Math.max(n, 20), items.length));
     } catch { /* offline */ }
   }, [pastQ, pastStatus]);
   useEffect(() => { void loadPast(); }, [loadPast]);
@@ -850,7 +853,7 @@ export default function TutorialMode({ onUseTranscript, onOpenReview }: { onUseT
               {snaps.map((s) => (
                 <p key={s.id} className="list-row">
                   <span className="tag">{s.trigger}</span> {new Date(s.created_at).toLocaleString()} · {s.markdown_chars} chars{s.simulated ? " · simulated" : ""}
-                  {" "}<button className="btn small secondary" onClick={() => void openSnapshot(s.id)}>{snapId === s.id ? "Hide" : "View"}</button>
+                  {" "}<button className="btn small secondary" onClick={() => { if (snapId === s.id) { setSnapId(null); setSnapMd(""); } else void openSnapshot(s.id); }}>{snapId === s.id ? "Hide" : "View"}</button>
                 </p>
               ))}
               {snapId && (
