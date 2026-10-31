@@ -158,6 +158,12 @@ def test_regeneration_approval_pinning_and_conflict(monkeypatch, tmp_path):
     v1b = c.get(f"/api/procedure-versions/{vid0}").json()
     assert v1b["steps"][0]["instruction"] == "EXPERT: wave it slowly, twice."
     assert v1b["source_evidence"]["sync"]["action"] == "conflict"
+    # Resolve: apply canonical text to step 1 only; expert keeps everything else.
+    res = c.post(f"/api/procedure-versions/{vid0}/resolve-conflict", json={"step_orders": [1]}, headers=TECH).json()
+    assert res["applied"] == [1] and res["remaining"] == [] and res["action"] == "resolved"
+    v1d = c.get(f"/api/procedure-versions/{vid0}").json()
+    assert v1d["steps"][0]["instruction"] == "Hold the flag up high and steady."
+    assert v1d["source_evidence"]["sync"]["action"] == "resolved"
 
     # Approve: immutable, jobs pin the revision.
     assert c.post(f"/api/procedure-versions/{vid0}/submit-review", json={}, headers=TECH).status_code == 200
@@ -165,6 +171,8 @@ def test_regeneration_approval_pinning_and_conflict(monkeypatch, tmp_path):
     v1c = c.get(f"/api/procedure-versions/{vid0}").json()
     assert v1c["status"] == "approved"
     assert c.put(f"/api/procedure-versions/{vid0}", json={"summary": "mutate"}, headers=TECH).status_code == 409
+    # Locked versions refuse conflict resolution too.
+    assert c.post(f"/api/procedure-versions/{vid0}/resolve-conflict", json={"step_orders": [1]}, headers=TECH).status_code == 409
     proc = c.get(f"/api/procedure-versions/{vid0}").json()
     job_start = c.post("/api/jobs", json={"procedure_id": proc["procedure_id"],
                                           "procedure_version_id": vid0}, headers=TECH).json()
@@ -237,6 +245,30 @@ def test_correction_propagates_to_guide_and_draft(monkeypatch, tmp_path):
     assert ver["source_evidence"]["sync"]["action"] in ("updated", "unchanged")
     # Original source pixels untouched: cutout + overlay both linked.
     assert len(ver["steps"][0]["evidence_refs"]) >= 2
+
+
+def test_simulated_tap_records_real_frame(tmp_path):
+    """Simulated tap: no SAM call, but a real local frame excerpt + evidence."""
+    vid = tmp_path / "simtap.mp4"
+    _fixture_video(vid, duration=10, salt=9)
+    up = c.post("/api/tutorial/start", files={"file": ("simtap.mp4", vid.read_bytes(), "video/mp4")},
+                data={"title": "Sim tap"}, headers=TECH).json()
+    done = _wait_done(up["id"], up["access_token"])
+    assert done["status"] == "done", done
+    hdr = {**TECH, "X-Tutorial-Token": done["access_token"]}
+
+    updated = tutorial.resegment_object_tap(done["id"], 1, 0.4, 0.6)
+    assert updated["status"] == "needs_tap"
+    assert updated.get("taps") == [{"nx": 0.4, "ny": 0.6}]
+    assert updated.get("tap_frame", "").startswith("tap-obj-1")
+    from app.tutorial import BASE
+    assert (BASE / "data" / "tutorials" / done["id"] / updated["tap_frame"]).is_file()
+    assert "no SAM" in updated.get("note", "").lower() or "unavailable" in updated.get("note", "").lower()
+    snaps = c.get(f"/api/tutorial/{done['id']}/snapshots", headers=hdr).json()["snapshots"]
+    assert any(s["trigger"] == "tap" for s in snaps)
+    # Tap frame linked as evidence on the draft (reviewable), originals intact.
+    ver = c.get(f"/api/procedure-versions/{done['draft_version_id']}").json()
+    assert ver["steps"] and ver["steps"][0]["evidence_refs"]
 
 
 def test_fallback_formats_distinct_and_honest():
@@ -338,3 +370,12 @@ def test_intent_shapes_generation_and_comparison(monkeypatch, tmp_path):
     assert acc["ok"] and acc["evidence_id"]
     snaps = c.get(f"/api/tutorial/{done['id']}/snapshots", headers=hdr).json()["snapshots"]
     assert any(s["trigger"] == "visual_accept" for s in snaps)
+    # The accepted visual is now inline in the visible guide, labelled as accepted.
+    job = c.get(f"/api/tutorial/{done['id']}", headers=hdr).json()
+    assert f"/api/evidence/{acc['evidence_id']}/image" in job["guide_markdown"]
+    assert "accepted visual" in job["guide_markdown"]
+    # A later regeneration preserves the accepted visual (no silent loss).
+    g2 = c.post(f"/api/tutorial/{done['id']}/guide", json={"format": "work_instruction"}, headers=hdr).json()
+    assert g2.get("duplicate") is not True
+    snap2 = c.get(f"/api/tutorial/{done['id']}/snapshots/{g2['snapshot_id']}", headers=hdr).json()
+    assert f"/api/evidence/{acc['evidence_id']}/image" in snap2["guide_markdown"]
