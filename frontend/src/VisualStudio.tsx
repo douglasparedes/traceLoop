@@ -77,6 +77,12 @@ function Provenance({ asset }: { asset: VisualAsset }) {
       {typeof (asset.provenance as { warning?: unknown }).warning === "string" && (
         <span className="tag warn" style={{ marginLeft: 6 }}>{String((asset.provenance as { warning?: unknown }).warning)}</span>
       )}
+      {typeof (asset.provenance as { comparison?: unknown }).comparison === "object" && (asset.provenance as { comparison?: { verdict?: unknown } }).comparison !== null && (
+        <span className="muted small-text" style={{ display: "block", marginTop: 4 }}>
+          Comparison recorded: requested change vs generated output must be compared by a human
+          (verdict: {String((asset.provenance as { comparison: { verdict?: unknown } }).comparison.verdict || "unverified")}). No compatibility established.
+        </span>
+      )}
       {asset.status !== "accepted" && <span> · status: {asset.status} (not authoritative until accepted and reviewed)</span>}
     </div>
   );
@@ -242,10 +248,22 @@ export default function VisualStudio({ tutorialId, token, sourceAsset, reference
   }
 
   function ResultCard({ a, extra }: { a: VisualAsset; extra?: React.ReactNode }) {
+    const showSource = sourceAsset && a.parent_id && sourceAsset.source && a.kind !== "annotation";
     return (
       <div className="card" style={{ marginTop: 10 }}>
         <h4 style={{ marginTop: 0 }}>{a.kind === "illustrative_alternative" ? "AI-generated illustrative alternative" : a.kind === "annotation" ? "Annotation overlay" : "Proposed improvement"}</h4>
-        {a.kind === "annotation"
+        {showSource ? (
+          <div className="grid" style={{ gridTemplateColumns: "1fr 1fr" }}>
+            <figure style={{ margin: 0 }}>
+              <img src={sourceAsset.imageUrl} alt={`Original source: ${sourceAsset.label}`} style={{ maxWidth: "100%", borderRadius: 8 }} />
+              <figcaption className="muted small-text">Original source — never modified</figcaption>
+            </figure>
+            <figure style={{ margin: 0 }}>
+              <img src={visualFileUrl(a, token)} alt={a.instruction || "Generated visual"} style={{ maxWidth: "100%", borderRadius: 8 }} />
+              <figcaption className="muted small-text">AI-generated proposal — compare carefully before accepting</figcaption>
+            </figure>
+          </div>
+        ) : a.kind === "annotation"
           ? <div className="overlay-wrap"><img src={visualFileUrl(a, token)} alt="Annotation overlay" style={{ maxWidth: "100%" }} /></div>
           : <img src={visualFileUrl(a, token)} alt={a.instruction || "Generated visual"} style={{ maxWidth: "100%", borderRadius: 8 }} />}
         <Provenance asset={a} />

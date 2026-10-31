@@ -28,6 +28,9 @@ _TINY_PNG = _b64mod.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAD
 
 @pytest.fixture(autouse=True)
 def _patch(monkeypatch):
+    # Emulates the LIVE provider path with mocks; simulated-mode coverage
+    # lives in dedicated end-to-end tests (no key + real ffmpeg).
+    monkeypatch.setattr(ai, "live_enabled", lambda: True)
     monkeypatch.setattr(tutorial, "probe_video", lambda p: {"duration": 30.0, "width": 320, "height": 240})
     monkeypatch.setattr(tutorial, "extract_audio_wav", lambda s, o: o.write_bytes(b"wav"))
     monkeypatch.setattr(tutorial, "make_tracking_copy", lambda s, o, max_width=512: (o.write_bytes(b"mp4"), {"width": 320, "height": 240})[1])

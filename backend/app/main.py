@@ -848,7 +848,6 @@ def tutorial_generate_guide(jid: str, body: dict, x_tutorial_token: str = Header
         source, rationale = "user", "Selected explicitly by the user."
     same_as_current = bool(job.guide_format) and fmt == job.guide_format
     objects = job.objects or []
-    steps = job.steps or []
     # Idempotency: an identical format generation completed moments ago
     # (double-click / retry) returns the existing snapshot, no new version.
     try:
@@ -868,75 +867,15 @@ def tutorial_generate_guide(jid: str, body: dict, x_tutorial_token: str = Header
                     "draft_version_id": job.draft_version_id or None,
                     "draft_status": "unchanged", "markdown_chars": len(job.guide_markdown or ""),
                     "duplicate": True}
-    with proc.timed() as t:
-        guide = ai.generate_guide(job.title, steps, objects, job.timed_segments or [], guide_format=fmt)
-    md = guide.get("guide_markdown") or ai.fallback_guide_markdown(job.title, steps, objects)
-    md = tut.inject_illustrations(md, steps, objects)
-    proc.safe_record(db, "tutorial", job.id, "guide", "simulated" if guide.get("simulated") else "succeeded",
-                     operation="generate_guide_format", provider="meta", model=guide.get("model", ""),
-                     duration_ms=t.ms, actor=who["id"],
-                     summary={"format": fmt, "format_source": source, "same_as_current": same_as_current,
-                              "markdown_chars": len(md),
-                              "note": guide.get("note", "")})
-    snap = tut.snapshot_guide(db, job, "format", md, objects, model=guide.get("model", ""),
-                              simulated=bool(guide.get("simulated", True)), materials=guide.get("materials", []),
-                              guide_format=fmt, format_source=source, format_rationale=rationale)
-    job.guide_format = fmt
-    job.format_source = source
-    job.format_rationale = rationale
-    job.guide_markdown = md
-    job.materials = guide.get("materials", [])
-    db.commit(); db.refresh(job)
-    draft = tut._ensure_review_draft(db, job, steps, objects, md, guide.get("materials", []),
-                                     model=guide.get("model", ""), simulated=bool(guide.get("simulated", True)),
-                                     actor=who["id"])
-    draft_status = draft.status if draft is not None else None
-    if draft is not None and draft.status in ("draft", "rejected"):
-        # Same canonical content, new presentation: record which snapshot and
-        # format this draft reflects without touching its reviewable content.
-        try:
-            se = dict(draft.source_evidence or {})
-            se.update({"tutorial_id": job.id, "guide_snapshot_id": snap.id,
-                       "guide_format": fmt, "format_source": source})
-            draft.source_evidence = se
-            from sqlalchemy.orm.attributes import flag_modified as _flag_modified
-            _flag_modified(draft, "source_evidence")
-            db.commit()
-        except Exception:
-            db.rollback()
-    if draft is not None and draft.status in ("pending_review", "approved", "superseded"):
-        # Content changed under a locked draft: fork a new revision so the
-        # locked version stays byte-identical, per the normal review flow.
-        draft = None
-        base = db.get(M.ProcedureVersion, job.draft_version_id) if job.draft_version_id else None
-        if base is not None:
-            nxt = (db.scalar(select(func.max(M.ProcedureVersion.version_number)).where(M.ProcedureVersion.procedure_id == base.procedure_id)) or 0) + 1
-            nv = M.ProcedureVersion(procedure_id=base.procedure_id, version_number=nxt, status="draft",
-                                    summary=base.summary, prerequisites=base.prerequisites,
-                                    source_evidence=dict(base.source_evidence or {}, tutorial_id=job.id,
-                                                          guide_snapshot_id=snap.id, guide_format=fmt),
-                                    ai_model=guide.get("model", ""), ai_simulated=1 if guide.get("simulated", True) else 0,
-                                    created_by=who["id"])
-            db.add(nv); db.flush()
-            for s in base.steps:
-                db.add(M.ProcedureStep(procedure_version_id=nv.id, step_order=s.step_order, title=s.title,
-                                       instruction=s.instruction, expected_result=s.expected_result,
-                                       required_tools=list(s.required_tools or []),
-                                       evidence_refs=list(s.evidence_refs or []),
-                                       visual_refs=list(s.visual_refs or []),
-                                       verification_notes=s.verification_notes,
-                                       start_sec=s.start_sec, end_sec=s.end_sec))
-            job.draft_version_id = nv.id
-            db.commit(); db.refresh(nv)
-            audit(db, who["id"], "procedure.draft", "procedure_version", nv.id,
-                  {"tutorial_id": job.id, "from_format_change": True, "snapshot_id": snap.id})
-            proc.safe_record(db, "tutorial", job.id, "draft", "succeeded", operation="new_revision_from_format",
-                             actor=who["id"], summary={"version_id": nv.id, "version_number": nxt})
-            draft = nv
-            draft_status = "new_revision"
-    return {"ok": True, "snapshot_id": snap.id, "format": fmt, "format_source": source,
-            "rationale": rationale, "draft_version_id": job.draft_version_id,
-            "draft_status": draft_status, "markdown_chars": len(md)}
+    # Canonical path: regenerate from current job content, snapshot the new
+    # version, then sync (or fork) the linked Review draft. Approved
+    # procedures are never touched; prior snapshots are never mutated.
+    out = tut.regenerate_guide_for_job(db, job, "format", fmt=fmt, actor=who["id"])
+    return {"ok": True, "snapshot_id": out["snapshot_id"], "format": out["format"],
+            "format_source": out["format_source"], "rationale": out["rationale"],
+            "draft_version_id": out["draft_version_id"], "draft_status": out["draft_status"],
+            "markdown_chars": out["markdown_chars"],
+            "draft_action": out["draft_action"], "detail": out["detail"]}
 
 
 @app.post("/api/tutorial/{jid}/objects/{obj_id}/tap")
@@ -973,20 +912,19 @@ def tutorial_delete(jid: str, x_tutorial_token: str = Header(default=""), db: Se
 
 @app.post("/api/tutorial/{jid}/refresh-guide")
 def refresh_guide(jid: str, x_tutorial_token: str = Header(default=""), db: Session = Depends(get_db), who=Depends(actor)):
-    """Deterministically re-inject illustration links after tap corrections (no LLM call)."""
+    """Regenerate the guide from current canonical content and sync the draft.
+
+    Used after tap corrections (and from the UI refresh action): the guide,
+    snapshot history, and Review draft all reflect the latest objects,
+    labels, and illustrations. Never mutates locked versions.
+    """
     from . import tutorial as tut
     job = _get_tutorial(db, jid, x_tutorial_token)
     if job.status != "done":
         raise HTTPException(409, "The guide is not finished yet")
-    job.guide_markdown = tut.inject_illustrations(job.guide_markdown or "", job.steps or [], job.objects or [])
-    snap = tut.snapshot_guide(db, job, "refresh", job.guide_markdown, job.objects or [],
-                              model="deterministic-inject", simulated=True,
-                              materials=job.materials or [])
-    db.commit(); db.refresh(job)
-    from . import processing as proc
-    proc.safe_record(db, "tutorial", job.id, "guide", "succeeded", operation="refresh_guide",
-                     actor=who["id"], summary={"snapshot_id": snap.id, "markdown_chars": len(job.guide_markdown or "")})
-    return {"ok": True, "guide_markdown": job.guide_markdown, "snapshot_id": snap.id}
+    out = tut.regenerate_guide_for_job(db, job, "refresh", actor=who["id"])
+    return {"ok": True, "guide_markdown": job.guide_markdown, "snapshot_id": out["snapshot_id"],
+            "draft_version_id": out["draft_version_id"], "draft_action": out["draft_action"]}
 
 
 @app.get("/api/tutorial/{jid}/snapshots")
@@ -1211,6 +1149,31 @@ def visual_file(aid: str, token: str = "", x_tutorial_token: str = Header(defaul
     return FileResponse(path, media_type=media, filename=path.name)
 
 
+_VISUAL_INTENT_PREFIX = {
+    # Intent categories shape the actual model instruction (not just metadata).
+    "improve": "Improve the clarity, framing, and visibility of this technical reference photo while preserving the exact same component, geometry, and viewpoint. Do not move, add, or remove parts: ",
+    "highlight": "Emphasize the described region or component with a clear outline and label while preserving the exact geometry of everything else. Do not move, add, or remove parts: ",
+    "replace": "Show the same kind of component with the requested replacement applied, keeping viewpoint and context comparable. This is an illustrative variant, never technical evidence: ",
+    "adapt": "Adapt this reference to the requested variant while keeping viewpoint and context comparable. Illustrative only, never technical evidence: ",
+    "compare": "Render a clear comparison emphasizing the requested difference while keeping each depiction faithful to its input. Illustrative only, never technical evidence: ",
+    "similar": "Create a similar illustrative object guided by the references, keeping viewpoint and context comparable. Illustrative only: ",
+    "newer": "Create an illustrative depiction of the described newer model guided by the references, keeping viewpoint and context comparable. Illustrative only: ",
+    "reference": "Create an illustrative composition guided by the supplied reference images and the description. Illustrative only: ",
+}
+
+
+def _shape_instruction(intent: str, prompt: str, fallback_label: str = "") -> str:
+    """Turn (intent, user text) into the model instruction.
+
+    The user's words always drive the request; the intent prefix constrains
+    HOW the model may change the image (preserve vs. illustrate). Unknown
+    intents pass the prompt through unchanged — never dropped.
+    """
+    prefix = _VISUAL_INTENT_PREFIX.get((intent or "").strip().lower(), "")
+    body = prompt.strip() or fallback_label
+    return (prefix + body).strip()
+
+
 @app.post("/api/tutorial/{jid}/visuals/improve")
 def visual_improve(jid: str, body: dict, x_tutorial_token: str = Header(default=""), db: Session = Depends(get_db), who=Depends(actor)):
     """Muse Image edit of a source visual (crop/clarity/detail).
@@ -1234,7 +1197,8 @@ def visual_improve(jid: str, body: dict, x_tutorial_token: str = Header(default=
     raw, mime, parent_id, label = _visual_source_bytes(db, job, source)
     if len(raw) > 15 * 1024 * 1024:
         raise HTTPException(413, "Source image too large (max 15 MB)")
-    instruction = prompt or f"Improve this reference photo for a technical guide: keep the same component and viewpoint, make the subject clearer and better framed ({label})."
+    instruction = _shape_instruction(if_kind, prompt,
+        f"Improve this reference photo for a technical guide: keep the same component and viewpoint, make the subject clearer and better framed ({label}).")
     try:
         linked_obj = int((body or {}).get("obj_id", 0) or 0)
     except (TypeError, ValueError):
@@ -1293,7 +1257,8 @@ def visual_alternative(jid: str, body: dict, x_tutorial_token: str = Header(defa
                                                    M.VisualAsset.idempotency_key == idem))
         if dup is not None:
             return {"ok": True, "asset": _visual_out(dup), "duplicate": True}
-    full_prompt = (prompt + " (AI-generated illustrative alternative for documentation; "
+    full_prompt = (_shape_instruction(intent, prompt, "Illustrative alternative.") +
+                   " (AI-generated illustrative alternative for documentation; "
                    "conceptual reference only, not a verified photograph of the actual object.)").strip()
     if not prompt:
         raise HTTPException(422, "A description is required")
@@ -1315,9 +1280,23 @@ def visual_alternative(jid: str, body: dict, x_tutorial_token: str = Header(defa
                       {"intent": intent, "references": ref_ids, "obj_id": linked_obj, "usage": res.get("usage", {}),
                        "attempts": res.get("attempts", 1),
                        "illustrative": True, "not_evidence": True,
+                       "comparison": {"requested": prompt, "references": ref_ids,
+                                      "generated_asset": None, "verdict": "unverified",
+                                      "note": "Requested change vs generated output must be compared by a human; no compatibility or equivalence is established."},
                        "warning": "AI-generated illustration. Must not be treated as verified evidence of exact model features; applicability requires human verification."},
                       status="review", idempotency_key=idem)
-    db.commit(); db.refresh(a)
+    try:
+        prov = dict(a.provenance or {})
+        comp = dict(prov.get("comparison") or {})
+        comp["generated_asset"] = a.id
+        prov["comparison"] = comp
+        a.provenance = prov
+        from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+        _flag_modified(a, "provenance")
+        db.commit()
+    except Exception:
+        db.rollback()
+    db.refresh(a)
     return {"ok": True, "asset": _visual_out(a), "duplicate": False}
 
 
@@ -1496,7 +1475,23 @@ def visual_accept(aid: str, body: dict, db: Session = Depends(get_db), who=Depen
                      summary={"asset": aid, "kind": a.kind, "step_id": step_id or None,
                               "version_id": version_id or None, "evidence_id": evidence_id})
     db.commit(); db.refresh(a)
-    return {"ok": True, "asset": _visual_out(a), "evidence_id": evidence_id}
+    snapshot_id = None
+    if evidence_id and a.tutorial_id:
+        # Accepted visuals propagate as a recorded guide version: the draft
+        # step link is the canonical change; the snapshot preserves what the
+        # guide looked like when the visual was accepted (originals untouched).
+        try:
+            from . import tutorial as tut
+            job = db.get(M.TutorialJob, a.tutorial_id)
+            if job is not None:
+                snap = tut.snapshot_guide(db, job, "visual_accept", job.guide_markdown or "",
+                                          job.objects or [], model=a.model or "",
+                                          simulated=bool(a.simulated), materials=job.materials or [])
+                db.commit()
+                snapshot_id = snap.id
+        except Exception:
+            db.rollback()
+    return {"ok": True, "asset": _visual_out(a), "evidence_id": evidence_id, "snapshot_id": snapshot_id}
 
 
 @app.post("/api/visuals/{aid}/reject")

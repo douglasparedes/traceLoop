@@ -2,23 +2,31 @@
 // Shell: precached at build time (hashed list injected into SHELL), network-first
 // at runtime with navigation preload + navigation fallback so the app opens fast
 // online and still opens offline.
-// Media: runtime cache-first for evidence/reference images and tutorial/live
-// videos. App JSON (/api/*) is NEVER cached here — procedure/job state syncs
-// through IndexedDB + explicit sync events, and a stale cached response would
-// corrupt that flow. Media URLs carry per-session ?token= params, so cache keys
-// are normalized to the bare pathname.
+// Media: runtime cache-first for evidence/reference images, tutorial/live
+// videos, tutorial illustrations, and accepted visual derivatives. App JSON
+// (/api/*) is NEVER cached here — procedure/job state syncs through IndexedDB
+// + explicit sync events, and a stale cached response would corrupt that flow.
+// CACHE POLICY (auth): media URLs carry per-session ?token= bearers and the
+// full URL (including token) is the cache key, so a cached entry is bound to
+// the authorization that fetched it. Entries without a token (evidence images,
+// unguessable-UUID URLs) key on the bare path. The media cache is deleted on
+// sign-out (see doLogout in App.tsx) so a later user on the same device never
+// reads a previous user's cached media.
 const CACHE = "fieldguard-shell-v5";
-const MEDIA_CACHE = "fieldguard-media-v1";
+const MEDIA_CACHE = "fieldguard-media-v2";
 const MEDIA_MAX_ENTRIES = 120;
 
 // Injected at build time (vite.config.ts): full list of hashed shell assets.
 // In dev the placeholder is untouched and the fallback list below is used.
 const SHELL = /*__FG_PRECACHE__*/["/", "/index.html", "/manifest.webmanifest"];
 
-const MEDIA_RE = /^\/api\/(evidence\/[^/]+\/image|tutorial\/[^/]+\/video|live-recordings\/[^/]+\/chunks\/\d+\/video)$/;
+const MEDIA_RE = /^\/api\/(evidence\/[^/]+\/image|tutorial\/[^/]+\/video|tutorial\/[^/]+\/illustrations\/[^/]+\.png|tutorial\/[^/]+\/diagnostics\/frame\/\d+|visuals\/[^/]+\/file|live-recordings\/[^/]+\/chunks\/\d+\/video)$/;
 
 function mediaKey(url) {
-  return url.origin + url.pathname;
+  // Token-bound: entries fetched with a ?token= bearer key on the full URL,
+  // so one tutorial's cached media is never served for another token.
+  // Tokenless evidence URLs (unguessable UUIDs) fall back to the bare path.
+  return url.search ? url.origin + url.pathname + url.search : url.origin + url.pathname;
 }
 
 async function trimMedia() {

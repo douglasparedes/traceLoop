@@ -205,6 +205,12 @@ export default function App() {
   }
   function doLogout() {
     clearToken(); setAuthRequired(true); setAuthPassword("");
+    // Auth boundary: drop cached private media so the next user on this
+    // device cannot read it from the service-worker cache. Queued work and
+    // downloaded procedures stay (IndexedDB), per the offline policy.
+    try {
+      if ("caches" in window) void caches.delete("fieldguard-media-v2");
+    } catch { /* cache API unavailable */ }
     notify("Signed out on this device. Queued work stays saved locally.", "info");
   }
   useEffect(() => {

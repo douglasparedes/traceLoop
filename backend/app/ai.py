@@ -650,16 +650,45 @@ def build_box_prompt(bbox_px: list[int], w: int, h: int, obj_id: int = 1) -> str
 
 # ---------------------------------------------------------------- Tutorial (Muse Voice turns + Spark)
 
+_SIM_SCRIPT = [
+    "This is my red screwdriver. I use it to loosen the terminal screws.",
+    "First, I isolate the power and verify the indicator light is off.",
+    "Next, I remove the cover panel with the screwdriver, turning each screw counterclockwise.",
+    "Then I reseat the cable harness, pushing until the retaining clip clicks.",
+    "Finally, I restore power and confirm the status light shows ready.",
+]
+
+
+def _simulated_transcript(duration_sec: float = 0) -> dict:
+    """Deterministic offline fixture: scripted narration spread over the video.
+
+    The content is generic maintenance narration — clearly labelled simulated,
+    never presented as a real transcription. Span scales with duration so
+    multi-step guides always have timestamped segments; at least two segments
+    are produced even for very short clips.
+    """
+    dur = max(float(duration_sec or 0), 10.0)
+    n = max(2, min(len(_SIM_SCRIPT), int(dur // 20) + 1))
+    step = dur / n
+    segments = [{"text": _SIM_SCRIPT[i % len(_SIM_SCRIPT)],
+                 "start": round(i * step, 1), "end": round(min((i + 1) * step, dur), 1)}
+                for i in range(n)]
+    text = " ".join(s["text"] for s in segments)
+    return {"text": text, "segments": segments, "simulated": True, "model": VOICE_MODEL,
+            "note": "Deterministic simulated transcript (no META_API_KEY; no audio left this device). Configure the key for live Muse Voice transcription."}
+
 def transcribe_timed(filename: str, data: bytes, duration_sec: float = 0) -> dict:
     """Muse Voice with ENDPOINTING: returns turn-level timed segments.
 
     Muse Voice has no word timestamps: segments are speech turns with
     startMs/endMs. If turns come back empty, the whole transcript is one
     segment spanning the audio (documented fallback).
+
+    Without a key, returns a deterministic SIMULATED fixture (clearly
+    labelled, never a live result) so the offline demo pipeline completes.
     """
     if not live_enabled():
-        return {"text": "", "segments": [], "simulated": True, "model": VOICE_MODEL,
-                "note": "No META_API_KEY configured."}
+        return _simulated_transcript(duration_sec)
     import httpx
 
     try:
@@ -731,7 +760,7 @@ _GUIDE_SCHEMA = {
 def understand_tutorial(segments: list[dict], duration_sec: float) -> dict:
     """Muse Spark: extract objects + steps from a timed transcript."""
     if not live_enabled():
-        return {"objects": [], "steps": [], "simulated": True, "model": SPARK_MODEL}
+        return _simulated_understanding(segments, duration_sec)
     timed = "\n".join(f"[{s.get('start', 0):.1f}-{s.get('end', 0):.1f}] {s.get('text', '')}" for s in segments)
     system = (
         "You analyze a tutorial transcript with segment timestamps (seconds). Extract: "
@@ -767,6 +796,42 @@ def understand_tutorial(segments: list[dict], duration_sec: float) -> dict:
                 "note": f"Understanding failed ({type(e).__name__})"}
 
 
+_SIM_OBJECTS = ["red screwdriver", "cover panel", "cable harness"]
+_SIM_STEPS = [
+    ("Isolate the power", "Verify the indicator light is off before touching anything."),
+    ("Remove the cover panel", "Loosen each terminal screw counterclockwise with the red screwdriver."),
+    ("Reseat the cable harness", "Push the harness until the retaining clip clicks."),
+    ("Restore power and verify", "Confirm the status light shows ready."),
+]
+
+
+def _simulated_understanding(segments: list[dict], duration_sec: float) -> dict:
+    """Deterministic offline fixture mirroring the simulated transcript script.
+
+    Objects and step boundaries scale with duration; every step references
+    its evidence segment so downstream stages (segmentation placeholders,
+    guide, draft) behave exactly like the live path. Clearly labelled.
+    """
+    dur = max(float(duration_sec or 0), 10.0)
+    n = max(2, min(len(_SIM_STEPS), len(segments) or 2))
+    step = dur / n
+    objects = [{"label": _SIM_OBJECTS[i % len(_SIM_OBJECTS)], "first_mentioned_at": round(i * step, 1),
+                "obj_id": i + 1, "status": "pending", "confidence": None,
+                "illustration": "", "overlay": "", "track": []}
+               for i in range(min(len(_SIM_OBJECTS), n + 1))]
+    if not objects:
+        objects = [{"label": _SIM_OBJECTS[0], "first_mentioned_at": 0.0, "obj_id": 1,
+                    "status": "pending", "confidence": None, "illustration": "", "overlay": "", "track": []}]
+    valid = {o["obj_id"] for o in objects}
+    steps = [{"step_number": j + 1, "title": _SIM_STEPS[j % len(_SIM_STEPS)][0],
+              "start": round(j * step, 1), "end": round(min((j + 1) * step, dur), 1),
+              "summary": _SIM_STEPS[j % len(_SIM_STEPS)][1],
+              "objects_used": sorted(valid)}
+             for j in range(n)]
+    return {"objects": objects, "steps": steps, "simulated": True, "model": SPARK_MODEL,
+            "note": "Deterministic simulated understanding (no META_API_KEY). Configure the key for live Muse Spark analysis."}
+
+
 def generate_guide(title: str, steps: list[dict], objects: list[dict], segments: list[dict],
                    guide_format: str = "work_instruction") -> dict:
     """Muse Spark: final guide markdown + materials from validated steps/objects.
@@ -798,8 +863,10 @@ def generate_guide(title: str, steps: list[dict], objects: list[dict], segments:
         ),
     }.get(guide_format, "")
     if not live_enabled():
-        return {"guide_markdown": "", "materials": [], "simulated": True, "model": SPARK_MODEL,
-                "format": guide_format}
+        return {"guide_markdown": fallback_guide_markdown(title, steps, objects, guide_format),
+                "materials": [o.get("label", "") for o in objects], "simulated": True, "model": SPARK_MODEL,
+                "format": guide_format,
+                "note": "Deterministic fallback guide (no META_API_KEY). Configure the key for live Muse Spark generation."}
     system = (
         "Write a clear tutorial guide in Markdown from the validated steps, objects, and transcript excerpts. "
         + structure + " "
@@ -819,13 +886,62 @@ def generate_guide(title: str, steps: list[dict], objects: list[dict], segments:
                 "note": f"Guide generation failed ({type(e).__name__})"}
 
 
-def fallback_guide_markdown(title: str, steps: list[dict], objects: list[dict]) -> str:
-    lines = [f"# {title}", "", "## What you need", ""]
-    lines += [f"- {o.get('label', 'object')}" for o in objects] or ["- (see video)"]
+def fallback_guide_markdown(title: str, steps: list[dict], objects: list[dict],
+                              guide_format: str = "work_instruction") -> str:
+    """Deterministic offline renderer: same canonical steps, three structures.
+
+    Used when live generation is unavailable (or fails). Never invents tools,
+    values, or warnings: sections with no supporting evidence are omitted or
+    marked unknown, never fabricated.
+    """
+    lines = [f"# {title}", ""]
+    tools = sorted({t for s in steps for t in (s.get("tools") or []) if isinstance(t, str) and t.strip()})
+    if guide_format == "reference_manual":
+        lines += ["_Reference manual (offline fallback — generated without live AI)._", "",
+                  "## Scope", "",
+                  "Tutorial-derived reference. Steps, objects, and time ranges below come from the recorded narration; anything not observed is omitted.", ""]
+        if tools:
+            lines += ["## Tools and materials", ""] + [f"- {t}" for t in tools] + [""]
+        lines += ["## Components", ""]
+        if objects:
+            for o in objects:
+                t = o.get("first_mentioned_at")
+                when = f" (first shown at {t:.0f}s)" if isinstance(t, (int, float)) else ""
+                lines += [f"- **{o.get('label', 'object')}**{when} — status: {o.get('status', 'unknown')}"]
+        else:
+            lines += ["- _No objects detected — components unknown, needs review._"]
+        lines += ["", "## Numbered procedure", ""]
+        for s in steps:
+            lines += [f"### {s.get('step_number', '')}. {s.get('title', '')} ({s.get('start', 0):.0f}s–{s.get('end', 0):.0f}s)", "",
+                      s.get("summary", "") or "_No summary recorded._",
+                      f"Objects: {', '.join(str(x) for x in (s.get('objects_used') or [])) or 'none linked'}", ""]
+        lines += ["## Expected outcomes", "",
+                  "_Only confirm what the recording shows; unverified outcomes are unknown._", "",
+                  "## Sources", "",
+                  "Transcript segments and object first-seen times above. No external manuals were consulted.", ""]
+        return "\n".join(lines).strip() + "\n"
+    if guide_format == "interactive":
+        lines += ["_Interactive guided execution (offline fallback)._", ""]
+        if tools:
+            lines += ["## Before you start", ""] + [f"- {t}" for t in tools] + [""]
+        lines += ["## Steps — do one at a time", ""]
+        for s in steps:
+            lines += [f"### Step {s.get('step_number', '')} of {len(steps)}: {s.get('title', '')} ({s.get('start', 0):.0f}s–{s.get('end', 0):.0f}s)", "",
+                      (s.get("summary", "") or "_No instruction recorded._"),
+                      "",
+                      "Expected: confirm visually before continuing (only the recording can verify).",
+                      "Blocked? Record the issue and stop — do not improvise.", ""]
+        return "\n".join(lines).strip() + "\n"
+    # work_instruction (default)
+    lines += ["_Illustrated work instruction (offline fallback — generated without live AI)._", "",
+              "## What you need", ""]
+    lines += [f"- {o.get('label', 'object')}" for o in objects] or ["- _(no tools identified — see video)_"]
     lines += ["", "## Steps", ""]
     for s in steps:
-        lines += [f"### {s.get('step_number', '')}. {s.get('title', '')} ({s.get('start', 0):.0f}s-{s.get('end', 0):.0f}s)", "", s.get("summary", ""), ""]
-    return "\n".join(lines)
+        lines += [f"### {s.get('step_number', '')}. {s.get('title', '')} ({s.get('start', 0):.0f}s–{s.get('end', 0):.0f}s)", "",
+                  s.get("summary", "") or "_No instruction recorded._",
+                  "Expected: unknown — verify against the video." if not s.get("summary") else "", ""]
+    return "\n".join(lines).strip() + "\n"
 
 
 # ---------------------------------------------------------------- Ask (Spark)
