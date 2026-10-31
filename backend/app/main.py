@@ -554,6 +554,48 @@ def new_revision(vid: str, db: Session = Depends(get_db), who=Depends(actor)):
     return ver_out(nv)
 
 
+@app.post("/api/procedure-versions/{vid}/resolve-conflict")
+def resolve_conflict(vid: str, body: dict, db: Session = Depends(get_db), who=Depends(actor)):
+    """Apply canonical text to chosen conflicted steps (expert keeps the rest).
+
+    Only editable versions. Each listed step takes the title/instruction from
+    the stored canonical snapshot; unresolved steps stay exactly as the
+    expert left them. When nothing remains flagged, the sync action flips
+    to "resolved".
+    """
+    v = db.get(M.ProcedureVersion, vid)
+    if not v:
+        raise HTTPException(404, "Version not found")
+    if v.status not in ("draft", "rejected"):
+        raise HTTPException(409, "Only editable drafts can resolve conflicts. Create a new revision instead.")
+    try:
+        orders = [int(x) for x in ((body or {}).get("step_orders") or [])]
+    except (TypeError, ValueError):
+        raise HTTPException(422, "step_orders must be a list of step numbers")
+    canon = {int(c.get("n", 0)): c for c in (v.source_evidence or {}).get("canonical_steps", []) if isinstance(c, dict)}
+    applied: list[int] = []
+    for s in v.steps:
+        if s.step_order in orders and s.step_order in canon:
+            s.title = str(canon[s.step_order].get("t", "") or s.title)
+            s.instruction = str(canon[s.step_order].get("i", "") or "")
+            applied.append(s.step_order)
+    se = dict(v.source_evidence or {})
+    sync = dict(se.get("sync") or {})
+    remaining = [o for o in (sync.get("conflicting_steps") or []) if o not in applied]
+    sync.update({"conflicting_steps": remaining})
+    if not remaining and sync.get("action") == "conflict":
+        sync["action"] = "resolved"
+    se["sync"] = sync
+    v.source_evidence = se
+    from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+    _flag_modified(v, "source_evidence")
+    db.commit()
+    db.refresh(v)
+    audit(db, who["id"], "procedure.conflict_resolve", "procedure_version", v.id,
+          {"applied": applied, "remaining": remaining})
+    return {"ok": True, "applied": applied, "remaining": remaining, "action": sync.get("action")}
+
+
 @app.post("/api/procedure-versions/{vid}/submit-review")
 def submit_review(vid: str, db: Session = Depends(get_db), who=Depends(actor)):
     v = db.get(M.ProcedureVersion, vid)
@@ -1477,12 +1519,17 @@ def visual_accept(aid: str, body: dict, db: Session = Depends(get_db), who=Depen
     db.commit(); db.refresh(a)
     snapshot_id = None
     if evidence_id and a.tutorial_id:
-        # Accepted visuals propagate as a recorded guide version: the draft
-        # step link is the canonical change; the snapshot preserves what the
-        # guide looked like when the visual was accepted (originals untouched).
+        # Attach accepted visuals to the visible guide as labelled presentation
+        # assets (deterministic re-injection, no LLM): the draft step link is
+        # the canonical change; the guide shows what was accepted for it.
         try:
             from . import tutorial as tut
             job = db.get(M.TutorialJob, a.tutorial_id)
+            if job is not None and job.guide_markdown:
+                extra = tut.accepted_visuals_by_step(db, version_id)
+                if extra:
+                    job.guide_markdown = tut.inject_illustrations(
+                        job.guide_markdown, job.steps or [], job.objects or [], extra)
             if job is not None:
                 snap = tut.snapshot_guide(db, job, "visual_accept", job.guide_markdown or "",
                                           job.objects or [], model=a.model or "",

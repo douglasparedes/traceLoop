@@ -215,14 +215,20 @@ def _best_track(frames: list[dict]) -> tuple[dict | None, int, float]:
     return best, distinct_best, margin_best
 
 
-def inject_illustrations(md: str, steps: list[dict], objects: list[dict]) -> str:
+def inject_illustrations(md: str, steps: list[dict], objects: list[dict],
+                         extra_visuals: dict[int, list[tuple[str, str]]] | None = None) -> str:
     """Deterministically embed illustration links into guide Markdown.
 
     Appends an illustration block per step (for every objects_used entry
     that has PNGs) delimited by HTML comment markers, so re-running is
-    idempotent: previous blocks are stripped first.
+    idempotent: previous blocks are stripped first. Accepted review visuals
+    (human-approved derivatives) can be attached via extra_visuals as
+    {step_number: [(image_url, caption)]} — labelled as accepted, never as
+    source evidence.
     """
     md = re.sub(r"\n?<!-- illustrations:\d+:start -->.*?<!-- illustrations:\d+:end -->\n?", "\n", md or "", flags=re.S)
+    md = re.sub(r"\n?<!-- accepted-visuals:\d+:start -->.*?<!-- accepted-visuals:\d+:end -->\n?", "\n", md or "", flags=re.S)
+    md = re.sub(r"\n?<!-- accepted-visuals:general:start -->.*?<!-- accepted-visuals:general:end -->\n?", "\n", md or "", flags=re.S)
     md = re.sub(r"[ \t]+\n", "\n", md)
     md = re.sub(r"\n{3,}", "\n\n", md).strip() + "\n"
     step_files: dict[int, list[tuple[dict, list[str]]]] = {}
@@ -233,11 +239,13 @@ def inject_illustrations(md: str, steps: list[dict], objects: list[dict]) -> str
         for s in steps or []:
             if o.get("obj_id") in (s.get("objects_used") or []):
                 step_files.setdefault(int(s.get("step_number", 0)), []).append((o, files))
-    if not step_files:
+    extra = extra_visuals or {}
+    if not step_files and not extra:
         return md.strip() + "\n"
     out_lines: list[str] = []
     buf: list[str] = []
     cur: int | None = None
+    seen_steps: set[int] = set()
 
     def flush() -> None:
         nonlocal buf, cur
@@ -250,6 +258,12 @@ def inject_illustrations(md: str, steps: list[dict], objects: list[dict]) -> str
                     out_lines.append(f"![{o.get('label', 'object')}](illustrations/{f})")
             out_lines.append(f"<!-- illustrations:{cur}:end -->")
             out_lines.append("")
+        if cur in extra:
+            out_lines.append(f"<!-- accepted-visuals:{cur}:start -->")
+            for url, caption in extra[cur]:
+                out_lines.append(f"![accepted visual — {caption}]({url})")
+            out_lines.append(f"<!-- accepted-visuals:{cur}:end -->")
+            out_lines.append("")
         cur = None
 
     for line in (md.strip() + "\n").split("\n"):
@@ -257,6 +271,7 @@ def inject_illustrations(md: str, steps: list[dict], objects: list[dict]) -> str
         if m_step:
             flush()
             cur = int(m_step.group(1))
+            seen_steps.add(cur)
             buf.append(line)
         elif re.match(r"^##\s+", line):
             flush()
@@ -264,6 +279,19 @@ def inject_illustrations(md: str, steps: list[dict], objects: list[dict]) -> str
         else:
             buf.append(line)
     flush()
+    # Accepted visuals whose step has no matching ### section (e.g. terse
+    # model output) are appended once under their own heading rather than
+    # silently dropped — still labelled, still idempotent.
+    leftover = {n: v for n, v in extra.items() if n not in seen_steps}
+    if leftover:
+        out_lines.append("<!-- accepted-visuals:general:start -->")
+        out_lines.append("## Accepted visuals")
+        out_lines.append("")
+        for n in sorted(leftover):
+            for url, caption in leftover[n]:
+                out_lines.append(f"![accepted visual — step {n}: {caption}]({url})")
+        out_lines.append("<!-- accepted-visuals:general:end -->")
+        out_lines.append("")
     return "\n".join(out_lines).strip() + "\n"
 
 
@@ -502,13 +530,45 @@ def _hirez_retry(job_dir: Path, source: Path, obj: dict, prompt: str,
         return None
 
 
+def accepted_visuals_by_step(db, version_id: str) -> dict[int, list[tuple[str, str]]]:
+    """Accepted review visuals per draft step_order, for guide injection.
+
+    Only visuals a human explicitly accepted (Evidence rows carrying a
+    visual_asset_id) are included, labelled as accepted — never presented
+    as source evidence. Missing rows/assets are skipped, never fabricated.
+    """
+    out: dict[int, list[tuple[str, str]]] = {}
+    ver = db.get(M.ProcedureVersion, version_id) if version_id else None
+    if ver is None:
+        return out
+    for st in sorted(ver.steps, key=lambda x: x.step_order):
+        for eid in (st.visual_refs or []):
+            e = db.get(M.Evidence, eid)
+            if e is None or e.evidence_type != "image":
+                continue
+            va_id = (e.extra or {}).get("visual_asset_id")
+            if not va_id:
+                continue
+            va = db.get(M.VisualAsset, va_id)
+            if va is None or va.status != "accepted":
+                continue
+            kind = va.kind.replace("_", " ")
+            caption = f"{kind} — {va.instruction or va_id[:8]}".strip()
+            out.setdefault(st.step_order, []).append((f"/api/evidence/{e.id}/image", caption))
+    return out
+
+
+def _canon_list(steps: list) -> list[dict]:
+    """JSON-stable canonical step identity (order, title, instruction)."""
+    return [{"n": int(s.get("step_number", 0)), "t": str(s.get("title", "")),
+             "i": str(s.get("summary", ""))} for s in (steps or [])]
+
+
 def _canonical_hash(steps: list) -> str:
     """Stable identity of the canonical step list (titles + instructions)."""
     import hashlib as _hashlib
     import json as _json
-    canon = [{"n": s.get("step_number"), "t": str(s.get("title", "")),
-              "i": str(s.get("summary", ""))} for s in (steps or [])]
-    return _hashlib.sha256(_json.dumps(canon, sort_keys=True).encode("utf-8")).hexdigest()
+    return _hashlib.sha256(_json.dumps(_canon_list(steps), sort_keys=True).encode("utf-8")).hexdigest()
 
 
 def _ensure_object_evidence(db, job: M.TutorialJob, objects: list) -> tuple[dict[int, list[str]], dict[int, list[str]]]:
@@ -527,7 +587,7 @@ def _ensure_object_evidence(db, job: M.TutorialJob, objects: list) -> tuple[dict
     for o in (objects or []):
         oid = int(o.get("obj_id", 0))
         names = [("overlay", o.get("overlay")), ("cutout", o.get("illustration")),
-                 ("diagnostic", o.get("diagnostic_frame"))]
+                 ("diagnostic", o.get("diagnostic_frame")), ("tap", o.get("tap_frame"))]
         for kind, name in names:
             if not name:
                 continue
@@ -554,16 +614,18 @@ def _ensure_object_evidence(db, job: M.TutorialJob, objects: list) -> tuple[dict
 
 def _build_draft_steps(db, ver: M.ProcedureVersion, steps: list, objects: list,
                        ev_by_obj: dict[int, list[str]], overlay_by_obj: dict[int, list[str]],
-                       preserve_visual_refs: dict[int, list[str]] | None = None) -> int:
+                       preserve_visual_refs: dict[int, list[str]] | None = None) -> list:
     """Replace all steps of an editable draft from the canonical step list.
 
     Manually linked visuals (accepted Muse Image outputs etc.) that are not
     derived from object illustrations are preserved per step_order.
-    Returns the number of steps written.
+    Returns the created step rows (the ver.steps collection is stale after
+    delete+flush, so callers must use the return value, not ver.steps).
     """
     for s in list(ver.steps):
         db.delete(s)
     db.flush()
+    created: list = []
     for s in (steps or []):
         used = [int(x) for x in (s.get("objects_used") or []) if isinstance(x, int) or (isinstance(x, str) and x.isdigit())]
         refs: list[str] = []
@@ -583,16 +645,18 @@ def _build_draft_steps(db, ver: M.ProcedureVersion, steps: list, objects: list,
             end_sec = float(s.get("end")) if s.get("end") is not None else None
         except (TypeError, ValueError):
             end_sec = None
-        db.add(M.ProcedureStep(
+        row = M.ProcedureStep(
             procedure_version_id=ver.id, step_order=order,
             title=str(s.get("title", "")) or f"Step {s.get('step_number', 1)}",
             instruction=str(s.get("summary", "")),
             expected_result="", required_tools=[],
             evidence_refs=refs, visual_refs=visuals,
             start_sec=start_sec, end_sec=end_sec,
-            verification_notes="From tutorial narration; verify against source video."))
+            verification_notes="From tutorial narration; verify against source video.")
+        db.add(row)
+        created.append(row)
     db.flush()
-    return len(steps or [])
+    return created
 
 
 def _draft_step_hash(ver: M.ProcedureVersion) -> str:
@@ -634,41 +698,68 @@ def sync_review_draft(db, job: M.TutorialJob, steps: list, objects: list, md: st
     if ver.status not in ("draft", "rejected"):
         return ver, "locked", detail
     ev_by_obj, overlay_by_obj = _ensure_object_evidence(db, job, objects)
+    new_canon = _canon_list(steps)
     new_hash = _canonical_hash(steps)
-    stored_hash = (ver.source_evidence or {}).get("canonical_hash", "")
-    draft_hash = _draft_step_hash(ver)
-    expert_edited = bool(stored_hash) and draft_hash != stored_hash
-    canonical_changed = (not stored_hash) or (new_hash != stored_hash)
+    stored_canon: list[dict] = list((ver.source_evidence or {}).get("canonical_steps", []))
+    stored_by_n = {c["n"]: c for c in stored_canon}
+    new_by_n = {c["n"]: c for c in new_canon}
+    draft_by_n = {s.step_order: {"n": s.step_order, "t": s.title or "", "i": s.instruction or ""}
+                  for s in ver.steps}
     # Preserve manually linked visuals (accepted derivatives) across rebuilds.
     preserved: dict[int, list[str]] = {}
-    if canonical_changed:
-        fresh_visuals: dict[int, set[str]] = {}
-        for s in (steps or []):
-            used = [int(x) for x in (s.get("objects_used") or []) if isinstance(x, int) or (isinstance(x, str) and x.isdigit())]
-            refs: set[str] = set()
-            for oid in used:
-                refs.update(overlay_by_obj.get(int(oid), []))
-            fresh_visuals[int(s.get("step_number", 1))] = refs
-        for st in ver.steps:
-            extra = [v for v in (st.visual_refs or []) if v not in fresh_visuals.get(st.step_order, set())]
-            if extra:
-                preserved.setdefault(st.step_order, []).extend(extra)
-    if not canonical_changed:
+    fresh_visuals: dict[int, set[str]] = {}
+    for s in (steps or []):
+        used = [int(x) for x in (s.get("objects_used") or []) if isinstance(x, int) or (isinstance(x, str) and x.isdigit())]
+        refs: set[str] = set()
+        for oid in used:
+            refs.update(overlay_by_obj.get(int(oid), []))
+        fresh_visuals[int(s.get("step_number", 1))] = refs
+    for st in ver.steps:
+        extra = [v for v in (st.visual_refs or []) if v not in fresh_visuals.get(st.step_order, set())]
+        if extra:
+            preserved.setdefault(st.step_order, []).extend(extra)
+    if new_canon == stored_canon and stored_canon:
         action = "unchanged"
-    elif not expert_edited:
-        old_titles = {s.step_order: (s.title, s.instruction) for s in ver.steps}
-        _build_draft_steps(db, ver, steps, objects, ev_by_obj, overlay_by_obj, preserved)
-        new_titles = {s.step_order: (s.title, s.instruction) for s in ver.steps}
-        detail["changed_steps"] = [o for o in new_titles if new_titles[o] != old_titles.get(o)]
-        action = "updated"
     else:
-        cur = {s.step_order: (s.title, s.instruction) for s in ver.steps}
-        detail["conflicting_steps"] = [o for o in cur]  # expert text kept; reviewer resolves
-        action = "conflict"
+        # Per-step 3-way sync. Steps the expert never touched follow the new
+        # canonical text automatically (including brand-new and removed
+        # steps). A step the expert edited AND whose canonical source also
+        # changed is kept verbatim and flagged. Steps that exist only in the
+        # draft (expert additions) are preserved as-is and never flagged.
+        auto_orders: list[int] = []
+        conflict_orders: list[int] = []
+        for n in set(draft_by_n) | set(new_by_n) | set(stored_by_n):
+            d, s, w = draft_by_n.get(n), stored_by_n.get(n), new_by_n.get(n)
+            if w == d:
+                continue
+            if d == s:
+                auto_orders.append(n)
+            elif d is not None and w is not None:
+                conflict_orders.append(n)
+        detail["changed_steps"] = sorted(auto_orders)
+        detail["conflicting_steps"] = sorted(conflict_orders)
+        expert_only = [draft_by_n[n] for n in sorted(set(draft_by_n) - set(new_by_n) - set(stored_by_n))]
+        kept = {n: draft_by_n[n] for n in conflict_orders if n in draft_by_n}
+        created = _build_draft_steps(db, ver, steps, objects, ev_by_obj, overlay_by_obj, preserved)
+        used_orders = {st.step_order for st in created}
+        for st in created:
+            if st.step_order in kept:
+                st.title, st.instruction = kept[st.step_order]["t"], kept[st.step_order]["i"]
+        for ex in expert_only:
+            order = ex["n"] if ex["n"] not in used_orders else max(used_orders | {0}) + 1
+            used_orders.add(order)
+            db.add(M.ProcedureStep(procedure_version_id=ver.id, step_order=order,
+                                   title=ex["t"], instruction=ex["i"],
+                                   expected_result="", required_tools=[],
+                                   evidence_refs=[], visual_refs=[],
+                                   verification_notes="Added by expert review; not from tutorial narration."))
+        db.flush()
+        action = "conflict" if conflict_orders else "updated"
     se = dict(ver.source_evidence or {})
     se.update({"tutorial_id": job.id, "guide_snapshot_id": snapshot_id or se.get("guide_snapshot_id", ""),
                "guide_format": job.guide_format or "", "format_source": job.format_source or "",
-               "canonical_hash": new_hash,
+                "canonical_hash": new_hash,
+                "canonical_steps": new_canon,
                "sync": {"action": action, "snapshot_id": snapshot_id,
                         "changed_steps": detail["changed_steps"],
                         "conflicting_steps": detail["conflicting_steps"]}})
@@ -741,6 +832,14 @@ def regenerate_guide_for_job(db, job: M.TutorialJob, trigger: str, fmt: str | No
         guide = ai.generate_guide(job.title, steps, objects, job.timed_segments or [], guide_format=fmt)
     md = guide.get("guide_markdown") or ai.fallback_guide_markdown(job.title, steps, objects, fmt)
     md = inject_illustrations(md, steps, objects)
+    # Accepted review visuals ride along as labelled presentation assets
+    # (human-approved derivatives, never source evidence).
+    try:
+        extra = accepted_visuals_by_step(db, job.draft_version_id or "")
+        if extra:
+            md = inject_illustrations(md, steps, objects, extra)
+    except Exception:
+        pass
     proc.safe_record(db, "tutorial", job.id, "guide", "simulated" if guide.get("simulated") else "succeeded",
                      operation="regenerate_guide", provider="meta", model=guide.get("model", ""),
                      duration_ms=t.ms, actor=actor or job.actor,
@@ -806,6 +905,7 @@ def _ensure_review_draft(db, job: M.TutorialJob, steps: list, objects: list, md:
                              "format_source": job.format_source or "",
                              "guide_snapshot_id": snapshot_id,
                              "canonical_hash": _canonical_hash(steps),
+                             "canonical_steps": _canon_list(steps),
                              "transcript_chars": len(job.full_transcript or ""),
                              "segments": len(job.timed_segments or []),
                              "objects": [{"obj_id": o.get("obj_id"), "label": o.get("label"),
@@ -1089,7 +1189,9 @@ def resegment_object_tap(job_id: str, obj_id: int, nx: float, ny: float) -> dict
         job_dir = BASE / "data" / "tutorials" / job_id
         source = BASE / job.video_storage_key
         tracking = job_dir / "tracking.mp4"
-        if not tracking.exists():
+        if ai.live_enabled() and not tracking.exists():
+            # Live SAM needs the tracking copy; simulated tap only needs the
+            # source video, so a broken/unsupported container must not block it.
             make_tracking_copy(source, tracking)
         objects = list(job.objects or [])
         obj = next((o for o in objects if int(o.get("obj_id", 0)) == obj_id), None)
@@ -1098,11 +1200,20 @@ def resegment_object_tap(job_id: str, obj_id: int, nx: float, ny: float) -> dict
         obj = dict(obj)
         obj.setdefault("taps", []).append({"nx": round(nx, 4), "ny": round(ny, 4)})
         if not ai.live_enabled():
-            # Offline: no SAM call is possible. Record the tap honestly, refresh
-            # the real diagnostic frame, and regenerate from canonical content
+            # Offline: no SAM call is possible. Record the tap with a REAL
+            # local frame excerpt (ffmpeg) linked as evidence, refresh the
+            # diagnostic frame, and regenerate from canonical content
             # (fallback renderer). Never claim tracking succeeded.
+            try:
+                frame = extract_frame_image(source, float(obj.get("first_mentioned_at", 0)))
+                frame.thumbnail((960, 960))
+                tap_name = f"tap-obj-{obj_id}.jpg"
+                frame.convert("RGB").save(job_dir / tap_name, "JPEG", quality=85)
+                obj["tap_frame"] = tap_name
+            except Exception:
+                pass
             obj.update({"status": "needs_tap", "simulated": True,
-                        "note": "Tap recorded; live SAM is unavailable so the object was not re-tracked. Configure META_API_KEY and retry, or correct the label in Review."})
+                        "note": "Tap recorded with a real frame excerpt; live SAM is unavailable so the object was not re-tracked. Configure META_API_KEY and retry, or correct the label in Review."})
             try:
                 obj["diagnostic_frame"] = _diagnostic_frame(job_dir, source, obj) or obj.get("diagnostic_frame")
             except Exception:
