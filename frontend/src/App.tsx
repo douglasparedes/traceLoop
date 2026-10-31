@@ -9,6 +9,7 @@ import LiveTranscribe from "./LiveTranscribe";
 import { extractObjectPhrase, promptVariants } from "./speechPrompt";
 import type { JobEventRec, LocalJob, ProcSummary, Role, Step, Version, View } from "./types";
 import { checkAssetLinks, usePwaInstall, type AssetLinksStatus } from "./pwaInstall";
+import { clearMediaCache } from "./mediaCache";
 
 const ISSUE_TYPES = ["Component not found", "Instructions unclear", "Expected result not observed", "Tool unavailable", "Manual mismatch", "Unexpected condition", "Other"];
 
@@ -205,6 +206,10 @@ export default function App() {
   }
   function doLogout() {
     clearToken(); setAuthRequired(true); setAuthPassword("");
+    // Auth boundary: wipe cached private media so the next user on this
+    // device cannot read it from the service-worker cache. Queued work and
+    // downloaded procedures stay (IndexedDB), per the offline policy.
+    void clearMediaCache();
     notify("Signed out on this device. Queued work stays saved locally.", "info");
   }
   useEffect(() => {
@@ -1403,12 +1408,40 @@ function ReviewView({ version, setVersion, procs, openVersion, role, reload, not
           {Array.isArray((version.source_evidence as { missing_information?: string[] }).missing_information) && ((version.source_evidence as { missing_information?: string[] }).missing_information || []).length > 0 && <div className="notice warn"><strong>Missing information:</strong> {((version.source_evidence as { missing_information?: string[] }).missing_information || []).join(" ")}</div>}
           {Array.isArray((version.source_evidence as { safety_notes?: string[] }).safety_notes) && ((version.source_evidence as { safety_notes?: string[] }).safety_notes || []).length > 0 && <div className="notice info"><strong>Safety notes (from capture):</strong> {((version.source_evidence as { safety_notes?: string[] }).safety_notes || []).join(" ")}</div>}
           <ReviewEvidence versionId={version.id} />
+          {(() => {
+            const sync = (version.source_evidence as { sync?: { action?: string; conflicting_steps?: number[]; changed_steps?: number[] } }).sync;
+            if (!sync || (sync.action !== "conflict" && !(sync.conflicting_steps || []).length)) return null;
+            const rows = sync.conflicting_steps || [];
+            return (
+              <div className="notice warn" role="alert">
+                <strong>Regenerated content conflicts with expert edits.</strong>{" "}
+                {rows.length ? <>Steps {rows.join(", ")} were edited here and changed in the tutorial since. Your text was kept. </> : null}
+                Use “Use latest AI text” on a step to accept the regenerated wording, or keep yours.
+                {sync.action === "resolved" ? " All conflicts resolved." : ""}
+              </div>
+            );
+          })()}
           {version.steps.map((s, i) => (
             <div key={s.id} className="card">
               <strong>Step {s.step_order}: {s.title}</strong>
               <label htmlFor={`st-${s.id}`}>Instruction</label>
               <textarea id={`st-${s.id}`} rows={2} value={s.instruction} disabled={version.status === "approved"} onChange={(e) => { const steps = [...version.steps]; steps[i] = { ...s, instruction: e.target.value }; setVersion({ ...version, steps }); }} />
               <p className="muted">Expected: {s.expected_result || "—"} · Evidence refs: {s.evidence_refs.length ? s.evidence_refs.join(", ") : "none linked"} {s.verification_notes ? `· Check: ${s.verification_notes}` : ""}</p>
+              {((version.source_evidence as { sync?: { conflicting_steps?: number[] } }).sync?.conflicting_steps || []).includes(s.step_order) && (version.status === "draft" || version.status === "rejected") && (
+                <div className="row" style={{ marginTop: 6 }}>
+                  <span className="tag warn">Edited here and changed upstream — your text kept</span>
+                  <button className="btn small" disabled={busy} onClick={async () => {
+                    setBusy(true);
+                    try {
+                      const v = await api.post<Version>(`/api/procedure-versions/${version.id}/resolve-conflict`, { step_orders: [s.step_order] });
+                      setVersion(v);
+                      const left = ((v.source_evidence as { sync?: { conflicting_steps?: number[] } }).sync?.conflicting_steps || []).length;
+                      notify(left ? "Step updated to the regenerated wording." : "All conflicts resolved — draft matches the latest canonical content.", "ok");
+                    } catch (e) { notify(e instanceof Error ? e.message : "Could not apply canonical text", "error"); }
+                    finally { setBusy(false); }
+                  }}>Use latest AI text</button>
+                </div>
+              )}
             </div>
           ))}
           {version.status === "pending_review" && (<>

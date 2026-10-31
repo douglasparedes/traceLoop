@@ -22,6 +22,10 @@ def _fake_illustrations(job_dir, source, obj, best):
 
 
 def _patch_pipeline(monkeypatch):
+    # These fixtures emulate the LIVE provider path with mocks, so force
+    # live mode on: without a key the pipeline now takes the offline
+    # simulated branch (covered by dedicated end-to-end tests instead).
+    monkeypatch.setattr(ai, "live_enabled", lambda: True)
     monkeypatch.setattr(tutorial, "probe_video", lambda p: {"duration": 30.0, "width": 320, "height": 240})
     monkeypatch.setattr(tutorial, "extract_audio_wav", lambda s, o: o.write_bytes(b"wav"))
     monkeypatch.setattr(tutorial, "make_tracking_copy", lambda s, o: (o.write_bytes(b"mp4"), {"width": 320, "height": 240})[1])
