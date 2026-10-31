@@ -23,6 +23,8 @@ REV = {"X-User": "rev-1", "X-Role": "reviewer"}
 
 @pytest.fixture(autouse=True)
 def _patch(monkeypatch):
+    # Emulates the LIVE provider path with mocks (see test_tutorial.py).
+    monkeypatch.setattr(ai, "live_enabled", lambda: True)
     monkeypatch.setattr(tutorial, "probe_video", lambda p: {"duration": 30.0, "width": 320, "height": 240})
     monkeypatch.setattr(tutorial, "extract_audio_wav", lambda s, o: o.write_bytes(b"wav"))
     monkeypatch.setattr(tutorial, "make_tracking_copy", lambda s, o, max_width=512: (o.write_bytes(b"mp4"), {"width": 320, "height": 240})[1])

@@ -1,7 +1,14 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { AnnotationComposer, TechnicalImageViewer } from "./VisualStudio";
+import VisualStudio, { AnnotationComposer, TechnicalImageViewer } from "./VisualStudio";
+import type { VisualAsset } from "./guideFormats";
+import { improveVisual } from "./guideFormats";
+
+vi.mock("./guideFormats", async (orig) => {
+  const mod = await orig<typeof import("./guideFormats")>();
+  return { ...mod, improveVisual: vi.fn() };
+});
 
 describe("TechnicalImageViewer", () => {
   it("renders source image with accessible label and bbox overlay", () => {
@@ -66,5 +73,31 @@ describe("AnnotationComposer", () => {
     expect(save).toBeDisabled();
     await user.click(screen.getByRole("button", { name: "pump. Activate, then click the part you mean." }));
     expect(save).not.toBeDisabled();
+  });
+});
+
+describe("VisualStudio comparison", () => {
+  it("shows original vs generated side by side with an unverified verdict", async () => {
+    const { improveVisual } = await import("./guideFormats");
+    const asset = {
+      id: "a1", tutorial_id: "t1", parent_id: "asset:src", kind: "enhanced",
+      status: "review", image_url: "/api/visuals/a1/file", mime_type: "image/png",
+      width: 4, height: 4, instruction: "make it clearer", model: "muse-image-1.0",
+      simulated: false, created_at: new Date().toISOString(),
+      provenance: { comparison: { requested: "make it clearer", verdict: "unverified" } },
+    } as VisualAsset;
+    vi.mocked(improveVisual).mockResolvedValueOnce({ ok: true, asset, duplicate: false });
+    const user = userEvent.setup();
+    render(
+      <VisualStudio tutorialId="t1" token="tok" onChanged={() => {}}
+        sourceAsset={{ id: "src", label: "pump overlay", imageUrl: "http://x/src.png", kind: "segmentation", source: { kind: "asset", id: "src" } }}
+        references={[]} />
+    );
+    await user.click(screen.getByRole("button", { name: "Improve image" }));
+    await user.type(screen.getByPlaceholderText(/tip of this screw/i), "make it clearer");
+    await user.click(screen.getByRole("button", { name: "Generate improvement" }));
+    expect(await screen.findByText(/original source/i)).toBeInTheDocument();
+    expect(await screen.findByText(/AI-generated proposal/i)).toBeInTheDocument();
+    expect(await screen.findByText(/verdict: unverified/i)).toBeInTheDocument();
   });
 });
