@@ -6,6 +6,7 @@ import { bundle } from "@remotion/bundler";
 import { renderMedia, selectComposition } from "@remotion/renderer";
 import fs from "node:fs";
 import path from "node:path";
+import { serveAssets, rewritePropsForRender } from "./asset-server.mjs";
 
 function arg(name) {
   const i = process.argv.indexOf(name);
@@ -33,7 +34,15 @@ function writeProgress(p) {
   }
 }
 
-const inputProps = JSON.parse(fs.readFileSync(propsPath, "utf-8"));
+const rawProps = JSON.parse(fs.readFileSync(propsPath, "utf-8"));
+
+// Absolute disk paths are invisible to headless Chrome (it resolves them
+// against the bundle origin -> 404), so serve every local asset over
+// loopback HTTP and rewrite the props. Nulls and remote URLs pass through.
+const assets = await serveAssets();
+const inputProps = rewritePropsForRender(rawProps, (localPath, name) =>
+  assets.urlFor(localPath, name)
+);
 
 let serveUrl = bundleDir;
 try {
@@ -72,5 +81,7 @@ try {
   console.log(`[render] done: ${outPath}`);
 } catch (e) {
   console.error("[render] failed:", e?.message || e);
+  await assets.close().catch(() => undefined);
   process.exit(4);
 }
+await assets.close().catch(() => undefined);
