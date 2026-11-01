@@ -944,6 +944,160 @@ def fallback_guide_markdown(title: str, steps: list[dict], objects: list[dict],
     return "\n".join(lines).strip() + "\n"
 
 
+# ---------------------------------------------------------------- Video guide (Spark scene plan + original-voice cut)
+
+_VIDEO_SCENES_SCHEMA = {
+    "name": "VideoGuideScenes",
+    "schema": {
+        "type": "object",
+        "properties": {
+            "scenes": {"type": "array", "items": {"type": "object",
+                "properties": {
+                    "step_number": {"type": "integer"},
+                    "title": {"type": "string"},
+                    "narration": {"type": "string"},
+                    "caption": {"type": "string"},
+                    "visual_label": {"type": "string"}},
+                "required": ["step_number", "title", "narration"], "additionalProperties": False}},
+        },
+        "required": ["scenes"], "additionalProperties": False,
+    },
+}
+
+
+def _segments_for_range(segments: list[dict], start: float, end: float) -> list[dict]:
+    out = []
+    for s in segments or []:
+        try:
+            ss, se = float(s.get("start", 0)), float(s.get("end", 0))
+        except (TypeError, ValueError):
+            continue
+        if se > start and ss < end:
+            out.append(s)
+    return out
+
+
+def _fallback_scenes(title: str, steps: list[dict], objects: list[dict], segments: list[dict]) -> list[dict]:
+    """Deterministic scene plan from the canonical procedure (no model call).
+
+    Narration is verbatim transcript where it overlaps the step, else the
+    step summary (labelled as such in the caption). Visuals reuse only real
+    object illustration files. Nothing is invented.
+    """
+    by_obj = {o.get("obj_id"): o for o in (objects or [])}
+    scenes = []
+    for s in (steps or []):
+        try:
+            start, end = float(s.get("start", 0)), float(s.get("end", 0))
+        except (TypeError, ValueError):
+            start, end = 0.0, 0.0
+        if end <= start:
+            end = start + 5.0
+        segs = _segments_for_range(segments, start, end)
+        if segs:
+            narration = " ".join(str(x.get("text", "")).strip() for x in segs).strip()
+            caption_src = "recorded narration"
+        else:
+            narration = str(s.get("summary", "") or s.get("title", "")).strip()
+            caption_src = "step summary (no recorded narration in this range)"
+        visual = None
+        for oid in (s.get("objects_used") or []):
+            o = by_obj.get(int(oid)) if isinstance(oid, int) or (isinstance(oid, str) and oid.isdigit()) else None
+            if o and (o.get("overlay") or o.get("illustration")):
+                visual = {"kind": "overlay" if o.get("overlay") else "cutout",
+                          "name": o.get("overlay") or o.get("illustration"),
+                          "label": o.get("label", "object")}
+                break
+        scenes.append({"step_number": int(s.get("step_number", len(scenes) + 1)),
+                       "title": str(s.get("title", "") or f"Step {len(scenes) + 1}"),
+                       "narration": narration, "caption": narration,
+                       "caption_src": caption_src,
+                       "audio_start": start, "audio_end": end,
+                       "objects_used": list(s.get("objects_used") or []),
+                       "visual": visual, "simulated": True})
+    return scenes
+
+
+def plan_video_scenes(title: str, steps: list[dict], objects: list[dict], segments: list[dict]) -> dict:
+    """Muse Spark: plan video scenes (title, narration, caption, visual) per step.
+
+    Narration must quote the recorded transcript; the voiceover track is cut
+    from the user's own audio, so invented lines would desync picture and
+    sound. Visuals may only reference real object illustration files.
+    Returns {scenes, simulated, model, note?} — scenes always present.
+    """
+    fallback = _fallback_scenes(title, steps, objects, segments)
+    if not live_enabled():
+        return {"scenes": fallback, "simulated": True, "model": SPARK_MODEL,
+                "note": "Deterministic scene plan (no META_API_KEY). Configure the key for live Muse Spark planning."}
+    known = {o.get("label", "") for o in (objects or []) if o.get("label")}
+    system = (
+        "Plan a step-by-step tutorial video from the validated procedure steps, objects, and transcript excerpts. "
+        "One scene per step, in order. For each scene: step_number, a short title, narration QUOTING the transcript "
+        "excerpts for that step's time range (never invent lines — the voiceover is cut from the user's own recording, "
+        "so invented narration would desync), a one-line caption, and visual_label naming which listed object to show "
+        "(must be one of the known object labels, or empty if none fits). Never invent tools, values, warnings, or steps."
+    )
+    user = (f"Title: {title}\nSteps: {json.dumps(steps)}\nObjects: {json.dumps(objects)}\n"
+            f"Known object labels: {sorted(known)}\nTranscript excerpts:\n" + "\n".join(
+                f"[{s.get('start', 0):.0f}s] {s.get('text', '')}" for s in (segments or [])[:60]))
+    try:
+        parsed = json.loads(_chat(system, user, json_schema=_VIDEO_SCENES_SCHEMA))
+        raw = parsed.get("scenes") or []
+        if not raw:
+            raise ValueError("empty scenes")
+        by_step = {int(s.get("step_number", i + 1)): s for i, s in enumerate(steps or [])}
+        scenes, seen = [], set()
+        for i, sc in enumerate(raw):
+            try:
+                n = int(sc.get("step_number", i + 1))
+            except (TypeError, ValueError):
+                n = i + 1
+            if n in seen or n not in by_step:
+                continue
+            seen.add(n)
+            base = by_step[n]
+            try:
+                start, end = float(base.get("start", 0)), float(base.get("end", 0))
+            except (TypeError, ValueError):
+                start, end = 0.0, 5.0
+            if end <= start:
+                end = start + 5.0
+            narration = str(sc.get("narration") or base.get("summary", "")).strip()
+            caption = str(sc.get("caption") or narration).strip()
+            want = str(sc.get("visual_label") or "").strip().lower()
+            visual = None
+            for oid in (base.get("objects_used") or []):
+                try:
+                    oid_int = int(oid)
+                except (TypeError, ValueError):
+                    continue
+                o = next((x for x in (objects or []) if int(x.get("obj_id", -1) or -1) == oid_int), None)
+                if o and (o.get("overlay") or o.get("illustration")) and (not want or want in str(o.get("label", "")).lower()):
+                    visual = {"kind": "overlay" if o.get("overlay") else "cutout",
+                              "name": o.get("overlay") or o.get("illustration"),
+                              "label": o.get("label", "object")}
+                    break
+            segs = _segments_for_range(segments, start, end)
+            quoted = " ".join(str(x.get("text", "")) for x in segs)
+            grounded = bool(quoted and narration and (narration[:40] in quoted or quoted[:40] in narration))
+            scenes.append({"step_number": n, "title": str(sc.get("title") or base.get("title", "")),
+                           "narration": narration if grounded else (quoted.strip() or narration),
+                           "caption": caption, "caption_src": "recorded narration" if grounded else "step summary",
+                           "audio_start": start, "audio_end": end,
+                           "objects_used": list(base.get("objects_used") or []),
+                           "visual": visual, "simulated": False})
+        if not scenes:
+            raise ValueError("no valid scenes")
+        return {"scenes": sorted(scenes, key=lambda s: s["step_number"]), "simulated": False, "model": SPARK_MODEL}
+    except Exception as e:
+        out = _fallback_scenes(title, steps, objects, segments)
+        for s in out:
+            s["simulated"] = True
+        return {"scenes": out, "simulated": True, "model": SPARK_MODEL,
+                "note": f"Live planning failed ({type(e).__name__}); deterministic fallback used."}
+
+
 # ---------------------------------------------------------------- Ask (Spark)
 
 def answer_question(question: str, context_chunks: list[str]) -> dict:
