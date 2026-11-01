@@ -36,7 +36,7 @@ RUN pip install -r requirements.txt
 COPY backend/ ./
 COPY --from=frontend /build/dist /app/frontend/dist
 COPY --from=videobuild /vbuild/bundle /app/video/bundle
-COPY --from=videobuild /vbuild/render.mjs /vbuild/package.json /app/video/
+COPY --from=videobuild /vbuild/render.mjs /vbuild/asset-server.mjs /vbuild/package.json /app/video/
 COPY --from=videobuild /vbuild/node_modules /app/video/node_modules
 RUN mkdir -p /data /app/backend/data
 EXPOSE 8000
