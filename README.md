@@ -2,7 +2,7 @@
 
 TraceLoop turns a short recording of someone performing a real task into an interactive, verifiable procedure that another person can follow.
 
-**Product loop:** Capture (video + narration) → Meta AI understanding (Muse Voice, Muse Spark, SAM 3.1, Muse Image) → **canonical structured procedure** → three guide formats (work instruction, reference manual, interactive) → expert Review & approval → **immutable approved revision** → offline field execution → new evidence and revisions.
+**Product loop:** Capture (video + narration) → Meta AI understanding (Muse Voice, Muse Spark, SAM 3.1, Muse Image) → **canonical structured procedure** → three guide formats (work instruction, reference manual, interactive) + optional **video guide** (MP4 cut from the user's own recorded narration, scenes planned by Muse Spark, rendered with Remotion) → expert Review & approval → **immutable approved revision** → offline field execution → new evidence and revisions.
 
 The core guarantee: the visible guide, the structured review draft, and the approved procedure always represent the same revision. Corrections propagate; approvals never mutate.
 

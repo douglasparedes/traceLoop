@@ -129,7 +129,7 @@ import re as _re_gate
 # mismatch). The evidence image URL is an unguessable UUID, as it was before
 # the team gate existed.
 MEDIA_GATE_EXEMPT_RE = _re_gate.compile(
-    r"^/api/(tutorial/[^/]+/(video|bundle\.zip|illustrations/[^/]+|diagnostics/frame/[^/]+)"
+    r"^/api/(tutorial/[^/]+/(video|video-guide/file|bundle\.zip|illustrations/[^/]+|diagnostics/frame/[^/]+)"
     r"|visuals/[^/]+/file"
     r"|live-recordings/[^/]+/chunks/[^/]+/video"
     r"|evidence/[^/]+/image)$")
@@ -1189,6 +1189,63 @@ def visual_file(aid: str, token: str = "", x_tutorial_token: str = Header(defaul
     media = {"image/png": "image/png", "image/jpeg": "image/jpeg", "image/svg+xml": "image/svg+xml",
              "image/webp": "image/webp"}.get(a.mime_type, "application/octet-stream")
     return FileResponse(path, media_type=media, filename=path.name)
+
+
+def _video_guide_out(vg) -> dict:
+    return {"id": vg.id, "tutorial_id": vg.tutorial_id, "status": vg.status,
+            "progress": vg.progress, "error": vg.error or "",
+            "asset_id": vg.asset_id or None,
+            "video_url": f"/api/tutorial/{vg.tutorial_id}/video-guide/file" if vg.status == "ready" else None,
+            "scenes": vg.scenes or [], "simulated": bool(vg.simulated),
+            "provenance": vg.provenance or {}, "created_at": vg.created_at.isoformat()}
+
+
+@app.post("/api/tutorial/{jid}/video-guide")
+def tutorial_video_guide(jid: str, body: dict, x_tutorial_token: str = Header(default=""), db: Session = Depends(get_db), who=Depends(actor)):
+    """Generate an MP4 video guide cut from the user's own recorded narration.
+
+    Optional, user-triggered, runs in the background: scenes are planned from
+    the canonical procedure (Muse Spark, or deterministic fallback), the
+    voiceover is cut from the original recording (never synthesized), and the
+    video is rendered with the vendored Remotion project. Same versioning and
+    honesty rules as image derivatives.
+    """
+    from . import videoguide as vgmod
+    job = _get_tutorial(db, jid, x_tutorial_token)
+    force = bool((body or {}).get("regenerate"))
+    try:
+        vg, dup = vgmod.start_video_guide(job.id, actor=who["id"], force=force)
+    except ValueError as e:
+        msg = str(e)
+        code = 429 if "limit" in msg else 409 if "finished processing" in msg else 422
+        raise HTTPException(code, msg)
+    return {"ok": True, "video_guide": _video_guide_out(vg), "duplicate": dup}
+
+
+@app.get("/api/tutorial/{jid}/video-guide")
+def tutorial_video_guide_status(jid: str, x_tutorial_token: str = Header(default=""), db: Session = Depends(get_db)):
+    from . import videoguide as vgmod  # noqa: F401 (keeps video surface next to its endpoints)
+    from . import models as _M
+    job = _get_tutorial(db, jid, x_tutorial_token)
+    vg = db.scalars(select(_M.VideoGuide).where(_M.VideoGuide.tutorial_id == job.id).order_by(_M.VideoGuide.created_at.desc())).first()
+    if vg is None:
+        return {"tutorial_id": job.id, "status": "none", "video_guide": None}
+    return {"tutorial_id": job.id, "status": vg.status, "video_guide": _video_guide_out(vg)}
+
+
+@app.get("/api/tutorial/{jid}/video-guide/file")
+def tutorial_video_guide_file(jid: str, token: str = "", db: Session = Depends(get_db)):
+    """Serve the rendered MP4 (token-gated like other tutorial media)."""
+    from fastapi.responses import FileResponse
+    job = _get_tutorial(db, jid, token)
+    vg = db.scalars(select(M.VideoGuide).where(M.VideoGuide.tutorial_id == job.id,
+                                               M.VideoGuide.status == "ready").order_by(M.VideoGuide.created_at.desc())).first()
+    if not vg or not vg.storage_key:
+        raise HTTPException(404, "No finished video guide for this tutorial yet")
+    path = Path(__file__).resolve().parent.parent / vg.storage_key
+    if not path.is_file():
+        raise HTTPException(404, "Video guide file missing")
+    return FileResponse(path, media_type="video/mp4", filename=f"{(job.title or 'tutorial-guide').strip() or 'tutorial-guide'}-guide.mp4")
 
 
 _VISUAL_INTENT_PREFIX = {

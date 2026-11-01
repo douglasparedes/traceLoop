@@ -333,3 +333,26 @@ class TutorialJob(Base):
     draft_version_id: Mapped[str] = mapped_column(String, default="")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
+
+
+class VideoGuide(Base):
+    """A rendered MP4 video guide cut from one tutorial.
+
+    Versioned per tutorial like guide snapshots: a new generation never
+    overwrites a previous file (storage_key is unique per row). The voiceover
+    is the user's own recorded narration, cut per scene with ffmpeg — never
+    synthesized, never invented. status: queued|rendering|ready|error.
+    """
+    __tablename__ = "video_guides"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
+    tutorial_id: Mapped[str] = mapped_column(String, default="", index=True)
+    status: Mapped[str] = mapped_column(String, default="queued")
+    progress: Mapped[int] = mapped_column(Integer, default=0)
+    error: Mapped[str] = mapped_column(Text, default="")
+    asset_id: Mapped[str] = mapped_column(String, default="")
+    storage_key: Mapped[str] = mapped_column(String, default="")
+    scenes: Mapped[list] = mapped_column(JSON, default=list)
+    simulated: Mapped[bool] = mapped_column(Boolean, default=False)
+    provenance: Mapped[dict] = mapped_column(JSON, default=dict)
+    created_by: Mapped[str] = mapped_column(String, default="demo-tech")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
