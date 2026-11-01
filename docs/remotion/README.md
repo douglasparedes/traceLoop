@@ -29,3 +29,8 @@ Voiceover intentionally does **not** use the skill's ElevenLabs TTS path:
 the video guide reuses the user's own recorded narration, cut per step with
 ffmpeg ("cut it"). Narration text is stored per scene so TTS can be added
 later without touching the composition.
+Per-render assets (voiceover WAV, step illustrations) are served to headless
+Chrome over loopback HTTP by `video/render.mjs` + `video/asset-server.mjs`
+(absolute disk paths resolve to 404 against the bundle origin; canvas-drawn
+images additionally require CORS headers). Never pass bare disk paths or
+`file://` URLs as media `src`.

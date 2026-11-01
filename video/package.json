@@ -6,7 +6,8 @@
   "scripts": {
     "bundle": "remotion bundle src/index.tsx --out-dir bundle",
     "studio": "remotion studio",
-    "render": "node render.mjs"
+    "render": "node render.mjs",
+    "test": "node --test asset-server.test.mjs"
   },
   "dependencies": {
     "@remotion/bundler": "4.0.539",
