@@ -137,15 +137,17 @@ describe("sw media authorization policy (real sw.js)", () => {
     expect(sb.store.get(MEDIA_CACHE_NAME)?.size || 0).toBe(0);
   });
 
-  it("covers illustrations and accepted-visual files too", async () => {
+  it("covers illustrations, accepted visuals, and video guides", async () => {
     const sb = loadSw(async () => new FakeResponse("img"));
-    for (const u of [ILL, VIS]) {
+    const VG = "https://app.test/api/tutorial/abc/video-guide/file?token=tok-A";
+    for (const u of [ILL, VIS, VG]) {
       const r = await dispatchFetch(sb, u);
       expect(r.responded).toBe(true);
     }
     const keys = [...(sb.store.get(MEDIA_CACHE_NAME) || new Map()).keys()];
     expect(keys.some((k) => k.includes("illustrations/obj-1-overlay.png?token=tok-A"))).toBe(true);
     expect(keys.some((k) => k.includes("visuals/v1/file?token=tok-A"))).toBe(true);
+    expect(keys.some((k) => k.includes("video-guide/file?token=tok-A"))).toBe(true);
   });
 
   it("lets JSON API traffic bypass the service worker cache entirely", async () => {

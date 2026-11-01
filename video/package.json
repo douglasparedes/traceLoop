@@ -1,0 +1,28 @@
+{
+  "name": "traceloop-video-guide",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Remotion project rendering TraceLoop procedure video guides from canonical steps (see docs/remotion/).",
+  "scripts": {
+    "bundle": "remotion bundle src/index.tsx --out-dir bundle",
+    "studio": "remotion studio",
+    "render": "node render.mjs"
+  },
+  "dependencies": {
+    "@remotion/bundler": "4.0.539",
+    "@remotion/captions": "4.0.539",
+    "@remotion/cli": "4.0.539",
+    "@remotion/cli": "^4.0.539",
+    "@remotion/media": "4.0.539",
+    "@remotion/renderer": "4.0.539",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "remotion": "4.0.539",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/react": "^18.3.12",
+    "typescript": "^5.7.2"
+  }
+}

@@ -20,7 +20,7 @@ const MEDIA_MAX_ENTRIES = 120;
 // In dev the placeholder is untouched and the fallback list below is used.
 const SHELL = /*__FG_PRECACHE__*/["/", "/index.html", "/manifest.webmanifest"];
 
-const MEDIA_RE = /^\/api\/(evidence\/[^/]+\/image|tutorial\/[^/]+\/video|tutorial\/[^/]+\/illustrations\/[^/]+\.png|tutorial\/[^/]+\/diagnostics\/frame\/\d+|visuals\/[^/]+\/file|live-recordings\/[^/]+\/chunks\/\d+\/video)$/;
+const MEDIA_RE = /^\/api\/(evidence\/[^/]+\/image|tutorial\/[^/]+\/video|tutorial\/[^/]+\/video-guide\/file|tutorial\/[^/]+\/illustrations\/[^/]+\.png|tutorial\/[^/]+\/diagnostics\/frame\/\d+|visuals\/[^/]+\/file|live-recordings\/[^/]+\/chunks\/\d+\/video)$/;
 
 function mediaKey(url) {
   // Token-bound: entries fetched with a ?token= bearer key on the full URL,

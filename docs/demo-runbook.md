@@ -27,6 +27,10 @@ Objects tab → pick a `needs_tap` object → "Tap which one you meant" → tap 
 
 Guide tab → Visuals → select an overlay → **Improve image** ("make the tip easier to see") [live]. Review the side-by-side original vs proposal and the provenance (model, intent, unverified verdict), then Accept/Reject. Annotation overlays are deterministic SVG — no AI involved.
 
+## 4b. Generate the video guide (2 min, optional)
+
+Guide tab → **Video guide** → Generate video guide. Muse Spark plans one scene per canonical step (or the deterministic fallback does, offline); the voiceover is cut from *your own recorded narration*, sliced per step with ffmpeg — never synthesized. The render runs in the background (polls every few seconds). When ready: play it inline, check the simulated/live badge and per-scene list, Download .mp4. The MP4 is a versioned tutorial asset — regenerating after corrections creates a new version, never overwrites the old one.
+
 ## 5. Review & approve (1 min)
 
 Open in Review (from the tutorial or Review queue). Edit nothing or fix a summary → Submit for review → switch role to Reviewer → Approve. The version becomes immutable (editing returns 409).
@@ -40,3 +44,4 @@ Library → approved procedure → Save for offline use → Start procedure. Com
 - Every AI output carries provenance (live vs simulated, model, trigger); nothing fake is presented as real.
 - The guide, draft, and approved version are the same canonical revision — regenerate after approval forks a new draft instead of mutating.
 - Corrections propagate: tap → guide → draft → snapshot, with originals preserved.
+- Optional video guides cut from the user's own voice; Spark plans scenes, never the narration audio.

@@ -36,6 +36,7 @@ interface PastItem {
 
 import GuideFormatSelector from "./GuideFormatSelector";
 import VisualStudio from "./VisualStudio";
+import VideoGuidePanel from "./VideoGuidePanel";
 import type { GuideSnapshotItem, VisualAsset } from "./guideFormats";
 import { acceptVisual, rejectVisual, visualFileUrl } from "./guideFormats";
 
@@ -762,6 +763,7 @@ export default function TutorialMode({ onUseTranscript, onOpenReview }: { onUseT
                 );
               })}
               <div className="card"><Markdown text={job.guide_markdown} resolveImage={resolveMdImage} /></div>
+              <VideoGuidePanel tutorialId={job.id} token={job.access_token} jobDone={job.status === "done"} />
               <div className="row" style={{ marginTop: 8 }}>
                 <button className="btn small secondary" onClick={async () => {
                   try {
