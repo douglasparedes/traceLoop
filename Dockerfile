@@ -12,7 +12,7 @@ RUN npm run build
 # Remotion video bundle (prebuilt so first render doesn't pay bundling).
 FROM node:22-alpine AS videobuild
 WORKDIR /vbuild
-COPY video/package.json ./
+COPY video/package.json video/package-lock.json ./
 RUN npm ci --no-audit --no-fund
 COPY video/ ./
 RUN npm run bundle
