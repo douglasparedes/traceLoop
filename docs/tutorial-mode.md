@@ -46,12 +46,19 @@ selected strategy; visually-derived steps link to their sampled keyframes
    incremental checksum, enforced 300 MB cap, atomic rename, and temp
    cleanup on every path.
 2. Background job (`tutorial_jobs` table, thread worker):
-   - **Transcribe** - audio demuxed with bundled ffmpeg to WAV mono
-     24kHz, then Muse Voice Transcribe
+   - **Transcribe** - audio demuxed with bundled ffmpeg to mono 16-bit
+     PCM WAV @24kHz (`-vn` drops video streams, so regular MP4/WebM/MOV/MKV
+     containers all work), then validated locally (RIFF/WAVE, mono 16-bit
+     PCM @16/24 kHz, non-trivial audio), then Muse Voice Transcribe
      (`muse-voice-transcribe-1.0`) in `ENDPOINTING` mode.
      **Muse Voice returns turn-level timestamps only**
      (`turns[].startMs/endMs`); there are no word timestamps. If turns
      are empty, the full transcript becomes one segment.
+     Over-long audio (>10 min) and oversize bodies (>32 MB) are rejected
+     locally with an actionable error instead of a wasted provider call;
+     provider failures keep the server's own message/type (never a bare
+     exception name). Deterministic rejections in Automatic mode fall
+     back to visual-first analysis instead of failing the tutorial.
    - **Understand** — Muse Spark (`muse-spark-1.3`, JSON-schema)
      extracts objects (label + first-mentioned time, pronouns resolved)
      and steps (title, start/end, summary, objects used).

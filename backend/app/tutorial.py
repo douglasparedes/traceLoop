@@ -1253,17 +1253,27 @@ def run_job(job_id: str) -> None:
                                  "segments": len(tr.get("segments") or []), "error": tr.get("error", ""),
                                  "note": tr.get("note", "")})
                     if tr.get("error"):
-                        raise RuntimeError(tr["error"])
-                    sufficient, detail = ai.assess_speech_sufficiency(
-                        tr.get("text") or "", tr.get("segments") or [], info["duration"])
-                    if sufficient:
-                        strategy, reason = "narrated", detail
-                        _set(db, job, full_transcript=tr["text"], timed_segments=tr["segments"], progress=30)
-                    elif input_mode == "auto":
-                        strategy, reason = "visual_first", detail + " — analyzing visible actions instead; transcript kept as supplementary context"
-                        _set(db, job, full_transcript=tr["text"], timed_segments=tr["segments"], progress=30)
-                    else:
-                        raise RuntimeError("No speech was transcribed. Check the microphone track and try again, or switch to Visual-First mode.")
+                        if input_mode == "narrated" or not tr.get("fallback_visual"):
+                            raise RuntimeError(tr["error"])
+                        # Deterministic provider rejection in auto mode (bad audio,
+                        # over limits): the narration path is a dead end, but the
+                        # video itself is still analyzable. Fall back instead of
+                        # failing, and say so.
+                        strategy = "visual_first"
+                        reason = (tr.get("error", "") + " Continuing with visual analysis; " +
+                                  "no transcript will be available.").strip()
+                        _set(db, job, full_transcript="", timed_segments=[])
+                    if strategy != "visual_first":
+                        sufficient, detail = ai.assess_speech_sufficiency(
+                            tr.get("text") or "", tr.get("segments") or [], info["duration"])
+                        if sufficient:
+                            strategy, reason = "narrated", detail
+                            _set(db, job, full_transcript=tr["text"], timed_segments=tr["segments"], progress=30)
+                        elif input_mode == "auto":
+                            strategy, reason = "visual_first", detail + " — analyzing visible actions instead; transcript kept as supplementary context"
+                            _set(db, job, full_transcript=tr["text"], timed_segments=tr["segments"], progress=30)
+                        else:
+                            raise RuntimeError("No speech was transcribed. Check the microphone track and try again, or switch to Visual-First mode.")
 
             _set(db, job, analysis_strategy=strategy, strategy_reason=reason)
             _set(db, job, status="understanding", progress=38)
