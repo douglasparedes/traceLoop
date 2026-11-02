@@ -188,6 +188,47 @@ def validate_scene_plan(scenes: object, duration_sec: float) -> list[dict]:
     return clean
 
 
+def suggest_scene_plan(job: M.TutorialJob) -> dict:
+    """AI-planned initial scene plan from the processed tutorial content.
+
+    Uses the same planner as the automatic render path (Muse Spark with a
+    deterministic fallback, never inventing narration or visuals), then maps
+    the plan into the editable StudioScene shape and validates it so the
+    suggestion is guaranteed render-acceptable. Read-only: creates no
+    versions, saves no drafts. Raises ValueError when there is nothing to
+    plan from (no steps).
+    """
+    from . import ai as _ai
+
+    steps = job.steps or []
+    if not steps:
+        raise ValueError("No guide steps yet — the tutorial has no processed content to plan scenes from")
+    plan = _ai.plan_video_scenes(job.title, steps, job.objects or [],
+                                 job.timed_segments or [])
+    raw = plan.get("scenes") or []
+    if not raw:
+        raise ValueError("Could not plan video scenes from this tutorial")
+    scenes = []
+    for i, sc in enumerate(raw):
+        if not isinstance(sc, dict):
+            continue
+        vis = sc.get("visual") or {}
+        vis_name = str(vis.get("name", "") or "") if isinstance(vis, dict) else ""
+        scenes.append({
+            "step": int(sc.get("step_number", sc.get("step", i + 1)) or (i + 1)),
+            "title": str(sc.get("title", "") or f"Scene {i + 1}"),
+            "caption": str(sc.get("caption", "") or ""),
+            "audio_start": sc.get("audio_start", sc.get("start", 0)),
+            "audio_end": sc.get("audio_end", sc.get("end", 0)),
+            "visual": {"name": vis_name} if vis_name else {},
+            "include": True,
+        })
+    clean = validate_scene_plan(scenes, job.duration_sec or 0)
+    return {"scenes": clean, "simulated": bool(plan.get("simulated", True)),
+            "model": str(plan.get("model", "") or ""),
+            "note": str(plan.get("note", "") or "")}
+
+
 def start_video_guide(job_id: str, actor: str = "", force: bool = False, scenes: list[dict] | None = None) -> tuple[M.VideoGuide, bool]:
     """Queue (or reuse) a video-guide render. Returns (row, duplicate).
 

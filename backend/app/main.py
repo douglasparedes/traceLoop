@@ -1902,6 +1902,31 @@ def tutorial_video_guide_save_scenes(jid: str, body: dict, x_tutorial_token: str
     return {"ok": True, "tutorial_id": job.id, "video_guide_id": draft.id, "scenes": clean}
 
 
+@app.get("/api/tutorial/{jid}/video-guide/suggest")
+def tutorial_video_guide_suggest(jid: str, x_tutorial_token: str = Header(default=""), db: Session = Depends(get_db), who=Depends(actor)):
+    """Suggest an initial AI-planned scene plan from the processed content.
+
+    Read-only: plans from the canonical steps/objects/segments (Muse Spark,
+    deterministic fallback offline), validates the plan so it is guaranteed
+    render-acceptable, and returns it for review. Creates no versions and
+    saves no drafts — the user reviews the suggestion in VideoStudio and
+    renders explicitly.
+    """
+    from . import videoguide as vgmod
+    from . import processing as proc
+    job = _get_tutorial(db, jid, x_tutorial_token)
+    if job.status != "done":
+        raise HTTPException(409, "The tutorial has not finished processing yet")
+    try:
+        out = vgmod.suggest_scene_plan(job)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    proc.safe_record(db, "tutorial", job.id, "video_guide", "succeeded", operation="suggest_scene_plan",
+                     actor=who["id"], summary={"scenes": len(out["scenes"]), "simulated": out["simulated"]})
+    return {"ok": True, "tutorial_id": job.id, "scenes": out["scenes"],
+            "simulated": out["simulated"], "model": out["model"], "note": out["note"]}
+
+
 @app.post("/api/tutorial/{jid}/video-guide/render")
 def tutorial_video_guide_render(jid: str, body: dict, x_tutorial_token: str = Header(default=""), db: Session = Depends(get_db), who=Depends(actor)):
     """Render a NEW versioned MP4 from an edited scene plan (or the saved draft).
