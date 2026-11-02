@@ -6,7 +6,7 @@ import { API, api, authHeaders, getIdentity } from "./api";
 import { Icon } from "./icons";
 import GuideFormatSelector from "./GuideFormatSelector";
 import ProcessingSummary from "./ProcessingSummary";
-import VisualStudio from "./VisualStudio";
+import VisualStudio, { SafeImg } from "./VisualStudio";
 import VideoStudio from "./VideoStudio";
 import type { GuideSnapshotItem, VisualAsset } from "./guideFormats";
 import { acceptVisual, fetchSnapshot, fetchSnapshots, fetchVisuals, generateGuideVersion, rejectVisual, visualFileUrl } from "./guideFormats";
@@ -781,7 +781,9 @@ function VisualsEditor({ detail, token, notify }: {
         {visuals.length === 0 && <p className="muted small-text">No derivatives yet — improve, highlight, or annotate a source above.</p>}
         {visuals.map((v) => (
           <div key={v.id} className="list-row">
-            <div className="row" style={{ justifyContent: "space-between" }}>
+            <div className="row" style={{ alignItems: "flex-start", gap: 10 }}>
+              <SafeImg src={v.image_url ? visualFileUrl(v, token) : null} alt={v.instruction || v.kind.replace(/_/g, " ")} maxWidth={120} />
+              <div style={{ flex: "1 1 auto" }}>
               <span><strong>{v.kind.replace(/_/g, " ")}</strong> <span className={`tag ${v.status === "accepted" ? "approved" : v.status === "rejected" ? "error" : ""}`}>{v.status}</span>
                 <span className="muted small-text"> · {v.instruction.slice(0, 80)} · {new Date(v.created_at).toLocaleString()}</span></span>
               <span className="row">
@@ -793,6 +795,7 @@ function VisualsEditor({ detail, token, notify }: {
                   </>
                 )}
               </span>
+              </div>
             </div>
             {typeof (v.provenance as { warning?: unknown }).warning === "string" && (
               <p className="muted small-text" style={{ marginBottom: 0 }}>{String((v.provenance as { warning?: unknown }).warning)}</p>

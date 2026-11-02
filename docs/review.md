@@ -21,7 +21,9 @@
 | Tutorial uploads stream safely to disk | Chunked receive, incremental sha256, enforced cap, atomic rename, temp cleanup; `GET /admin/storage` health | Implemented; `test_storage.py` (persistence, dedup, 413 + cleanup, traversal, health, keyframes, versions) |
 | Transcription failures keep the provider's message | Local WAV validation (format/rate/content), 10-min/32 MB pre-checks, server `message/type/code` preserved in event + job error; deterministic 400/413 auto-falls-back to visual-first | Implemented; `test_transcribe.py` (7 tests) |
 | Silent/weak narration takes the visual path | Speech-sufficiency gate; `analyze_tutorial_frames` (Spark multimodal + labelled deterministic fallback); evidence-frame step links | Implemented; `test_visualfirst.py` (7 tests); narrated mode keeps the old hard failure |
+| Video scenes are AI-planned from processed content | `GET /api/tutorial/{id}/video-guide/suggest` (Spark planner + deterministic fallback, validated render-acceptable, read-only); Studio auto-fills scenes on first open + "Generate scenes with AI" re-derive; Remotion render unchanged | Implemented; `test_video_suggest.py` (3 tests) |
+| Visual assets always show or explain | `SafeImg` everywhere (missing/unloadable files render an explicit message, never empty frames); dead "Use as source" clicks disabled with reason; Studio derivatives list shows thumbnails | Implemented; frontend suite (95 tests) |
 
-Known limitations: manual page numbers are chunk-level (extraction keeps order, not exact pages); offline job start needs one prior online server start in this build (UI states this); no video tracking (deferred per spec §7.4); frontend has no automated test suite yet.
+Known limitations: manual page numbers are chunk-level (extraction keeps order, not exact pages); offline job start needs one prior online server start in this build (UI states this); no video tracking (deferred per spec §7.4).
 
 Submission risks to recheck with organizers: current official rules/deadlines, Geographic Use Policy, and model availability for the account used. This repo's compliance notes are an unofficial summary, not legal certification.
