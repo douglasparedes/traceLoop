@@ -39,7 +39,7 @@ interface Sandbox {
   self: Record<string, unknown>;
 }
 
-function loadSw(fetchImpl: Sandbox["fetchImpl"]): Sandbox {
+function loadSw(fetchImpl: Sandbox["fetchImpl"], opts: { failPut?: boolean } = {}): Sandbox {
   const sb: Sandbox = {
     listeners: {},
     store: new Map(),
@@ -54,7 +54,10 @@ function loadSw(fetchImpl: Sandbox["fetchImpl"]): Sandbox {
       const inner = sb.store.get(name)!;
       return {
         match: async (k: unknown) => inner.get(normKey(k)) || undefined,
-        put: async (k: unknown, v: FakeResponse) => { inner.set(normKey(k), v); },
+        put: async (k: unknown, v: FakeResponse) => {
+          if (opts.failPut) throw new TypeError("Request scheme 'chrome-extension' is unsupported");
+          inner.set(normKey(k), v);
+        },
         delete: async (k: unknown) => inner.delete(normKey(k)),
         keys: async () => [...inner.keys()].map((url) => ({ url })),
         addAll: async () => undefined,
@@ -154,6 +157,36 @@ describe("sw media authorization policy (real sw.js)", () => {
     const sb = loadSw(async () => new FakeResponse("{}"));
     const r = await dispatchFetch(sb, "https://app.test/api/procedures");
     expect(r.responded).toBe(false);
+  });
+
+  it("ignores non-HTTP(S) schemes instead of crashing the cache", async () => {
+    const sb = loadSw(async () => new FakeResponse("bytes"));
+    const r = await dispatchFetch(sb, "chrome-extension://abcdef/some-script.js");
+    expect(r.responded).toBe(false);
+    expect(sb.fetchCalls).toHaveLength(0);
+    expect(sb.store.get("fieldguard-shell-v6")?.size || 0).toBe(0);
+  });
+
+  it("still serves the network copy when the shell cache put rejects", async () => {
+    const sb = loadSw(async () => new FakeResponse("js-bytes"), { failPut: true });
+    const r = await dispatchFetch(sb, "https://app.test/assets/index-abc.js");
+    expect(r.responded).toBe(true);
+    if (!r.responded) return;
+    expect(r.response.body).toBe("js-bytes");
+  });
+
+  it("purges stale shell caches on activate but keeps media", async () => {
+    const sb = loadSw(async () => new FakeResponse("x"));
+    // Seed a stale shell generation plus current media entries.
+    sb.store.set("fieldguard-shell-v5", new Map([["https://app.test/index.html", new FakeResponse("old")]]));
+    sb.store.set("fieldguard-media-v2", new Map([["https://app.test/api/visuals/v1/file?token=t", new FakeResponse("img")]]));
+    for (const fn of sb.listeners["activate"] || []) {
+      await (fn as (e: never) => Promise<unknown>)({ waitUntil: (p: Promise<unknown>) => p } as never);
+      await new Promise((res) => setTimeout(res, 0));
+    }
+    await new Promise((res) => setTimeout(res, 50));
+    expect(sb.store.has("fieldguard-shell-v5")).toBe(false);
+    expect(sb.store.get("fieldguard-media-v2")?.size).toBe(1);
   });
 });
 

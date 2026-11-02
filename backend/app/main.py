@@ -2813,4 +2813,11 @@ if _DIST is not None:
                 media = None
             headers = {"Cache-Control": "no-store"} if candidate.name == "sw.js" else None
             return _FileResponse(candidate, media_type=media, headers=headers)
+        # Missing static assets (e.g. /assets/*.js from a stale cached
+        # index.html) must 404, not serve index.html with 200: a 200
+        # text/html body under a .js URL breaks module loading with a
+        # cryptic MIME error and poisons the service-worker shell cache.
+        # SPA fallback applies to extensionless navigation paths only.
+        if "." in full_path.rsplit("/", 1)[-1]:
+            raise HTTPException(404, "Not found")
         return _FileResponse(_DIST / "index.html")

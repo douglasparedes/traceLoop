@@ -12,7 +12,7 @@
 // unguessable-UUID URLs) key on the bare path. The media cache is deleted on
 // sign-out (see doLogout in App.tsx) so a later user on the same device never
 // reads a previous user's cached media.
-const CACHE = "fieldguard-shell-v5";
+const CACHE = "fieldguard-shell-v6";
 const MEDIA_CACHE = "fieldguard-media-v2";
 const MEDIA_MAX_ENTRIES = 120;
 
@@ -81,6 +81,10 @@ self.addEventListener("message", (e) => {
 
 self.addEventListener("fetch", (e) => {
   const url = new URL(e.request.url);
+  // Only HTTP(S) subresources are cacheable. Browser/extension schemes
+  // (chrome-extension:, moz-extension:, etc.) reach this handler from
+  // controlled pages, but Cache.put rejects them — let them pass through.
+  if (url.protocol !== "http:" && url.protocol !== "https:") return;
   if (e.request.method !== "GET") return;
   // Runtime media cache (offline reference photos + tutorial/live videos).
   if (url.origin === self.location.origin && MEDIA_RE.test(url.pathname)) {
@@ -117,7 +121,12 @@ self.addEventListener("fetch", (e) => {
     fetch(e.request).then((r) => {
       if (r.ok) {
         const copy = r.clone();
-        caches.open(CACHE).then((c) => c.put(e.request, copy));
+        caches.open(CACHE).then((c) => {
+          try {
+            const p = c.put(e.request, copy);
+            if (p && typeof p.catch === "function") p.catch(() => undefined);
+          } catch { /* unsupported scheme/quota: serve network copy, skip caching */ }
+        });
       }
       return r;
     }).catch(async () => {

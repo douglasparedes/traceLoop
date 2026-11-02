@@ -58,6 +58,12 @@ def test_frontend_static_and_spa_fallback():
     spa = c.get("/procedures")
     assert spa.status_code == 200 and "text/html" in spa.headers["content-type"]
     assert c.get("/api/does-not-exist").status_code == 404
+    # A missing hashed bundle (e.g. referenced by a stale cached
+    # index.html) must 404, never serve index.html as text/html under a
+    # .js URL — that breaks module loading with a cryptic MIME error and
+    # poisons the service-worker shell cache.
+    missing = c.get("/assets/index-stale123.js")
+    assert missing.status_code == 404, missing.status_code
     assert c.get("/api/health").status_code == 200
 
 
