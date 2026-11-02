@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { validateTutorialFile, queueTutorialUpload, listQueuedUploads, removeQueuedUpload, parseUploadResponse, MAX_TUTORIAL_BYTES } from "./uploadQueue";
+import { validateTutorialFile, queueTutorialUpload, listQueuedUploads, removeQueuedUpload, parseUploadResponse, parseApiJson, sha256Hex, runQueuedUpload, CHUNK_BYTES, MAX_TUTORIAL_BYTES } from "./uploadQueue";
 
 vi.mock("./db", () => {
   const stores = new Map<string, Map<string, unknown>>();
@@ -101,5 +101,132 @@ describe("queued uploads persist across reload", () => {
     expect(listed[0].title).toBe("T");
     await removeQueuedUpload(entry.key);
     expect(await listQueuedUploads()).toHaveLength(0);
+  });
+});
+
+describe("sha256Hex", () => {
+  it("matches known vectors without loading the whole file at once", async () => {
+    const enc = new TextEncoder();
+    expect(await sha256Hex(new Blob([enc.encode("abc")]))).toBe(
+      "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+    expect(await sha256Hex(new Blob([]))).toBe(
+      "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+  });
+});
+
+describe("parseApiJson", () => {
+  it("passes through valid JSON and server error details", () => {
+    expect(parseApiJson(200, JSON.stringify({ ok: true }), "application/json")).toEqual({ ok: true });
+    expect(() => parseApiJson(422, JSON.stringify({ detail: "Nope" }), "application/json")).toThrow("Nope");
+  });
+
+  it("explains HTML error pages instead of leaking SyntaxError", () => {
+    const html = "<html><body><h1>Too big</h1></body></html>";
+    expect(() => parseApiJson(200, html, "text/html")).toThrow(/wrong address/);
+    expect(() => parseApiJson(413, html, "text/html")).toThrow(/before reaching TraceLoop/);
+    expect(() => parseApiJson(500, html, "text/html")).toThrow(/unreadable error page/);
+    try {
+      parseApiJson(500, html, "text/html");
+      expect.unreachable();
+    } catch (e) {
+      expect((e as Error).message).not.toMatch(/Unexpected token/);
+    }
+  });
+});
+
+describe("chunked resume", () => {
+  const server = { received: 0, bytes: new Uint8Array(0), failAtChunk: -1, chunks: 0, total: 0 };
+
+  class FakeXHR {
+    static DONE = 4;
+    upload: { onprogress: ((e: { lengthComputable: boolean; loaded: number; total: number }) => void) | null } = { onprogress: null };
+    onload: (() => void) | null = null;
+    onerror: (() => void) | null = null;
+    onabort: (() => void) | null = null;
+    status = 0;
+    responseText = "";
+    readyState = 0;
+    private url = "";
+    private hdrs: Record<string, string> = {};
+    open(_m: string, url: string) { this.url = url; }
+    setRequestHeader(k: string, v: string) { this.hdrs[k] = v; }
+    getResponseHeader(n: string) { return n.toLowerCase() === "content-type" ? "application/json" : null; }
+    abort() { this.readyState = 4; if (this.onabort) this.onabort(); }
+    async send(blob: Blob) {
+      const m = /offset=(\d+)/.exec(this.url);
+      const offset = m ? Number(m[1]) : 0;
+      const buf = new Uint8Array(await (blob as Blob).arrayBuffer());
+      await new Promise((r) => setTimeout(r, 0));
+      server.chunks += 1;
+      if (server.chunks === server.failAtChunk) { if (this.onerror) this.onerror(); return; }
+      if (offset !== server.received) {
+        this.status = 422;
+        this.responseText = JSON.stringify({ detail: `Gap: expected ${server.received}` });
+      } else {
+        const grown = new Uint8Array(server.bytes.length + buf.length);
+        grown.set(server.bytes);
+        grown.set(buf, server.bytes.length);
+        server.bytes = grown;
+        server.received += buf.length;
+        this.status = 200;
+        this.responseText = JSON.stringify({ received_bytes: server.received, total_size: server.total });
+      }
+      this.readyState = 4;
+      if (this.upload.onprogress) this.upload.onprogress({ lengthComputable: true, loaded: buf.length, total: buf.length });
+      if (this.onload) this.onload();
+    }
+  }
+
+  beforeEach(() => {
+    server.received = 0;
+    server.bytes = new Uint8Array(0);
+    server.failAtChunk = -1;
+    server.chunks = 0;
+    server.total = 0;
+    vi.stubGlobal("XMLHttpRequest", FakeXHR);
+    vi.spyOn(globalThis, "fetch").mockImplementation((async (url: unknown, init?: unknown) => {
+      const u = String(url);
+      const method = ((init as RequestInit | undefined)?.method || "GET").toUpperCase();
+      const json = (v: unknown, status = 200) => ({ ok: status < 400, status, headers: new Headers({ "Content-Type": "application/json" }), json: async () => v, text: async () => JSON.stringify(v) }) as unknown as Response;
+      if (u.endsWith("/api/tutorial/uploads") && method === "POST") {
+        const body = JSON.parse(String((init as { body?: string }).body || "{}"));
+        server.total = body.total_size;
+        server.received = 0;
+        server.bytes = new Uint8Array(0);
+        return json({ ok: true, upload_id: "up-1", chunk_size: 4 * 1024 * 1024 });
+      }
+      if (u.includes("/api/tutorial/uploads/up-1") && method === "GET") {
+        return json({ status: "open", received_bytes: server.received, total_size: server.total });
+      }
+      if (u.endsWith("/complete") && method === "POST") {
+        return json({ id: "job-1", title: "Big", status: "uploaded", progress: 2, access_token: "tok", upload_id: "up-1" });
+      }
+      return json({}, 404);
+    }) as typeof fetch);
+  });
+
+  it("uploads in chunks, resumes after a network drop, and verifies bytes", async () => {
+    const size = 10 * 1024 * 1024;
+    const raw = new Uint8Array(size);
+    for (let i = 0; i < size; i++) raw[i] = i % 251;
+    const blob = new Blob([raw], { type: "video/mp4" });
+    const entry = await queueTutorialUpload({ blob, filename: "big.mp4", title: "Big", mode: "auto", origin: "uploaded" });
+    server.failAtChunk = 2; // second chunk's XHR fails after one chunk confirmed
+    await expect(runQueuedUpload(entry, () => undefined)).rejects.toThrow(/check the connection/);
+    expect(server.received).toBe(4 * 1024 * 1024);
+    expect((await listQueuedUploads()).find((e) => e.key === entry.key)).toBeTruthy();
+    server.failAtChunk = -1;
+    const job = await runQueuedUpload({ ...(await listQueuedUploads()).find((e) => e.key === entry.key)! }, () => undefined);
+    expect(job.id).toBe("job-1");
+    expect(server.bytes.length).toBe(size);
+    expect(Array.from(server.bytes)).toEqual(Array.from(raw));
+    expect(await listQueuedUploads()).toHaveLength(0); // removed only after server confirm
+  });
+
+  it("cancels without losing the queue entry", async () => {
+    const blob = new Blob([new Uint8Array(1024)], { type: "video/mp4" });
+    const entry = await queueTutorialUpload({ blob, filename: "c.mp4", title: "C", mode: "auto", origin: "recorded" });
+    await expect(runQueuedUpload(entry, () => undefined, { cancelled: true })).rejects.toThrow(/cancelled/i);
+    expect(await listQueuedUploads()).toHaveLength(1);
   });
 });

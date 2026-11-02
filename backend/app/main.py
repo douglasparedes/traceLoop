@@ -925,6 +925,254 @@ async def tutorial_start(file: UploadFile = File(...), title: str = Form(default
     return _tutorial_out(job)
 
 
+    job.video_storage_key = final_rel
+    db.commit(); db.refresh(job)
+    tut.start_job(job.id)
+    return _tutorial_out(job)
+
+
+# Chunked resumable uploads: large videos arrive as small offset-addressed
+# chunks so per-request proxy/CDN size caps stop mattering. Completing
+# verifies size + sha256, then performs the exact same atomic persist +
+# TutorialJob creation as the single-shot path above.
+UPLOAD_CHUNK_BYTES = 4 * 1024 * 1024
+UPLOAD_MAX_CHUNK_BYTES = 16 * 1024 * 1024
+UPLOAD_SESSION_TTL_SEC = 24 * 3600
+
+
+def _upload_tmp_dir(upload_id: str):
+    from . import storage as _storage
+    d = _storage.media_root() / ".tmp" / "uploads" / upload_id
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _sweep_upload_sessions(db: Session) -> int:
+    """Delete expired open sessions and their temp files. Returns count."""
+    import shutil as _shutil
+    import time as _time
+    cutoff = _time.time() - UPLOAD_SESSION_TTL_SEC
+    removed = 0
+    try:
+        rows = db.scalars(select(M.TutorialUploadSession).where(
+            M.TutorialUploadSession.status == "open")).all()
+    except Exception:
+        return 0
+    for r in rows:
+        try:
+            created = r.created_at.timestamp() if getattr(r.created_at, "timestamp", None) else 0
+        except Exception:
+            created = 0
+        if created and created < cutoff:
+            try:
+                _shutil.rmtree(_upload_tmp_dir(r.id), ignore_errors=True)
+            except OSError:
+                pass
+            db.delete(r)
+            removed += 1
+    if removed:
+        try:
+            db.commit()
+        except Exception:
+            db.rollback()
+    return removed
+
+
+def _get_upload_session(db: Session, uid: str, who: dict) -> M.TutorialUploadSession:
+    s = db.get(M.TutorialUploadSession, uid)
+    if not s:
+        raise HTTPException(404, "Upload session not found (it may have expired — start a new upload)")
+    if s.actor != who["id"]:
+        raise HTTPException(403, "This upload belongs to a different session")
+    return s
+
+
+@app.post("/api/tutorial/uploads")
+def upload_init(body: dict, db: Session = Depends(get_db), who=Depends(actor)):
+    """Open a chunked upload session. Returns upload_id + chunk_size."""
+    from . import storage as _storage
+    if not isinstance(body, dict):
+        raise HTTPException(422, "Request body must be an object")
+    filename = str(body.get("filename") or "tutorial.mp4")
+    mime = str(body.get("mime") or "video/mp4").split(";")[0].strip().lower()
+    try:
+        total = int(body.get("total_size") or 0)
+    except (TypeError, ValueError):
+        raise HTTPException(422, "total_size must be a number of bytes")
+    sha = str(body.get("sha256") or "").lower()
+    if len(sha) != 64 or any(c not in "0123456789abcdef" for c in sha):
+        raise HTTPException(422, "sha256 must be the hex SHA-256 of the complete file")
+    ext = Path(filename).suffix.lower()
+    base_ok = {"video/mp4": ".mp4", "video/webm": ".webm", "video/quicktime": ".mov", "video/x-matroska": ".mkv"}.get(mime)
+    suffix = base_ok or (ext if ext in (".mp4", ".webm", ".mov", ".mkv") else None)
+    if suffix is None:
+        raise HTTPException(415, "Only MP4, WebM, MOV, or MKV tutorial videos are supported")
+    if total <= 0 or total > TUTORIAL_MAX_BYTES:
+        raise HTTPException(413 if total > TUTORIAL_MAX_BYTES else 422,
+                            "Tutorial video too large (max 300 MB)" if total > TUTORIAL_MAX_BYTES else "total_size must be positive")
+    mode = str(body.get("mode") or "auto").strip().lower()
+    if mode not in ("auto", "narrated", "visual_first"):
+        raise HTTPException(422, "mode must be auto, narrated, or visual_first")
+    title = str(body.get("title") or "").strip() or filename
+    if len(title) > 200:
+        raise HTTPException(422, "Title too long (max 200 chars)")
+    try:
+        _storage.ensure_media_subdirs()
+        _storage.sweep_stale_tmp()
+    except OSError as e:
+        raise HTTPException(500, f"Media storage unavailable: {e}")
+    _sweep_upload_sessions(db)
+    s = M.TutorialUploadSession(
+        actor=who["id"], filename=Path(filename).name[:200], mime_type=mime, total_size=total,
+        sha256=sha, title=title, equipment_name=str(body.get("equipment_name") or "")[:200],
+        task_description=str(body.get("task_description") or "")[:4000],
+        context_notes=str(body.get("context_notes") or "")[:8000], input_mode=mode,
+        origin=str(body.get("origin") or "uploaded") if str(body.get("origin") or "") in ("recorded", "uploaded") else "uploaded")
+    db.add(s)
+    db.flush()
+    _upload_tmp_dir(s.id)
+    db.commit()
+    db.refresh(s)
+    return {"ok": True, "upload_id": s.id, "chunk_size": UPLOAD_CHUNK_BYTES, "received_bytes": 0}
+
+
+@app.put("/api/tutorial/uploads/{uid}/chunks")
+async def upload_chunk(uid: str, request: Request, offset: int = 0, db: Session = Depends(get_db), who=Depends(actor)):
+    """Append one chunk at an absolute byte offset. Idempotent: re-sending an
+    already-received range with identical bytes is accepted without duplicating
+    data; gaps (offset beyond received) are rejected with the expected offset
+    so the client can resume exactly where the server stopped."""
+    s = _get_upload_session(db, uid, who)
+    if s.status != "open":
+        raise HTTPException(409, f"Upload session is {s.status}; start a new upload")
+    if offset < 0 or offset > s.total_size:
+        raise HTTPException(422, "offset must be within the declared file size")
+    data = await request.body()
+    if len(data) > UPLOAD_MAX_CHUNK_BYTES:
+        raise HTTPException(413, f"Chunk too large (max {UPLOAD_MAX_CHUNK_BYTES // 1024 // 1024} MB per request)")
+    if offset > s.received_bytes:
+        raise HTTPException(422, f"Gap in upload: next expected offset is {s.received_bytes}")
+    if offset + len(data) > s.total_size:
+        raise HTTPException(422, "Chunk would exceed the declared total_size")
+    tmp = _upload_tmp_dir(s.id) / "upload.part"
+    if offset < s.received_bytes:
+        # Idempotent retry: bytes already on disk must be identical.
+        # Verified BEFORE writing so a mismatched retry can never corrupt
+        # the already-persisted prefix.
+        try:
+            with open(tmp, "rb") as fh:
+                fh.seek(offset)
+                if fh.read(len(data)) != data:
+                    raise HTTPException(409, "Chunk bytes differ from what was already received — restart the upload")
+        except HTTPException:
+            raise
+        except OSError as e:
+            raise HTTPException(500, f"Could not verify the chunk ({e})")
+        return {"ok": True, "received_bytes": s.received_bytes, "total_size": s.total_size}
+    try:
+        with open(tmp, "r+b" if tmp.is_file() else "wb") as fh:
+            fh.seek(offset)
+            fh.write(data)
+            fh.flush()
+            import os as _os
+            _os.fsync(fh.fileno())
+    except OSError as e:
+        raise HTTPException(500, f"Could not store the chunk ({e})")
+    s.received_bytes = offset + len(data)
+    from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+    _flag_modified(s, "received_bytes")
+    db.commit()
+    db.refresh(s)
+    return {"ok": True, "received_bytes": s.received_bytes, "total_size": s.total_size}
+
+
+@app.get("/api/tutorial/uploads/{uid}")
+def upload_status(uid: str, db: Session = Depends(get_db), who=Depends(actor)):
+    s = _get_upload_session(db, uid, who)
+    return {"upload_id": s.id, "status": s.status, "received_bytes": s.received_bytes,
+            "total_size": s.total_size, "chunk_size": UPLOAD_CHUNK_BYTES}
+
+
+@app.delete("/api/tutorial/uploads/{uid}")
+def upload_abort(uid: str, db: Session = Depends(get_db), who=Depends(actor)):
+    import shutil as _shutil
+    s = _get_upload_session(db, uid, who)
+    _shutil.rmtree(_upload_tmp_dir(s.id), ignore_errors=True)
+    db.delete(s)
+    db.commit()
+    return {"ok": True, "aborted": True}
+
+
+@app.post("/api/tutorial/uploads/{uid}/complete")
+def upload_complete(uid: str, db: Session = Depends(get_db), who=Depends(actor)):
+    """Verify, atomically persist, and create the TutorialJob.
+
+    Verifies every received byte (size + full-file sha256) before anything
+    is marked persisted; the job is created only after the file is durably
+    in its final location. Identical bytes to an existing finished tutorial
+    return the cached job instead of duplicating it.
+    """
+    import hashlib as _hashlib
+    import shutil as _shutil
+    from . import storage as _storage
+    s = _get_upload_session(db, uid, who)
+    if s.status != "open":
+        raise HTTPException(409, f"Upload session is {s.status}")
+    if s.received_bytes != s.total_size:
+        raise HTTPException(409, f"Upload incomplete: {s.received_bytes} of {s.total_size} bytes received")
+    tmp = _upload_tmp_dir(s.id) / "upload.part"
+    if not tmp.is_file():
+        raise HTTPException(500, "Uploaded data missing on the server — retry the upload")
+    digest = _hashlib.sha256()
+    try:
+        with open(tmp, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                digest.update(chunk)
+    except OSError as e:
+        raise HTTPException(500, f"Could not verify the upload ({e})")
+    if digest.hexdigest() != s.sha256:
+        s.status = "aborted"
+        db.commit()
+        _shutil.rmtree(_upload_tmp_dir(s.id), ignore_errors=True)
+        raise HTTPException(422, "Checksum mismatch: the received bytes do not match the file. Discard and upload again.")
+    existing = db.scalar(select(M.TutorialJob).where(
+        M.TutorialJob.video_hash == s.sha256, M.TutorialJob.actor == who["id"],
+        M.TutorialJob.status == "done"))
+    if existing is not None:
+        _shutil.rmtree(_upload_tmp_dir(s.id), ignore_errors=True)
+        db.delete(s)
+        db.commit()
+        out = _tutorial_out(existing)
+        out["cached"] = True
+        return out
+    suffix = {".mp4", ".webm", ".mov", ".mkv"}
+    ext = Path(s.filename).suffix.lower()
+    ext = ext if ext in suffix else ".mp4"
+    job = M.TutorialJob(title=s.title or (s.filename or "Untitled tutorial"), actor=who["id"],
+                        access_token=str(uuid.uuid4()), video_hash=s.sha256, status="uploaded", progress=2,
+                        equipment_name=s.equipment_name, task_description=s.task_description,
+                        context_notes=s.context_notes, input_mode=s.input_mode, origin=s.origin)
+    db.add(job)
+    db.flush()
+    store_dir = _storage.media_root() / "tutorials" / job.id
+    store_dir.mkdir(parents=True, exist_ok=True)
+    final_rel = f"data/tutorials/{job.id}/source{ext}"
+    try:
+        _os.replace(tmp, _storage.media_path(final_rel))
+    except OSError as e:
+        db.rollback()
+        raise HTTPException(500, f"Could not persist the uploaded video ({e})")
+    job.video_storage_key = final_rel
+    audit(db, who["id"], "tutorial.upload.complete", "tutorial_job", job.id,
+          {"upload_id": s.id, "bytes": s.total_size})
+    db.delete(s)
+    db.commit()
+    db.refresh(job)
+    _shutil.rmtree(_upload_tmp_dir(uid), ignore_errors=True)
+    tut.start_job(job.id)
+    return _tutorial_out(job)
+
+
 @app.get("/api/tutorial")
 def list_tutorials(q: str = "", status: str = "", limit: int = 50, offset: int = 0,
                    include_archived: bool = False, db: Session = Depends(get_db)):

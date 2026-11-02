@@ -91,12 +91,12 @@ follow-up; until then treat all data on the public URL as shared demo data.
    "answered with a web page instead of data" error — the upload path now
    says this explicitly instead of a raw JSON `SyntaxError`, and the file
    stays queued for retry.
-5. Upload limits in front of the app: the in-app cap is 300 MB, but
-   proxies/CDNs enforce their own (e.g. Cloudflare free ≈ 100 MB,
-   Traefik `client_max_body_size` equivalents). An HTML 413 from a proxy
-   surfaces as "rejected as too large before reaching TraceLoop" with a
-   retry-safe queued copy — lower the proxy limit expectation or upload
-   over Wi-Fi with a trimmed file if you hit it.
+5. Upload limits in front of the app: the in-app cap is 300 MB, and videos
+   upload in 4 MB chunks, so per-request proxy/CDN limits (e.g. Cloudflare
+   free ≈ 100 MB, Traefik `client_max_body_size` equivalents) no longer
+   block large videos the way a single 300 MB POST would. If a proxy still
+   interferes, the failure surfaces as a plain-language error with the
+   upload safely resumable from the last confirmed byte.
 
 ## 3. Android TWA (after the site is live and PWABuilder is green)
 
