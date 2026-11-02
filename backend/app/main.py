@@ -45,6 +45,11 @@ with engine.begin() as _conn:
                                 ("tutorial_jobs", "content_revision", "INTEGER DEFAULT 1"),
                                 ("tutorial_jobs", "transcript_original", "TEXT DEFAULT ''"),
                                 ("tutorial_jobs", "transcript_corrected", "TEXT DEFAULT ''"),
+                                ("tutorial_jobs", "input_mode", "VARCHAR DEFAULT 'auto'"),
+                                ("tutorial_jobs", "analysis_strategy", "VARCHAR DEFAULT ''"),
+                                ("tutorial_jobs", "strategy_reason", "TEXT DEFAULT ''"),
+                                ("tutorial_jobs", "origin", "VARCHAR DEFAULT 'recorded'"),
+                                ("tutorial_jobs", "keyframes", "TEXT DEFAULT '[]'"),
                                 ("video_guides", "version_number", "INTEGER DEFAULT 1")):
         if _insp.has_table(_table) and _col not in {c["name"] for c in _insp.get_columns(_table)}:
             _conn.execute(_text(f"ALTER TABLE {_table} ADD COLUMN {_col} {_type}"))
@@ -63,6 +68,9 @@ app.add_middleware(CORSMiddleware, allow_origins=_cors_origins, allow_methods=["
 
 MAX_PDF_BYTES = 15 * 1024 * 1024
 MAX_IMG_BYTES = 8 * 1024 * 1024
+# Tutorial uploads stream in 1 MB chunks and enforce this cap while receiving.
+# Tests lower it via monkeypatch to prove the 413 path without sending 300 MB.
+TUTORIAL_MAX_BYTES = int(_os.getenv("TUTORIAL_MAX_BYTES", str(300 * 1024 * 1024)))
 ROLES = {"technician", "expert", "reviewer", "admin"}
 
 
@@ -136,6 +144,21 @@ def health(db: Session = Depends(get_db)):
     return {"status": "ok" if db_ok else "degraded", "db": db_ok, "ai_live": ai.live_enabled(), "models": {"spark": ai.SPARK_MODEL, "segment": ai.SAM_MODEL, "voice": ai.VOICE_MODEL}}
 
 
+@app.get("/api/admin/storage")
+def admin_storage(db: Session = Depends(get_db), who=Depends(actor)):
+    """Storage health for operators (reviewer/admin only).
+
+    Reports media volume existence/writability, disk usage, database reachability,
+    and counts of records pointing at missing files (ids only — never paths).
+    If the volume is unavailable the report says so instead of pretending
+    uploads succeeded.
+    """
+    if who["role"] not in ("reviewer", "admin", "expert"):
+        raise HTTPException(403, "Reviewer role required for storage diagnostics")
+    from . import storage as _storage
+    return {"ok": True, **_storage.storage_health(db)}
+
+
 @app.get("/api/auth/status")
 def auth_status():
     from . import auth as _auth
@@ -173,7 +196,7 @@ import re as _re_gate
 # mismatch). The evidence image URL is an unguessable UUID, as it was before
 # the team gate existed.
 MEDIA_GATE_EXEMPT_RE = _re_gate.compile(
-    r"^/api/(tutorial/[^/]+/(video|video-guide/file|bundle\.zip|illustrations/[^/]+|diagnostics/frame/[^/]+)"
+    r"^/api/(tutorial/[^/]+/(video|video-guide/file|bundle\.zip|illustrations/[^/]+|diagnostics/frame/[^/]+|keyframes/[^/]+)"
     r"|visuals/[^/]+/file"
     r"|live-recordings/[^/]+/chunks/[^/]+/video"
     r"|evidence/[^/]+/image)$")
@@ -559,6 +582,24 @@ def get_version(vid: str, db: Session = Depends(get_db)):
     return ver_out(v, db)
 
 
+@app.post("/api/procedure-versions/{vid}/offline-grant")
+def offline_grant(vid: str, db: Session = Depends(get_db), who=Depends(actor)):
+    """Issue a signed offline execution grant for one approved revision.
+
+    The client stores the grant with the downloaded approved version. If the
+    device later registers a job started offline after the revision was
+    superseded, the grant authorizes that exact registration — nothing else.
+    Grants expire (30 days) and are bound to procedure + version + actor.
+    """
+    from . import auth as _auth
+    v = db.get(M.ProcedureVersion, vid)
+    if not v: raise HTTPException(404, "Version not found")
+    if v.status != "approved":
+        raise HTTPException(409, "Offline grants are only issued for approved revisions")
+    return {"ok": True, "procedure_id": v.procedure_id, "procedure_version_id": v.id,
+            "offline_grant": _auth.create_offline_grant(v.procedure_id, v.id, who["id"])}
+
+
 @app.put("/api/procedure-versions/{vid}")
 def edit_version(vid: str, body: S.VersionEdit, db: Session = Depends(get_db), who=Depends(actor)):
     v = db.get(M.ProcedureVersion, vid)
@@ -779,6 +820,11 @@ def _tutorial_out(job: M.TutorialJob) -> dict:
             "task_description": getattr(job, "task_description", "") or "",
             "context_notes": getattr(job, "context_notes", "") or "",
             "content_revision": getattr(job, "content_revision", 1) or 1,
+            "input_mode": getattr(job, "input_mode", "auto") or "auto",
+            "analysis_strategy": getattr(job, "analysis_strategy", "") or "",
+            "strategy_reason": getattr(job, "strategy_reason", "") or "",
+            "origin": getattr(job, "origin", "recorded") or "recorded",
+            "keyframes": getattr(job, "keyframes", "") or [],
             "objects": job.objects or [], "steps": job.steps or [], "materials": job.materials or [],
             "guide_markdown": job.guide_markdown, "created_at": job.created_at.isoformat(),
             "updated_at": job.updated_at.isoformat() if getattr(job, "updated_at", None) else job.created_at.isoformat(),
@@ -789,9 +835,15 @@ def _tutorial_out(job: M.TutorialJob) -> dict:
 
 
 @app.post("/api/tutorial/start")
-async def tutorial_start(file: UploadFile = File(...), title: str = Form(default=""), db: Session = Depends(get_db), who=Depends(actor)):
+async def tutorial_start(file: UploadFile = File(...), title: str = Form(default=""),
+                         mode: str = Form(default="auto"),
+                         equipment_name: str = Form(default=""),
+                         task_description: str = Form(default=""),
+                         context_notes: str = Form(default=""),
+                         db: Session = Depends(get_db), who=Depends(actor)):
     # Browsers send codec-qualified types (e.g. "video/webm;codecs=vp8,opus"):
     # compare the base media type only, with a filename-extension fallback.
+    from . import storage as _storage
     base_type = (file.content_type or "").split(";")[0].strip().lower()
     suffix_by_type = {"video/mp4": ".mp4", "video/webm": ".webm", "video/quicktime": ".mov", "video/x-matroska": ".mkv"}
     suffix = suffix_by_type.get(base_type)
@@ -801,20 +853,73 @@ async def tutorial_start(file: UploadFile = File(...), title: str = Form(default
             suffix = ext
     if suffix is None:
         raise HTTPException(415, "Only MP4, WebM or MOV tutorial videos are supported")
-    data = await file.read()
-    if len(data) > 300 * 1024 * 1024: raise HTTPException(413, "Tutorial video too large (max 300 MB)")
-    digest = hashlib.sha256(data).hexdigest()
-    existing = db.scalar(select(M.TutorialJob).where(M.TutorialJob.video_hash == digest, M.TutorialJob.actor == who["id"], M.TutorialJob.status == "done"))
+    req_mode = (mode or "auto").strip().lower()
+    if req_mode not in ("auto", "narrated", "visual_first"):
+        raise HTTPException(422, "mode must be auto, narrated, or visual_first")
+    # Stream to a temp file in bounded chunks: a 300 MB upload must never
+    # sit fully in application memory. Size is enforced while streaming;
+    # the checksum is computed incrementally for duplicate detection.
+    try:
+        _storage.ensure_media_subdirs()
+        _storage.sweep_stale_tmp()
+    except OSError as e:
+        raise HTTPException(500, f"Media storage unavailable: {e}")
+    tmp_path = _storage.media_root() / ".tmp" / f"upload-{uuid.uuid4().hex}.part"
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        with open(tmp_path, "wb") as fh:
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > TUTORIAL_MAX_BYTES:
+                    raise HTTPException(413, "Tutorial video too large (max 300 MB)")
+                digest.update(chunk)
+                fh.write(chunk)
+                fh.flush()
+    except HTTPException:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    except Exception as e:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise HTTPException(500, f"Upload failed while receiving the file ({type(e).__name__})")
+    video_hash = digest.hexdigest()
+    existing = db.scalar(select(M.TutorialJob).where(M.TutorialJob.video_hash == video_hash, M.TutorialJob.actor == who["id"], M.TutorialJob.status == "done"))
     if existing is not None:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
         out = _tutorial_out(existing); out["cached"] = True
         return out
     job = M.TutorialJob(title=title.strip() or (file.filename or "Untitled tutorial"), actor=who["id"],
-                        access_token=str(uuid.uuid4()), video_hash=digest, status="uploaded", progress=2)
+                        access_token=str(uuid.uuid4()), video_hash=video_hash, status="uploaded", progress=2,
+                        equipment_name=(equipment_name or "")[:200],
+                        task_description=(task_description or "")[:4000],
+                        context_notes=(context_notes or "")[:8000])
+    job.input_mode = req_mode
     db.add(job); db.flush()
-    store_dir = Path(__file__).resolve().parent.parent / "data" / "tutorials" / job.id
+    store_dir = _storage.media_root() / "tutorials" / job.id
     store_dir.mkdir(parents=True, exist_ok=True)
-    (store_dir / f"source{suffix}").write_bytes(data)
-    job.video_storage_key = f"data/tutorials/{job.id}/source{suffix}"
+    final_rel = f"data/tutorials/{job.id}/source{suffix}"
+    try:
+        _os.replace(tmp_path, _storage.media_path(final_rel))
+    except OSError as e:
+        db.rollback()
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise HTTPException(500, f"Could not persist the uploaded video ({e})")
+    job.video_storage_key = final_rel
     db.commit(); db.refresh(job)
     tut.start_job(job.id)
     return _tutorial_out(job)
@@ -844,7 +949,10 @@ def list_tutorials(q: str = "", status: str = "", limit: int = 50, offset: int =
                        "draft_version_id": j.draft_version_id or None,
                        "objects_total": len(j.objects or []),
                        "objects_unresolved": sum(1 for o in (j.objects or []) if o.get("status") in ("needs_tap", "error")),
-                       "has_guide": bool(j.guide_markdown)} for j in page]}
+                       "has_guide": bool(j.guide_markdown),
+                       "input_mode": getattr(j, "input_mode", "auto") or "auto",
+                       "analysis_strategy": getattr(j, "analysis_strategy", "") or "",
+                       "origin": getattr(j, "origin", "recorded") or "recorded"} for j in page]}
 
 
 @app.get("/api/tutorial/formats")
@@ -1172,6 +1280,23 @@ def tutorial_diagnostic_frame(jid: str, obj_id: int, token: str = "", db: Sessio
     raise HTTPException(404, "No diagnostic frame recorded for this object")
 
 
+@app.get("/api/tutorial/{jid}/keyframes/{name}")
+def tutorial_keyframe(jid: str, name: str, token: str = "", db: Session = Depends(get_db)):
+    """A sampled frame backing visual-first analysis (token-gated like other
+    tutorial media). Lets reviewers jump from a candidate step to the exact
+    source frame that supports it."""
+    from fastapi.responses import FileResponse
+    from . import storage as _storage
+    job = _get_tutorial(db, jid, token)
+    safe = Path(str(name)).name
+    if not re.fullmatch(r"keyframe-\d+\.jpg", safe):
+        raise HTTPException(404, "Keyframe not found")
+    path = _storage.media_root() / "tutorials" / jid / safe
+    if not path.is_file():
+        raise HTTPException(404, "Keyframe not found")
+    return FileResponse(path, media_type="image/jpeg", filename=safe)
+
+
 @app.post("/api/tutorial/{jid}/draft")
 def tutorial_ensure_draft(jid: str, x_tutorial_token: str = Header(default=""), db: Session = Depends(get_db), who=Depends(actor)):
     """Create (or return) the persistent Review-queue draft for a finished tutorial.
@@ -1259,6 +1384,16 @@ def _normalize_studio_steps(raw: object, duration_sec: float) -> list[dict]:
         tools = s.get("required_tools", s.get("tools", []))
         if not isinstance(tools, list):
             raise HTTPException(422, f"Step {i + 1}: tools must be a list")
+        try:
+            ev_frames = sorted({round(float(x), 1) for x in (s.get("evidence_frames") or [])})[:8]
+        except (TypeError, ValueError):
+            raise HTTPException(422, f"Step {i + 1}: evidence_frames must be numbers")
+        conf = str(s.get("confidence", "") or "")
+        if conf and conf not in ("low", "medium", "high"):
+            raise HTTPException(422, f"Step {i + 1}: confidence must be low, medium, or high")
+        derivation = str(s.get("derivation", "") or "")
+        if derivation and derivation not in ("visual", "narration", "human"):
+            raise HTTPException(422, f"Step {i + 1}: derivation must be visual, narration, or human")
         clean.append({
             "step_number": i + 1,
             "title": title,
@@ -1269,6 +1404,9 @@ def _normalize_studio_steps(raw: object, duration_sec: float) -> list[dict]:
             "expected_result": str(s.get("expected_result", "") or "")[:2000],
             "verification_notes": str(s.get("verification_notes", "") or "")[:2000],
             "required_tools": [str(t)[:120] for t in tools if str(t).strip()][:20],
+            "evidence_frames": ev_frames,
+            "confidence": conf,
+            "derivation": derivation,
         })
     return clean
 
@@ -2421,7 +2559,20 @@ def start_job(body: S.JobCreate, db: Session = Depends(get_db), who=Depends(acto
     v = db.get(M.ProcedureVersion, body.procedure_version_id)
     if not v: raise HTTPException(404, "Procedure version not found")
     if v.procedure_id != body.procedure_id: raise HTTPException(409, "Procedure version does not belong to the selected procedure")
-    if v.status != "approved": raise HTTPException(409, "Jobs can only start from an approved procedure version")
+    grant_used = False
+    if v.status != "approved":
+        # Offline execution grant: a job legitimately started offline against
+        # an approved revision may register after that revision was
+        # superseded. The grant is bound to procedure + exact version +
+        # actor + expiry and verified with the team HMAC secret. It never
+        # authorizes unapproved drafts/rejections, other versions, other
+        # procedures, or other actors.
+        from . import auth as _auth
+        g = _auth.verify_offline_grant(body.offline_grant or "")
+        if (g is None or g.get("proc") != v.procedure_id or g.get("ver") != v.id
+                or g.get("actor") != who["id"] or v.status != "superseded"):
+            raise HTTPException(409, "Jobs can only start from an approved procedure version")
+        grant_used = True
     if body.id:
         existing = db.get(M.JobSession, body.id)
         if existing is not None:
@@ -2430,9 +2581,13 @@ def start_job(body: S.JobCreate, db: Session = Depends(get_db), who=Depends(acto
             return {"id": existing.id, "status": existing.status, "procedure_version_id": existing.procedure_version_id, "already_registered": True}
     j = M.JobSession(id=body.id or M.uid(), asset_id=body.asset_id, procedure_id=body.procedure_id, procedure_version_id=body.procedure_version_id,
                      technician_id=who["id"])
-    db.add(j); db.flush(); audit(db, who["id"], "job.start", "job_session", j.id)
+    db.add(j); db.flush(); audit(db, who["id"], "job.start", "job_session", j.id,
+                                 {"offline_grant": grant_used} if grant_used else None)
     db.commit(); db.refresh(j)
-    return {"id": j.id, "status": j.status, "procedure_version_id": j.procedure_version_id}
+    out = {"id": j.id, "status": j.status, "procedure_version_id": j.procedure_version_id}
+    if grant_used:
+        out["grant_used"] = True
+    return out
 
 
 @app.get("/api/jobs")

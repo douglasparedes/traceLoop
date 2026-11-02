@@ -14,6 +14,9 @@ export interface StudioStep {
   expected_result?: string;
   verification_notes?: string;
   required_tools?: string[];
+  evidence_frames?: number[];
+  confidence?: string;
+  derivation?: string;
 }
 
 export interface StudioSegment {

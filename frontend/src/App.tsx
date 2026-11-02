@@ -5,18 +5,18 @@ import { Icon, type IconName } from "./icons";
 import TutorialMode from "./TutorialMode";
 import TutorialLibrary, { type LibraryItem } from "./TutorialLibrary";
 import TutorialStudio from "./TutorialStudio";
+import TutorialUpload, { ModeSelector, QueuedUploads } from "./TutorialUpload";
+import { requestPersistentStorage, type AnalysisMode } from "./uploadQueue";
 import type { JobEventRec, LocalJob, ProcSummary, Role, Step, Version, View } from "./types";
 import { checkAssetLinks, usePwaInstall, type AssetLinksStatus } from "./pwaInstall";
 import { clearMediaCache } from "./mediaCache";
+import { runSync, storeGrant, getStoredGrant, type PendingReg, type PendingFinish, type PendingPhoto } from "./sync";
+import SyncDiagnostics from "./SyncDiagnostics";
 
 const ISSUE_TYPES = ["Component not found", "Instructions unclear", "Expected result not observed", "Tool unavailable", "Manual mismatch", "Unexpected condition", "Other"];
 
 interface JobRow { id: string; procedure_title: string; status: string; outcome: string | null; started_at: string; events: number }
 interface ManualRow { id: string; title: string; model: string | null; chunks: number }
-
-interface PendingReg { job_id: string; procedure_id: string; procedure_version_id: string }
-interface PendingFinish { job_id: string; outcome: string }
-interface PendingPhoto { key: string; job_id: string; step_id: string | null; description: string }
 
 async function loadPending<T>(key: string): Promise<T[]> {
   return (await idb.get<T[]>("meta", key)) || [];
@@ -80,64 +80,10 @@ export default function App() {
   const syncNow = useCallback(async () => {
     setSyncState("syncing");
     try {
-      try { await api.get("/api/health"); } catch { setSyncState("failed"); notify("Server unreachable. Your work stays queued on this device — nothing is marked synced.", "error"); return; }
-      let problems = 0;
-      // 1) Register offline-created jobs under their stable local ids first,
-      //    so their queued events have a real server session to land on.
-      const regs = await loadPending<PendingReg>("pending-regs");
-      if (regs.length) {
-        const remaining: PendingReg[] = [];
-        for (const reg of regs) {
-          try { await api.post("/api/jobs", { id: reg.job_id, procedure_id: reg.procedure_id, procedure_version_id: reg.procedure_version_id }); }
-          catch { remaining.push(reg); problems++; }
-        }
-        await savePending("pending-regs", remaining);
-      }
-      // 1b) Upload job photos queued while offline, so their events can
-      // reference real server-side evidence in step 2 below.
-      const pendingPhotos = await loadPending<PendingPhoto>("pending-photos");
-      if (pendingPhotos.length) {
-        const remainingPhotos: PendingPhoto[] = [];
-        for (const ph of pendingPhotos) {
-          try {
-            const blob = await idb.get<Blob>("media", ph.key);
-            if (!blob) continue; // orphaned record: drop it
-            const fd = new FormData();
-            fd.append("file", blob, "job-photo.jpg");
-            fd.append("description", ph.description);
-            if (ph.step_id) fd.append("step_id", ph.step_id);
-            const up = await api.upload<{ id: string }>(`/api/jobs/${ph.job_id}/evidence`, fd);
-            await idb.del("media", ph.key);
-            const evid = uuid();
-            await idb.put("events", evid, { event_id: evid, session_id: ph.job_id, step_id: ph.step_id, event_type: "evidence_attached", payload: { evidence_id: up.id, description: ph.description }, occurred_at: new Date().toISOString(), sync_status: "pending" });
-            await refreshPending();
-          } catch { remainingPhotos.push(ph); problems++; }
-        }
-        await savePending("pending-photos", remainingPhotos);
-      }
-      // 2) Sync queued events (server acknowledges or reports duplicates).
-      const evs = (await idb.all<JobEventRec>("events")).filter((e) => e.sync_status === "pending");
-      if (evs.length) {
-        const res = await api.post<{ acknowledged: string[]; duplicates?: string[]; failed?: unknown[] }>("/api/sync/events", { events: evs });
-        problems += res.failed?.length || 0;
-        for (const id of [...(res.acknowledged || []), ...(res.duplicates || [])]) {
-          const row = evs.find((e) => e.event_id === id);
-          if (row) await idb.put("events", id, { ...row, sync_status: "synced" });
-        }
-      }
-      // 3) Push locally-finished states; the server finish is idempotent.
-      const finishes = await loadPending<PendingFinish>("pending-finishes");
-      if (finishes.length) {
-        const remaining: PendingFinish[] = [];
-        for (const f of finishes) {
-          try { await api.post(`/api/jobs/${f.job_id}/finish`, { outcome: f.outcome, reason: "", summary: "" }); }
-          catch { remaining.push(f); problems++; }
-        }
-        await savePending("pending-finishes", remaining);
-      }
-      setSyncState(problems ? "failed" : "idle");
-      if (problems) notify(`Synchronization incomplete: ${problems} item(s) were rejected or unreachable and remain queued on this device.`, "error");
-      else notify(evs.length || regs.length || finishes.length ? "Synchronization complete — the server confirmed your work." : "Nothing pending to synchronize.");
+      const res = await runSync();
+      if (!res.ran) { setSyncState("idle"); notify(res.message, "info"); return; }
+      setSyncState(res.problems || res.aborted ? "failed" : "idle");
+      notify(res.message, res.problems || res.aborted ? "error" : "ok");
       await refreshPending(); await loadLists();
     } catch (e) { setSyncState("failed"); notify(e instanceof Error ? e.message : "Sync failed", "error"); }
   }, [loadLists, notify, refreshPending]);
@@ -254,6 +200,15 @@ export default function App() {
       const v = await api.get<Version>(`/api/procedure-versions/${vid}`);
       await idb.put("versions", v.id, v);
       void refreshCached();
+      // Fetch an offline execution grant with each approved download: if
+      // this revision is later superseded, an offline-started job can still
+      // register against it. Best-effort — offline caching must not fail.
+      if (v.status === "approved") {
+        try {
+          const g = await api.post<{ offline_grant: string }>(`/api/procedure-versions/${vid}/offline-grant`, {});
+          if (g.offline_grant) await storeGrant(v.id, g.offline_grant);
+        } catch { /* grant refresh happens on next online open */ }
+      }
       return v;
     } catch {
       return (await idb.get<Version>("versions", vid)) || null;
@@ -292,7 +247,7 @@ export default function App() {
       registered = false;
       const regs = await loadPending<PendingReg>("pending-regs");
       if (!regs.some((r) => r.job_id === jobId)) {
-        regs.push({ job_id: jobId, procedure_id: p.id, procedure_version_id: v.id });
+        regs.push({ job_id: jobId, procedure_id: p.id, procedure_version_id: v.id, grant: await getStoredGrant(v.id) });
         await savePending("pending-regs", regs);
       }
       notify("Offline: this job is saved on this device under a stable id and will register with the server on sync.", "info");
@@ -666,12 +621,12 @@ function Activity({ jobs, pending, pendingReview, reload, go, syncNow, syncing, 
       <div className="card"><h2><Icon name="schedule" size={20} /> Activity</h2>
         <p>{pending} event(s) pending synchronization. Events are only marked synced after the server acknowledges them.</p>
         <div className="row">
-          <button className="btn" onClick={syncNow} disabled={syncing}><Icon name="sync" size={18} /> {syncing ? "Syncing…" : "Sync now"}</button>
           <button className="btn secondary" onClick={() => go("review")}><Icon name="flag" size={17} /> Review queue{pendingReview ? ` (${pendingReview})` : ""}</button>
           <button className="btn secondary" onClick={() => go("manuals")}><Icon name="book" size={17} /> Manuals</button>
           <button className="btn secondary" onClick={() => go("settings")}><Icon name="cog" size={17} /> Settings</button>
         </div>
       </div>
+      <SyncDiagnostics pending={pending} syncing={syncing} onSync={syncNow} onChanged={reload} notify={notify} />
       <History jobs={jobs} reload={reload} role={role} notify={notify} onProposeRevision={onProposeRevision} />
       <ProcessingLog />
     </div>
@@ -858,9 +813,14 @@ interface SegObject { object_id: number; bbox_norm: number[]; confidence?: numbe
 interface SegGeometry { bbox_norm: number[]; label: string; mask?: SegMask | null; objects?: SegObject[]; image_size?: number[] }
 
 function TutorialsView({ onOpenStudio, refreshKey }: { onOpenStudio: (t: LibraryItem) => void; refreshKey?: number }) {
-  // Single workflow: Record a tutorial. Quick capture and Live are gone
-  // from the UI; the server keeps its capture APIs for existing records.
+  // Two equal ways to create a tutorial — recording and uploading feed the
+  // same TutorialJob pipeline. Analysis mode is shared by both.
   const [showRecord, setShowRecord] = useState(true);
+  const [showUpload, setShowUpload] = useState(false);
+  const [mode, setMode] = useState<AnalysisMode>("auto");
+  const [libKey, setLibKey] = useState(0);
+  useEffect(() => { void requestPersistentStorage(); }, []);
+  useEffect(() => { setLibKey((n) => n + 1); }, [refreshKey]);
   return (
     <div>
       <span className="eyebrow">Knowledge capture</span>
@@ -876,11 +836,27 @@ function TutorialsView({ onOpenStudio, refreshKey }: { onOpenStudio: (t: Library
         </div>
         {showRecord && (
           <div style={{ marginTop: 10 }}>
-            <TutorialMode hideLibrary onOpenStudio={(t) => onOpenStudio({ id: t.id, access_token: t.access_token, title: t.title } as LibraryItem)} />
+            <ModeSelector mode={mode} onModeChange={setMode} />
+            <TutorialMode hideLibrary analysisMode={mode} onOpenStudio={(t) => onOpenStudio({ id: t.id, access_token: t.access_token, title: t.title } as LibraryItem)} />
           </div>
         )}
       </div>
-      <TutorialLibrary onOpen={onOpenStudio} refreshKey={refreshKey} />
+      <div className="card">
+        <div className="row" style={{ justifyContent: "space-between" }}>
+          <div>
+            <h3 style={{ margin: 0 }}>Upload an existing video</h3>
+            <p className="muted small-text" style={{ margin: "2px 0 0" }}>Already have the recording on this device? Upload it instead — same pipeline, same library.</p>
+          </div>
+          <button className="btn small secondary" aria-expanded={showUpload} onClick={() => setShowUpload((v) => !v)}>{showUpload ? "Hide upload" : "Upload existing video"}</button>
+        </div>
+        {showUpload && (
+          <div style={{ marginTop: 10 }}>
+            <TutorialUpload mode={mode} onModeChange={setMode} onOpenStudio={onOpenStudio} onUploaded={() => setLibKey((n) => n + 1)} />
+          </div>
+        )}
+      </div>
+      <QueuedUploads onChanged={() => setLibKey((n) => n + 1)} />
+      <TutorialLibrary onOpen={onOpenStudio} refreshKey={(refreshKey || 0) + libKey} />
     </div>
   );
 }

@@ -58,8 +58,8 @@ Visuals (VisualStudio improve/highlight/alternative/annotate with
 accept/reject and provenance).
 
 ```powershell
-cd backend; .\.venv\Scripts\python.exe -m pytest tests -q   # 71 passed, 1 skipped
-cd frontend; npm run test                                    # 62 passed
+cd backend; .\.venv\Scripts\python.exe -m pytest tests -q   # 92 passed, 1 skipped
+cd frontend; npm run test                                    # 85 passed
 ```
 
 Key suites: `test_canonical.py` (simulated end-to-end without network, correction propagation, regen/approval/pinning, fallback distinctness, intent shaping), `test_guides.py` (formats, versions, visuals), `test_observability.py`, `test_auth.py` (incl. media-gate exemptions), `test_tutorial.py`, `test_api.py`. CI (`.github/workflows/ci.yml`) runs backend tests, typecheck, frontend tests, and the production build.

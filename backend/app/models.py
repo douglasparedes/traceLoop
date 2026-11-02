@@ -315,6 +315,11 @@ class TutorialJob(Base):
     task_description: Mapped[str] = mapped_column(Text, default="")
     context_notes: Mapped[str] = mapped_column(Text, default="")
     content_revision: Mapped[int] = mapped_column(Integer, default=1)
+    input_mode: Mapped[str] = mapped_column(String, default="auto")  # auto|narrated|visual_first (requested)
+    analysis_strategy: Mapped[str] = mapped_column(String, default="")  # narrated|visual_first (decided)
+    strategy_reason: Mapped[str] = mapped_column(Text, default="")
+    origin: Mapped[str] = mapped_column(String, default="recorded")  # recorded|uploaded
+    keyframes: Mapped[list] = mapped_column(JSON, default=list)  # [{t, name}] sampled frames backing visual analysis
     status: Mapped[str] = mapped_column(String, default="uploaded")  # uploaded|transcribing|understanding|segmenting|illustrating|generating|done|error
     progress: Mapped[int] = mapped_column(Integer, default=0)
     error: Mapped[str] = mapped_column(Text, default="")

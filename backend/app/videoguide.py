@@ -10,6 +10,7 @@ Follows docs/remotion (remotion-saas skill): plain Node.js SSR via
 """
 import os
 import threading
+import uuid
 from pathlib import Path
 
 from sqlalchemy import select
@@ -39,7 +40,8 @@ def _check_video_quota(db, actor: str) -> None:
 
 
 def _video_paths(job_id: str) -> dict:
-    d = BASE / "data" / "tutorials" / job_id / "video"
+    from . import storage as _storage
+    d = _storage.media_root() / "tutorials" / job_id / "video"
     d.mkdir(parents=True, exist_ok=True)
     return {"dir": d, "voiceover": d / "voiceover.wav", "props": d / "props.json",
             "progress": d / "render-progress.json", "output": d / "guide-video-render.mp4"}
@@ -53,7 +55,11 @@ def cut_voiceover(job: M.TutorialJob, scenes: list[dict]) -> tuple[Path | None, 
     the original audio, never synthesized. A 0.4s silence tail pads each
     scene so captions don't clip.
     """
-    source = BASE / job.video_storage_key
+    from . import storage as _storage
+    try:
+        source = _storage.media_path(job.video_storage_key)
+    except ValueError:
+        return None, 0.0
     if not source.is_file():
         return None, 0.0
     total = sum(max(0.0, float(s.get("audio_end", 0)) - float(s.get("audio_start", 0))) for s in scenes)
@@ -101,7 +107,8 @@ def build_video_props(job: M.TutorialJob, scenes: list[dict], voiceover: Path | 
     network at render time. Missing visuals stay null and the composition
     renders a title-only scene instead of inventing imagery.
     """
-    job_dir = BASE / "data" / "tutorials" / job.id
+    from . import storage as _storage
+    job_dir = _storage.media_root() / "tutorials" / job.id
     fps = VIDEO_FPS
     frame = int(1.5 * fps)  # title card
     out_scenes = []
@@ -260,6 +267,16 @@ def start_video_guide(job_id: str, actor: str = "", force: bool = False, scenes:
         db2.close()
 
 
+def _next_video_filename(video_dir: Path, job_id: str) -> tuple[Path, str]:
+    """Unique per-version MP4 path. Timestamped for humans, with a random
+    suffix so two renders in the same second never share a filename — each
+    version keeps its own immutable MP4."""
+    import datetime as _dt
+    stamp = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%d%H%M%S")
+    unique = f"{stamp}-{_dt.datetime.now(_dt.timezone.utc).strftime('%f')}-{uuid.uuid4().hex[:8]}"
+    return video_dir / f"guide-video-{unique}.mp4", f"data/tutorials/{job_id}/video/guide-video-{unique}.mp4"
+
+
 def run_video_guide_job(vg_id: str) -> dict:
     """Background worker: plan scenes -> cut voiceover -> Remotion render -> asset."""
     from . import processing as proc
@@ -311,11 +328,8 @@ def run_video_guide_job(vg_id: str) -> dict:
         out = _render_video(paths["props"], paths)
         if out is None or not out.exists():
             raise RuntimeError("Video render produced no file.")
-        import datetime as _dt
-        stamp = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%d%H%M%S")
-        final = paths["dir"] / f"guide-video-{stamp}.mp4"
+        final, storage_key = _next_video_filename(paths["dir"], job.id)
         out.replace(final)
-        storage_key = f"data/tutorials/{job.id}/video/guide-video-{stamp}.mp4"
         a = M.VisualAsset(tutorial_id=job.id, parent_id="", kind="video_guide", status="review",
                           storage_key=storage_key, mime_type="video/mp4",
                           width=VIDEO_W, height=VIDEO_H,

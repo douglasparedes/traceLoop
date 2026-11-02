@@ -30,8 +30,8 @@ def _patch_pipeline(monkeypatch):
     monkeypatch.setattr(tutorial, "extract_audio_wav", lambda s, o: o.write_bytes(b"wav"))
     monkeypatch.setattr(tutorial, "make_tracking_copy", lambda s, o: (o.write_bytes(b"mp4"), {"width": 320, "height": 240})[1])
     monkeypatch.setattr(ai, "transcribe_timed", lambda fn, data, duration_sec=0: {
-        "text": "This is my flag. Hold it up.", "simulated": False,
-        "segments": [{"text": "This is my flag.", "start": 1.0, "end": 4.0}, {"text": "Hold it up.", "start": 4.0, "end": 8.0}]})
+        "text": "This is my flag. I hold it up high so you can see the whole component clearly while I explain each part of the repair task.", "simulated": False,
+        "segments": [{"text": "This is my flag. I hold it up high so you can see the whole component clearly.", "start": 1.0, "end": 4.0}, {"text": "I explain each part of the repair task as I show it.", "start": 4.0, "end": 8.0}]})
     monkeypatch.setattr(ai, "understand_tutorial", lambda segs, dur: {
         "objects": [{"label": "flag", "first_mentioned_at": 1.0, "obj_id": 1, "status": "pending", "confidence": None, "illustration": "", "overlay": "", "track": []}],
         "steps": [{"step_number": 1, "title": "Show the flag", "start": 0.0, "end": 8.0, "summary": "Hold the flag up.", "objects_used": [1]}],
@@ -218,14 +218,32 @@ def test_extract_audio_rejects_silent_video(tmp_path):
 
 
 def test_pipeline_fails_fast_on_silent_video(tmp_path):
-    # No pipeline mocks: the real probe finds no audio stream, so the job
-    # must fail with an actionable message (retrying can never succeed).
+    # No pipeline mocks: the real probe finds no audio stream. In narrated
+    # mode the job must fail with an actionable message (retrying a silent
+    # file can never succeed).
     silent = tmp_path / "silent.mp4"
     _make_fixture_video(silent, with_audio=False)
     up = c.post("/api/tutorial/start", files={"file": ("silent.mp4", silent.read_bytes(), "video/mp4")},
-                data={"title": "Silent test"}, headers=TECH)
+                data={"title": "Silent test", "mode": "narrated"}, headers=TECH)
     assert up.status_code == 200
     job = up.json()
     done = _wait_done(job["id"], job["access_token"])
     assert done["status"] == "error", done
     assert "no audio track" in (done.get("error") or "").lower()
+
+
+def test_pipeline_visual_first_on_silent_video(tmp_path):
+    # Same silent file in automatic mode: visual-first analysis instead of
+    # failure, with the strategy recorded in provenance.
+    silent = tmp_path / "silent2.mp4"
+    _make_fixture_video(silent, with_audio=False)
+    up = c.post("/api/tutorial/start", files={"file": ("silent2.mp4", silent.read_bytes(), "video/mp4")},
+                data={"title": "Silent visual test", "mode": "auto"}, headers=TECH)
+    assert up.status_code == 200
+    job = up.json()
+    assert job.get("input_mode") == "auto"
+    done = _wait_done(job["id"], job["access_token"])
+    assert done["status"] == "done", done
+    assert done.get("analysis_strategy") == "visual_first", done
+    assert "audio" in (done.get("strategy_reason") or "").lower()
+    assert done["full_transcript"] == ""

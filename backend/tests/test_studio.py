@@ -36,9 +36,8 @@ def _patch_pipeline(monkeypatch):
     monkeypatch.setattr(tutorial, "extract_audio_wav", lambda s, o: o.write_bytes(b"wav"))
     monkeypatch.setattr(tutorial, "make_tracking_copy", lambda s, o: (o.write_bytes(b"mp4"), {"width": 320, "height": 240})[1])
     monkeypatch.setattr(ai, "transcribe_timed", lambda fn, data, duration_sec=0: {
-        "text": "This is my flag. Hold it up.", "simulated": False,
-        "segments": [{"text": "This is my flag.", "start": 1.0, "end": 4.0},
-                     {"text": "Hold it up.", "start": 4.0, "end": 8.0}]})
+        "text": "This is my flag. I hold it up high so you can see the whole component clearly while I explain each part of the repair task.", "simulated": False,
+        "segments": [{"text": "This is my flag. I hold it up high so you can see the whole component clearly.", "start": 1.0, "end": 4.0}, {"text": "I explain each part of the repair task as I show it.", "start": 4.0, "end": 8.0}]})
     monkeypatch.setattr(ai, "understand_tutorial", lambda segs, dur: {
         "objects": [{"label": "flag", "first_mentioned_at": 1.0, "obj_id": 1, "status": "pending",
                      "confidence": None, "illustration": "", "overlay": "", "track": []}],
@@ -109,7 +108,7 @@ def test_content_save_revision_conflict_and_restore(monkeypatch):
     hdr = _hdr(job)
     got = c.get(f"/api/tutorial/{job['id']}/content", headers=hdr).json()
     assert got["content_revision"] >= 1
-    assert got["transcript_original"] == "This is my flag. Hold it up."  # AI original shown until corrected
+    assert got["transcript_original"].startswith("This is my flag. I hold it up high")  # AI original shown until corrected
     assert got["transcript_corrected"] == ""
     rev0 = got["content_revision"]
 
@@ -124,7 +123,7 @@ def test_content_save_revision_conflict_and_restore(monkeypatch):
 
     # Original transcription preserved separately; live transcript corrected.
     got2 = c.get(f"/api/tutorial/{job['id']}/content", headers=hdr).json()
-    assert got2["transcript_original"] == "This is my flag. Hold it up."
+    assert got2["transcript_original"].startswith("This is my flag. I hold it up high")
     assert got2["transcript_corrected"] == "This is my flag. Hold it up high."
     assert got2["steps"][0]["summary"] == "Hold the flag up high."
     assert got2["steps"][0]["step_number"] == 1

@@ -18,6 +18,9 @@ export interface LibraryItem {
   objects_total: number;
   objects_unresolved: number;
   has_guide: boolean;
+  input_mode?: string;
+  analysis_strategy?: string;
+  origin?: string;
 }
 
 function fmtDur(sec: number): string {
@@ -145,6 +148,8 @@ export default function TutorialLibrary({ onOpen, refreshKey }: {
             <span className="tut-row-meta">
               {statusBadge(t.status)}
               {t.objects_unresolved > 0 && <span className="tag warn">{t.objects_unresolved} need tap</span>}
+              {t.analysis_strategy === "visual_first" && <span className="tag ai" title="Understood from visual evidence; narration was absent or insufficient">visual-first</span>}
+              {t.origin === "uploaded" && <span className="tag" title="Created from an uploaded file rather than a fresh recording">upload</span>}
             </span>
             <span className="tut-row-actions">
               <button className="btn small" onClick={() => onOpen(t)}>Open</button>
