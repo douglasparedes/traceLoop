@@ -1,10 +1,10 @@
 import { useEffect, useRef, useState } from "react";
 import type { VideoGuide } from "./videoGuide";
-import { fetchVideoGuide, startVideoGuide, videoGuideFileUrl } from "./videoGuide";
+import { fetchVideoGuide, startVideoGuide, videoGuideVersionFileUrl } from "./videoGuide";
 
 /** Optional video guide: user-triggered MP4 cut from their own recorded narration. */
-export default function VideoGuidePanel({ tutorialId, token, jobDone }: {
-  tutorialId: string; token: string; jobDone: boolean;
+export default function VideoGuidePanel({ tutorialId, token, title, jobDone }: {
+  tutorialId: string; token: string; title?: string; jobDone: boolean;
 }) {
   const [guide, setGuide] = useState<VideoGuide | null>(null);
   const [busy, setBusy] = useState(false);
@@ -30,7 +30,7 @@ export default function VideoGuidePanel({ tutorialId, token, jobDone }: {
   }, [tutorialId]);
 
   useEffect(() => {
-    if (guide && (guide.status === "queued" || guide.status === "rendering")) {
+    if (guide && (guide.status === "queued" || guide.status === "rendering" || guide.status === "validating")) {
       if (timer.current === null) {
         timer.current = window.setInterval(() => { void refresh(); }, 3000);
       }
@@ -85,16 +85,21 @@ export default function VideoGuidePanel({ tutorialId, token, jobDone }: {
       )}
       {guide?.status === "ready" && (
         <div>
-          <video className="live-video" src={videoGuideFileUrl(tutorialId, token)} controls playsInline preload="metadata" aria-label="Generated video guide" />
+          <video className="live-video" src={videoGuideVersionFileUrl(tutorialId, guide.id, token)} controls playsInline preload="metadata" aria-label="Generated video guide" />
           <p className="muted small-text" style={{ marginTop: 6 }}>
             {guide.scenes.length} scene{guide.scenes.length === 1 ? "" : "s"} ·{" "}
             {guide.simulated ? <span className="tag warn">simulated plan (no Meta key)</span> : <span className="tag ai">Muse Spark plan</span>}{" "}
-            <span className="tag">original-voice cut</span>
+            {guide.provenance?.voiceover === "silent-captions-only"
+              ? <span className="tag">silent captioned video (no narration track)</span>
+              : <span className="tag">original-voice cut</span>}
             {typeof guide.provenance?.note === "string" && guide.provenance.note ? ` · ${guide.provenance.note}` : ""}
           </p>
+          {guide.staleness?.stale && (
+            <p className="notice warn" role="status">The guide changed since this video was rendered ({guide.staleness.changed.join(", ")}). Regenerate for an up-to-date video — this version stays available.</p>
+          )}
           <div className="row">
             <button className="btn small secondary" disabled={busy} onClick={() => void generate(true)}>Regenerate</button>
-            <a className="btn small secondary" href={videoGuideFileUrl(tutorialId, token)} download={`tutorial-guide.mp4`}>Download .mp4</a>
+            <a className="btn small secondary" href={videoGuideVersionFileUrl(tutorialId, guide.id, token)} download={`${(title || "tutorial-guide").replace(/[^\w\- ]+/g, "").trim() || "tutorial-guide"}-v${guide.version_number || ""}.mp4`}>Download .mp4</a>
           </div>
           <p className="muted small-text">Cached for offline viewing once played. Goes stale if the tutorial is re-recorded — regenerate to refresh.</p>
         </div>

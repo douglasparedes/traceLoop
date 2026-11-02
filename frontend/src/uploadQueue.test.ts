@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { validateTutorialFile, queueTutorialUpload, listQueuedUploads, removeQueuedUpload, parseUploadResponse, parseApiJson, sha256Hex, runQueuedUpload, CHUNK_BYTES, MAX_TUTORIAL_BYTES } from "./uploadQueue";
+import { validateTutorialFile, queueTutorialUpload, listQueuedUploads, removeQueuedUpload, parseUploadResponse, parseApiJson, sha256Hex, runQueuedUpload, findReusableUpload, refreshQueuedUpload, CHUNK_BYTES, MAX_TUTORIAL_BYTES } from "./uploadQueue";
 
 vi.mock("./db", () => {
   const stores = new Map<string, Map<string, unknown>>();
@@ -228,5 +228,32 @@ describe("chunked resume", () => {
     const entry = await queueTutorialUpload({ blob, filename: "c.mp4", title: "C", mode: "auto", origin: "recorded" });
     await expect(runQueuedUpload(entry, () => undefined, { cancelled: true })).rejects.toThrow(/cancelled/i);
     expect(await listQueuedUploads()).toHaveLength(1);
+  });
+});
+
+describe("retry reuse (no duplicate queue entries)", () => {
+  it("refreshes metadata in place instead of queueing again", async () => {
+    const blob = new Blob([new Uint8Array(2048)], { type: "video/mp4" });
+    const first = await queueTutorialUpload({ blob, filename: "r.mp4", title: "Old title", mode: "auto", origin: "uploaded" });
+    const updated = await refreshQueuedUpload(first.key, { title: "New title", mode: "narrated" as const });
+    expect(updated).not.toBeNull();
+    expect(updated!.title).toBe("New title");
+    expect(updated!.mode).toBe("narrated");
+    expect(updated!.uploadId).toBe(first.uploadId);
+    expect(await listQueuedUploads()).toHaveLength(1);
+  });
+
+  it("returns null for a missing key", async () => {
+    expect(await refreshQueuedUpload("nope", { title: "X" })).toBeNull();
+  });
+
+  it("finds the reusable entry only for the same key and size", async () => {
+    const blob = new Blob([new Uint8Array(512)], { type: "video/mp4" });
+    const entry = await queueTutorialUpload({ blob, filename: "s.mp4", title: "S", mode: "auto", origin: "uploaded" });
+    const all = await listQueuedUploads();
+    expect(findReusableUpload(all, entry.key, 512)).not.toBeNull();
+    expect(findReusableUpload(all, entry.key, 999)).toBeNull();
+    expect(findReusableUpload(all, "other-key", 512)).toBeNull();
+    expect(findReusableUpload(all, null, 512)).toBeNull();
   });
 });

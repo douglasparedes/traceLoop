@@ -114,6 +114,20 @@ async function patchQueuedUpload(key: string, patch: Partial<QueuedTutorialUploa
   await idb.put("meta", PENDING_TUTORIAL_UPLOADS, all.map((e) => (e.key === key ? { ...e, ...patch } : e)));
 }
 
+/** Refresh an existing queue entry's metadata in place (title, notes,
+ *  mode, …) without creating a new entry, blob, or server session.
+ *  Returns the updated entry, or null when the key is gone. */
+export async function refreshQueuedUpload(key: string, fields: {
+  title?: string; equipment?: string; task?: string; notes?: string; mode?: AnalysisMode;
+}): Promise<QueuedTutorialUpload | null> {
+  const all = await listQueuedUploads();
+  const cur = all.find((e) => e.key === key);
+  if (!cur) return null;
+  const next = { ...cur, ...fields };
+  await idb.put("meta", PENDING_TUTORIAL_UPLOADS, all.map((e) => (e.key === key ? next : e)));
+  return next;
+}
+
 export async function removeQueuedUpload(key: string): Promise<void> {
   await idb.del("media", key);
   const all = await listQueuedUploads();
@@ -185,6 +199,14 @@ async function apiJson<T>(path: string, init: RequestInit): Promise<T> {
   let ct: string | null = null;
   try { ct = res.headers.get("Content-Type"); } catch { /* noop */ }
   return parseApiJson<T>(res.status, text, ct);
+}
+
+/** Find the queue entry a retry should resume: same key and same file
+ *  size (guards against reusing a stale entry after picking a new file).
+ *  Returns null when a fresh queue entry must be created. */
+export function findReusableUpload(entries: QueuedTutorialUpload[], key: string | null, size: number): QueuedTutorialUpload | null {
+  if (!key) return null;
+  return entries.find((e) => e.key === key && e.size === size) || null;
 }
 
 /** Incremental SHA-256 over Blob slices, so even a 300 MB file is never

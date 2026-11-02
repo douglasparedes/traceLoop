@@ -108,3 +108,52 @@ def test_suggest_plan_unit_no_steps():
         assert "No guide steps" in str(e)
     else:
         raise AssertionError("expected ValueError for a job with no steps")
+
+
+def test_plan_prefers_accepted_visuals_offline():
+    """Guide-aware fallback: accepted visuals win, guide shapes the note."""
+    from app import ai
+    steps = [{"step_number": 1, "title": "Turn the knob", "start": 0.0, "end": 2.0,
+              "summary": "Turn it clockwise.", "objects_used": [1]}]
+    objects = [{"obj_id": 1, "label": "knob", "overlay": "obj-1-overlay.png"}]
+    acc = [{"label": "knob close-up", "name": "abc123.png", "asset_id": "a1", "kind": "enhanced"}]
+    plan = ai.plan_video_scenes("T", steps, objects, [],
+                                guide_markdown="# T\n\nTurn the knob, then check.\n",
+                                guide_format="work_instruction", accepted_visuals=acc)
+    assert plan["simulated"] is True
+    assert "guide" in (plan.get("note") or "").lower()
+    sc = plan["scenes"][0]
+    assert sc["visual"] and sc["visual"]["name"] == "abc123.png"
+    assert sc["visual"]["kind"] == "accepted"
+
+
+def test_build_video_props_timing_contract():
+    """Timing contract the Remotion composition relies on.
+    First scene starts exactly at the title-card end (1.5s @ VIDEO_FPS);
+    scenes are contiguous; totalFrames covers the last scene + tail.
+    The voiceover Sequence in ProcedureVideo.tsx starts at the same
+    title offset, so narration can never drift under the title card.
+    """
+    job_scenes = [
+        {"step_number": 1, "title": "A", "caption": "a",
+         "audio_start": 0.0, "audio_end": 2.0, "visual": {}},
+        {"step_number": 2, "title": "B", "caption": "b",
+         "audio_start": 2.0, "audio_end": 5.0, "visual": {}},
+    ]
+
+    class _Job:
+        id = "timing-job"
+        title = "Timing"
+
+    props = ai.plan_video_scenes("Timing", job_scenes, [], [])  # planner shape check
+    assert props["scenes"]
+    from app import videoguide as _vg
+    out = _vg.build_video_props(_Job(), job_scenes, None, 0.0)
+    fps = _vg.VIDEO_FPS
+    assert out["fps"] == fps
+    first = out["scenes"][0]
+    assert first["startFrame"] == round(1.5 * fps) == 45
+    for prev, nxt in zip(out["scenes"], out["scenes"][1:]):
+        assert nxt["startFrame"] == prev["startFrame"] + prev["durationFrames"]
+    last = out["scenes"][-1]
+    assert out["totalFrames"] == last["startFrame"] + last["durationFrames"] + round(0.5 * fps)

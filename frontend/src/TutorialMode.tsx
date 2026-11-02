@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { authHeaders, authPost, getIdentity } from "./api";
-import { checkStorageFor, queueTutorialUpload, runQueuedUpload, type AnalysisMode } from "./uploadQueue";
+import { checkStorageFor, queueTutorialUpload, runQueuedUpload, listQueuedUploads, refreshQueuedUpload, findReusableUpload, type AnalysisMode } from "./uploadQueue";
 import { listCameras, setPreferredCameraId, getPreferredCameraId, type CameraDevice } from "./camera";
 import { STATUS_LABELS, TUTORIAL } from "./museTutorialConfig";
 
@@ -334,7 +334,8 @@ export default function TutorialMode({ onOpenReview, onOpenStudio, hideLibrary, 
     const stream = streamRef.current;
     if (!stream) { setStatus("Open the camera first."); return; }
     const liveAudio = stream.getAudioTracks().filter((t) => t.readyState === "live");
-    if (liveAudio.length === 0) {
+    const visualOnly = modeRef.current === "visual_first";
+    if (liveAudio.length === 0 && !visualOnly) {
       setStatus("Cannot record: this camera stream has no live microphone track. Reopen the camera and allow the microphone — a tutorial without narration cannot be transcribed.");
       return;
     }
@@ -343,7 +344,9 @@ export default function TutorialMode({ onOpenReview, onOpenStudio, hideLibrary, 
     const rec = mime ? new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: 2_500_000 }) : new MediaRecorder(stream);
     chunksRef.current = [];
     peakRef.current = 0; setMicLevel(0);
-    setAudioInfo({ tracks: liveAudio.length, muted: liveAudio.every((t) => t.muted), silent: false, mime: rec.mimeType || mime || "browser default" });
+    setAudioInfo(liveAudio.length === 0
+      ? { tracks: 0, muted: false, silent: true, mime: rec.mimeType || mime || "browser default" }
+      : { tracks: liveAudio.length, muted: liveAudio.every((t) => t.muted), silent: false, mime: rec.mimeType || mime || "browser default" });
     try {
       audioCtxRef.current?.close().catch(() => undefined);
       const Ctx = window.AudioContext || (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
@@ -373,7 +376,9 @@ export default function TutorialMode({ onOpenReview, onOpenStudio, hideLibrary, 
     setElapsed(0);
     rec.start(1000);
     setRecording(true);
-    setStatus("Recording… narrate each step and show each object. Say “this is my …” as you show it.");
+    setStatus(visualOnly
+      ? "Recording video without microphone audio — show each action clearly; Visual-First analysis needs no narration."
+      : "Recording… narrate each step and show each object. Say “this is my …” as you show it.");
   }
 
   function stopRecording() {
@@ -397,11 +402,24 @@ export default function TutorialMode({ onOpenReview, onOpenStudio, hideLibrary, 
       const store = await checkStorageFor(blob.size);
       if (!store.ok) throw new Error(store.message);
       // Queue first: the blob survives reloads until the server confirms.
-      const queued = await queueTutorialUpload({
-        blob,
-        filename: isMp4 ? "tutorial.mp4" : "tutorial.webm",
-        title: titleRef.current, mode: modeRef.current, origin: "recorded",
-      });
+      // On retry, reuse the same entry so the server session resumes and no
+      // duplicate TutorialJob is created for the same recording.
+      let queued = null as Awaited<ReturnType<typeof queueTutorialUpload>> | null;
+      if (queuedKeyRef.current) {
+        const existing = findReusableUpload(await listQueuedUploads(), queuedKeyRef.current, blob.size);
+        if (existing) {
+          queued = await refreshQueuedUpload(existing.key, {
+            title: titleRef.current, mode: modeRef.current,
+          });
+        }
+      }
+      if (!queued) {
+        queued = await queueTutorialUpload({
+          blob,
+          filename: isMp4 ? "tutorial.mp4" : "tutorial.webm",
+          title: titleRef.current, mode: modeRef.current, origin: "recorded",
+        });
+      }
       queuedKeyRef.current = queued.key;
       const body = await runQueuedUpload(queued, setUploadPct, cancelRef.current);
       uploadingRef.current = false;
@@ -564,7 +582,9 @@ export default function TutorialMode({ onOpenReview, onOpenStudio, hideLibrary, 
             </div>
           )}
           {audioInfo && audioInfo.tracks === 0 && !recording && (
-            <p className="notice warn" role="alert" style={{ marginTop: 8 }}>No microphone track in this camera stream. Recording is blocked until the microphone is allowed — a silent video cannot be transcribed.</p>
+            modeRef.current === "visual_first"
+              ? <p className="notice info" role="status" style={{ marginTop: 8 }}>No microphone track in this stream. Visual-First analysis does not need narration — you can record actions silently.</p>
+              : <p className="notice warn" role="alert" style={{ marginTop: 8 }}>No microphone track in this camera stream. Recording is blocked until the microphone is allowed — a silent video cannot be transcribed. (Switch to Visual-First to record actions without narration.)</p>
           )}
           <div className="row" style={{ marginTop: 10 }}>
             <button className="btn secondary" onClick={() => void openCamera()}>Open camera</button>
@@ -620,9 +640,14 @@ export default function TutorialMode({ onOpenReview, onOpenStudio, hideLibrary, 
               {audioInfo.muted ? " · microphone reports muted" : ""} · {audioInfo.silent ? "no audible speech detected" : "speech detected"}.
             </p>
           )}
-          {audioInfo?.silent && (
-            <div className="notice warn" role="alert">
-              <strong>No audible speech was detected in this recording.</strong> If you narrated, your microphone may be muted at the OS level or another app may hold it. Uploading a silent video will fail transcription — consider recording again.
+          {audioInfo?.silent && modeRef.current === "narrated" && (
+            <div className="notice error" role="alert">
+              <strong>No audible speech was detected in this recording.</strong> Narrated mode requires usable speech — check the microphone is on at the OS/browser level, or switch to Automatic or Visual-First.
+            </div>
+          )}
+          {audioInfo?.silent && modeRef.current === "auto" && (
+            <div className="notice warn" role="status">
+              <strong>No audible speech was detected.</strong> Automatic mode will fall back to visual-first analysis if transcription finds nothing usable.
             </div>
           )}
           <label htmlFor="tut-title2">Tutorial title</label>
@@ -786,7 +811,7 @@ export default function TutorialMode({ onOpenReview, onOpenStudio, hideLibrary, 
                 );
               })}
               <div className="card"><Markdown text={job.guide_markdown} resolveImage={resolveMdImage} /></div>
-              <VideoGuidePanel tutorialId={job.id} token={job.access_token} jobDone={job.status === "done"} />
+              <VideoGuidePanel tutorialId={job.id} token={job.access_token} title={job.title} jobDone={job.status === "done"} />
               <div className="row" style={{ marginTop: 8 }}>
                 <button className="btn small secondary" onClick={async () => {
                   try {

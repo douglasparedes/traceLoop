@@ -1,290 +1,179 @@
-// Video Studio: scene-level editing for generated video guides.
-// Every render creates a NEW persistent MP4 version — prior versions stay
-// available. Captions are presentation text; the voiceover is always a cut
-// of the user's own original recording (never synthesized).
-import { useCallback, useEffect, useRef, useState } from "react";
-import type { StudioScene, StudioVideoVersion } from "./studioApi";
-import { fetchSuggestedScenes, fetchVideoVersions, renderScenePlan, saveScenePlan, sceneRange, sceneStep, videoVersionFileUrl } from "./studioApi";
+// Video Studio: one-click automatic video guide generation.
+//
+// One action — "Generate video guide". The server composes the video from
+// the current guide (Muse Spark composition, deterministic fallback
+// offline), cuts the voiceover from the user's own recording (silent
+// tutorials render as captioned videos), renders with Remotion, validates
+// the MP4, and persists it as a new immutable version. There is no scene
+// editor here: scenes stay internal to the render pipeline (backend
+// provenance + diagnostics), and every render creates a new version —
+// prior MP4s are never overwritten.
+import { useCallback, useEffect, useState } from "react";
+import type { StudioVideoVersion } from "./studioApi";
+import { fetchVideoLimits, fetchVideoVersions, startVideoGuide, videoVersionFileUrl } from "./studioApi";
+import { fetchVisuals } from "./guideFormats";
 
-function fmtT(sec: number): string {
+const STATUS_LABEL: Record<string, string> = {
+  queued: "Queued — waiting for a render worker",
+  rendering: "Rendering — composing scenes and cutting voiceover",
+  validating: "Validating — checking the rendered MP4",
+};
+
+const FORMAT_NAMES: Record<string, string> = {
+  work_instruction: "Illustrated Work Instruction",
+  reference_manual: "Reference Manual",
+  interactive: "Interactive Guided Execution",
+};
+
+function fmtClock(sec: number): string {
   if (!isFinite(sec) || sec < 0) return "0:00";
   const m = Math.floor(sec / 60);
   const s = Math.floor(sec % 60);
   return `${m}:${String(s).padStart(2, "0")}`;
 }
 
-export default function VideoStudio({ tutorialId, token, durationSec, visuals, jobDone, onChanged }: {
+function voiceLabel(v: StudioVideoVersion): string {
+  return v.provenance?.voiceover === "silent-captions-only"
+    ? "silent captioned video (no narration track)"
+    : "original-voice cut";
+}
+
+export default function VideoStudio({ tutorialId, token, title, durationSec, jobDone, guide, onChanged }: {
   tutorialId: string;
   token: string;
+  title: string;
   durationSec: number;
-  visuals: { name: string; label: string }[];
   jobDone: boolean;
+  guide: { format: string; steps: number; hasTranscript: boolean; contentRevision: number };
   onChanged: () => void;
 }) {
   const [versions, setVersions] = useState<StudioVideoVersion[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [scenes, setScenes] = useState<StudioScene[]>([]);
-  const [baseVersionId, setBaseVersionId] = useState<string | null>(null);
+  const [acceptedCount, setAcceptedCount] = useState(0);
+  const [maxGuideSec, setMaxGuideSec] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
   const [note, setNote] = useState("");
   const [busy, setBusy] = useState(false);
-  const [dirty, setDirty] = useState(false);
-  const [selScene, setSelScene] = useState(0);
-  const [suggestBusy, setSuggestBusy] = useState(false);
-  const suggestTriedRef = useRef(false);
 
-  const load = useCallback(async () => {
-    setLoading(true);
+  const load = useCallback(async (selectLatest = false) => {
     setError("");
     try {
-      const vers = await fetchVideoVersions(tutorialId, token);
+      const [vers, visuals, limits] = await Promise.all([
+        fetchVideoVersions(tutorialId, token),
+        fetchVisuals(tutorialId, token).catch(() => []),
+        fetchVideoLimits(tutorialId, token).catch(() => null),
+      ]);
       setVersions(vers);
+      setAcceptedCount(visuals.filter((v) => v.status === "accepted").length);
+      if (limits) setMaxGuideSec(limits.max_video_guide_sec);
       const ready = vers.filter((v) => v.status === "ready");
       const latest = ready.length ? ready[ready.length - 1] : vers.length ? vers[vers.length - 1] : null;
-      if (latest) {
-        setSelectedId((cur) => cur || latest.id);
-        if (!dirty) {
-          setScenes((latest.scenes || []).map((s, i) => ({ ...s, include: s.include !== false, step: sceneStep(s, i + 1) })));
-          setBaseVersionId(latest.id);
-          setSelScene(0);
-        }
-      }
+      if (latest && (selectLatest || !selectedId)) setSelectedId(latest.id);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Video history unavailable");
     } finally {
       setLoading(false);
     }
-  }, [tutorialId, token, dirty]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tutorialId, token]);
 
   useEffect(() => { void load(); }, [load]);
+
+  const working = versions.some((v) => v.status === "queued" || v.status === "rendering" || v.status === "validating");
+
   useEffect(() => {
-    if (!versions.length) return;
+    if (!working) return;
     const t = window.setInterval(async () => {
       try {
         const vers = await fetchVideoVersions(tutorialId, token);
         setVersions(vers);
-        if (vers.some((v) => v.status === "queued" || v.status === "rendering")) return;
-        window.clearInterval(t);
-        onChanged();
+        if (!vers.some((v) => v.status === "queued" || v.status === "rendering" || v.status === "validating")) {
+          window.clearInterval(t);
+          setSelectedId((cur) => {
+            if (cur) return cur;
+            const ready = vers.filter((v) => v.status === "ready");
+            return (ready.length ? ready[ready.length - 1] : vers[vers.length - 1])?.id || null;
+          });
+          onChanged();
+        }
       } catch { window.clearInterval(t); }
     }, 3000);
     return () => window.clearInterval(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [versions.some((v) => v.status === "queued" || v.status === "rendering")]);
+  }, [working, tutorialId, token]);
 
-  const selected = versions.find((v) => v.id === selectedId) || null;
-  const working = versions.some((v) => v.status === "queued" || v.status === "rendering") || busy;
-
-  function patchScene(i: number, patch: Partial<StudioScene>) {
-    setScenes((cur) => cur.map((s, j) => (j === i ? { ...s, ...patch } : s)));
-    setDirty(true);
-  }
-
-  function moveScene(i: number, dir: -1 | 1) {
-    const j = i + dir;
-    if (j < 0 || j >= scenes.length) return;
-    setScenes((cur) => {
-      const next = [...cur];
-      [next[i], next[j]] = [next[j], next[i]];
-      return next.map((s, k) => ({ ...s, step: k + 1 }));
-    });
-    setSelScene(j);
-    setDirty(true);
-  }
-
-  function addScene() {
-    const lastEnd = scenes.length ? Number(scenes[scenes.length - 1].audio_end ?? scenes[scenes.length - 1].end ?? 0) || 0 : 0;
-    const end = durationSec > 0 ? Math.min(durationSec, lastEnd + 5) : lastEnd + 5;
-    setScenes((cur) => [...cur, {
-      step: cur.length + 1, title: `New scene ${cur.length + 1}`, caption: "",
-      audio_start: Math.max(0, lastEnd), audio_end: Math.max(Math.max(0, lastEnd) + 1, end),
-      visual: {}, include: true,
-    }]);
-    setSelScene(scenes.length);
-    setDirty(true);
-  }
-
-  async function savePlan() {
-    if (busy) return;
+  async function generate(regenerate = false) {
+    if (busy || !jobDone) return;
     setBusy(true);
     setError("");
     setNote("");
     try {
-      const r = await saveScenePlan(tutorialId, token, scenes);
-      setScenes(r.scenes);
-      setDirty(false);
-      setBaseVersionId(r.video_guide_id);
-      setNote("Scene plan saved. Render to produce a new MP4 version — nothing rendered yet.");
-      await load();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : "Could not save the scene plan");
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function render() {
-    if (busy) return;
-    setBusy(true);
-    setError("");
-    setNote("");
-    try {
-      const r = await renderScenePlan(tutorialId, token, dirty ? scenes : undefined);
+      const r = await startVideoGuide(tutorialId, token, regenerate);
       setSelectedId(r.video_guide.id);
-      setDirty(false);
-      setBaseVersionId(r.video_guide.id);
-      setNote(r.duplicate ? "This exact plan already rendered — showing the existing version." : "Render queued. This tab polls every few seconds; you can leave — the video persists.");
+      setNote(r.duplicate
+        ? "This exact guide revision already has a video — showing the existing version instead of rendering a duplicate."
+        : "Render started. This tab polls every few seconds; you can leave — the video persists.");
       await load();
       onChanged();
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Could not start the render");
+      setError(e instanceof Error ? e.message : "Could not start video generation");
     } finally {
       setBusy(false);
     }
   }
 
-  const active = scenes[selScene];
+  const selected = versions.find((v) => v.id === selectedId) || null;
   const readyVersions = versions.filter((v) => v.status === "ready");
-
-  /** AI-planned initial scenes from the processed tutorial content (steps,
-   *  transcript, illustrations). Read-only on the server: review the plan
-   *  here, then Save + Render as usual — the Remotion render is unchanged. */
-  async function suggestScenes(auto = false) {
-    if (suggestBusy || !jobDone) return;
-    if (!auto && scenes.length > 0 && !window.confirm("Replace the current scene plan with a fresh AI-planned one? Unsaved edits will be lost.")) return;
-    setSuggestBusy(true);
-    if (!auto) { setError(""); setNote(""); }
-    try {
-      const plan = await fetchSuggestedScenes(tutorialId, token);
-      setScenes(plan.scenes.map((s, i) => ({ ...s, include: s.include !== false, step: sceneStep(s, i + 1) })));
-      setSelScene(0);
-      setDirty(true);
-      setNote(plan.note || (plan.simulated
-        ? `Deterministic scene plan from your guide steps (no live AI). Review, then Render.`
-        : `AI-planned ${plan.scenes.length} scenes from your processed tutorial. Review, then Render.`));
-    } catch (e) {
-      if (!auto) setError(e instanceof Error ? e.message : "Could not suggest scenes");
-      else setNote("Could not auto-plan scenes — generate them below or add the first scene manually.");
-    } finally {
-      setSuggestBusy(false);
-    }
-  }
-
-  // First open of a finished tutorial with no versions yet: the scenes
-  // should already exist from the processed content, so auto-plan once
-  // instead of asking the user to hand-build what the pipeline knows.
-  useEffect(() => { suggestTriedRef.current = false; }, [tutorialId]);
-  useEffect(() => {
-    if (!loading && jobDone && versions.length === 0 && scenes.length === 0 && !suggestTriedRef.current) {
-      suggestTriedRef.current = true;
-      void suggestScenes(true);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [loading, jobDone, versions.length, scenes.length]);
+  const overLimit = maxGuideSec != null && durationSec > maxGuideSec;
 
   return (
     <div>
       <h3 style={{ marginTop: 0 }}>Video</h3>
       <p className="muted small-text">
-        Edit the scene plan, then render a <strong>new</strong> MP4 version. Earlier versions stay available below.
-        The voiceover is always cut from your original recording — changing a caption never changes the narration.
+        One action: <strong>Generate video guide</strong>. The video is composed from your current guide,
+        narrated with your original recording (silent tutorials render caption-led), and every render
+        creates a new immutable version.
       </p>
       {error && <div className="notice error" role="alert">{error}</div>}
       {note && <div className="notice ok" role="status">{note}</div>}
       {loading && <div className="card" aria-label="Loading video history"><div className="skeleton" /><div className="skeleton" /></div>}
 
-      {!loading && versions.length === 0 && scenes.length === 0 && (
-        <div className="card"><div className="empty">
-          <p><strong>{suggestBusy ? "Planning scenes from your guide…" : "No video version yet"}</strong></p>
-          <p>{suggestBusy
-            ? "Reading your steps, transcript, and illustrations — one scene per step."
-            : jobDone ? "Generate the scene plan from your processed tutorial, or build it by hand." : "Video editing unlocks once the tutorial finishes processing."}</p>
-          {jobDone && !suggestBusy && (
-            <div className="row" style={{ justifyContent: "center", marginTop: 8 }}>
-              <button className="btn" onClick={() => void suggestScenes(false)}>Generate scenes with AI</button>
-              <button className="btn secondary" onClick={addScene}>Add first scene</button>
-            </div>
+      {!loading && (
+        <div className="card">
+          <h4 style={{ marginTop: 0 }}>What the next video is built from</h4>
+          <ul className="small-text" style={{ margin: "6px 0", paddingLeft: 18 }}>
+            <li>Guide: {guide.format ? FORMAT_NAMES[guide.format] || guide.format : "not generated yet"} · {guide.steps} step{guide.steps === 1 ? "" : "s"} · content rev {guide.contentRevision}</li>
+            <li>Narration: {guide.hasTranscript ? "original recording available — voiceover cut from your audio" : "no narration — silent captioned video"}</li>
+            <li>Accepted visuals available to the composition: {acceptedCount}</li>
+            <li>Source recording: {fmtClock(durationSec || 0)} total{maxGuideSec != null && ` · videos support up to ${Math.round(maxGuideSec / 60)} min`}</li>
+          </ul>
+          {overLimit && (
+            <p className="notice warn" role="status" style={{ marginBottom: 0 }}>
+              This recording is longer than the supported video length ({Math.round((maxGuideSec || 0) / 60)} min).
+              Generation will be refused — trim the source or split the tutorial first.
+            </p>
           )}
-        </div></div>
+          <div className="row" style={{ marginTop: 10 }}>
+            <button className="btn" onClick={() => void generate(readyVersions.length > 0)} disabled={busy || !jobDone || working || overLimit}>
+              {busy ? "Starting…" : readyVersions.length ? "Generate new version" : "Generate video guide"}
+            </button>
+            {!jobDone && <span className="muted small-text" role="status">Generation unlocks once the tutorial finishes processing.</span>}
+          </div>
+        </div>
       )}
 
-      {(scenes.length > 0 || jobDone) && (
-        <div className="studio-grid">
-          <div className="card" style={{ margin: 0 }}>
-            <div className="row" style={{ justifyContent: "space-between" }}>
-              <strong>Scenes ({scenes.length})</strong>
-              <span className="row">
-                <button className="btn small secondary" onClick={() => void suggestScenes(false)} disabled={!jobDone || busy || suggestBusy}>{suggestBusy ? "Planning…" : "Generate scenes with AI"}</button>
-                <button className="btn small secondary" onClick={addScene} disabled={!jobDone}>Add scene</button>
-              </span>
-            </div>
-            {scenes.length === 0 && <p className="muted small-text">No scenes yet — add the first one to describe the opening of the recording.</p>}
-            <ol className="scene-list">
-              {scenes.map((s, i) => {
-                const { start, end } = sceneRange(s);
-                return (
-                  <li key={i}>
-                    <button className="scene-row" aria-pressed={selScene === i} onClick={() => setSelScene(i)}>
-                      <span className="scene-num num">{i + 1}</span>
-                      <span className="scene-main">
-                        <strong>{s.title || `Scene ${i + 1}`}</strong>
-                        <span className="muted small-text num">{fmtT(start)}–{fmtT(end)}{s.include === false ? " · excluded" : ""}</span>
-                      </span>
-                      {s.include === false && <span className="tag warn">out</span>}
-                    </button>
-                  </li>
-                );
-              })}
-            </ol>
-            <div className="row" style={{ marginTop: 10 }}>
-              <button className="btn" onClick={() => void savePlan()} disabled={busy || !dirty || scenes.length === 0}>
-                {busy ? "Working…" : "Save scene plan"}
-              </button>
-              <button className="btn secondary" onClick={() => void render()} disabled={busy || scenes.length === 0 || !jobDone}>
-                Render new MP4
-              </button>
-            </div>
-            {dirty && <p className="muted small-text" role="status">Unsaved scene changes{baseVersionId ? " — based on a saved plan" : ""}.</p>}
-            {!dirty && baseVersionId && <p className="muted small-text">Plan matches the saved draft. Render produces version {readyVersions.length + 1}.</p>}
-          </div>
-
-          <div className="card" style={{ margin: 0 }}>
-            {active ? (
-              <div>
-                <div className="row" style={{ justifyContent: "space-between" }}>
-                  <strong>Scene {selScene + 1}</strong>
-                  <span className="row">
-                    <button className="btn small secondary icon-only" aria-label="Move scene earlier" disabled={selScene === 0} onClick={() => moveScene(selScene, -1)}>↑</button>
-                    <button className="btn small secondary icon-only" aria-label="Move scene later" disabled={selScene === scenes.length - 1} onClick={() => moveScene(selScene, 1)}>↓</button>
-                  </span>
-                </div>
-                <label htmlFor="vs-title">Title<input id="vs-title" value={active.title} onChange={(e) => patchScene(selScene, { title: e.target.value })} maxLength={200} /></label>
-                <label htmlFor="vs-caption">On-screen caption<textarea id="vs-caption" rows={2} value={active.caption} onChange={(e) => patchScene(selScene, { caption: e.target.value })} maxLength={2000} placeholder="Short caption shown on the step card. Does not change the spoken narration." /></label>
-                <div className="grid" style={{ gridTemplateColumns: "1fr 1fr" }}>
-                  <label htmlFor="vs-start">Audio in-point (sec)<input id="vs-start" type="number" min={0} max={durationSec || undefined} step={0.5} value={Number(active.audio_start ?? active.start ?? 0)} onChange={(e) => patchScene(selScene, { audio_start: Number(e.target.value) })} /></label>
-                  <label htmlFor="vs-end">Audio out-point (sec)<input id="vs-end" type="number" min={0} max={durationSec || undefined} step={0.5} value={Number(active.audio_end ?? active.end ?? 0)} onChange={(e) => patchScene(selScene, { audio_end: Number(e.target.value) })} /></label>
-                </div>
-                <p className="muted small-text num">Source recording: {fmtT(durationSec || 0)} total. Ranges must stay inside it and end after they start.</p>
-                <label htmlFor="vs-visual">Scene image
-                  <select id="vs-visual" value={(active.visual || {}).name || ""} onChange={(e) => patchScene(selScene, { visual: e.target.value ? { name: e.target.value } : {} })}>
-                    <option value="">Title-only scene (no image)</option>
-                    {visuals.map((v) => <option key={v.name} value={v.name}>{v.label}</option>)}
-                  </select>
-                </label>
-                <label className="check-row" htmlFor="vs-include">
-                  <input id="vs-include" type="checkbox" checked={active.include !== false} onChange={(e) => patchScene(selScene, { include: e.target.checked })} />
-                  Include this scene in the render
-                </label>
-                <button className="btn small secondary danger-ghost" onClick={() => {
-                  setScenes((cur) => cur.filter((_, j) => j !== selScene).map((s, k) => ({ ...s, step: k + 1 })));
-                  setSelScene((n) => Math.max(0, n - 1));
-                  setDirty(true);
-                }}>Remove scene</button>
-              </div>
-            ) : (
-              <div className="empty">Select a scene to edit it.</div>
-            )}
+      {working && (
+        <div className="card" role="status" aria-label="Render in progress">
+          <p style={{ marginTop: 0 }}><span className="spinner" aria-hidden="true" /> {(() => {
+            const active = versions.find((v) => v.status === "queued" || v.status === "rendering" || v.status === "validating");
+            const label = active ? STATUS_LABEL[active.status] || active.status : "Working";
+            return `${label}${active ? ` · ${active.progress}%` : ""}`;
+          })()}</p>
+          <div className="progress" role="progressbar"
+            aria-valuenow={versions.find((v) => v.status === "queued" || v.status === "rendering" || v.status === "validating")?.progress || 0}
+            aria-valuemin={0} aria-valuemax={100}>
+            <div style={{ width: `${versions.find((v) => v.status === "queued" || v.status === "rendering" || v.status === "validating")?.progress || 0}%` }} />
           </div>
         </div>
       )}
@@ -292,7 +181,6 @@ export default function VideoStudio({ tutorialId, token, durationSec, visuals, j
       {versions.length > 0 && (
         <div className="card">
           <h4 style={{ marginTop: 0 }}>Versions ({versions.length})</h4>
-          {working && <p className="muted small-text" role="status"><span className="spinner" aria-hidden="true" /> A render is in progress — this list refreshes automatically.</p>}
           {versions.map((v) => (
             <div key={v.id} className="list-row">
               <div className="row" style={{ justifyContent: "space-between" }}>
@@ -300,23 +188,32 @@ export default function VideoStudio({ tutorialId, token, durationSec, visuals, j
                   <strong>Version {v.version_number || "—"}</strong>{" "}
                   <span className={`tag ${v.status === "ready" ? "approved" : v.status === "error" ? "error" : ""}`}>{v.status}</span>
                   {v.simulated && <span className="tag warn">simulated plan</span>}
-                  <span className="muted small-text"> · {new Date(v.created_at).toLocaleString()} · {(v.scenes || []).length} scenes</span>
+                  {v.status === "ready" && v.staleness?.stale && <span className="tag warn">guide changed</span>}
+                  <span className="muted small-text"> · {new Date(v.created_at).toLocaleString()} · {(v.scenes || []).length} scenes · {voiceLabel(v)}</span>
                 </div>
                 <span className="row">
                   <button className="btn small secondary" aria-pressed={selectedId === v.id} onClick={() => setSelectedId(v.id)}>Preview</button>
                   {v.status === "ready" && (
-                    <a className="btn small secondary" href={videoVersionFileUrl(tutorialId, v.id, token)} download={`tutorial-guide-v${v.version_number || ""}.mp4`}>Download</a>
+                    <a className="btn small secondary"
+                      href={videoVersionFileUrl(tutorialId, v.id, token)}
+                      download={`${(title || "tutorial-guide").replace(/[^\w\- ]+/g, "").trim() || "tutorial-guide"}-v${v.version_number || ""}.mp4`}>Download</a>
                   )}
                 </span>
               </div>
               {v.status === "error" && v.error && <p className="notice error" role="alert" style={{ marginBottom: 0 }}>Render failed: {v.error}</p>}
+              {v.status === "ready" && v.staleness?.stale && (
+                <p className="muted small-text" style={{ marginBottom: 0 }}>
+                  The guide changed since this version ({v.staleness.changed.join(", ")}). Generate a new version for an up-to-date video — this one stays available.
+                </p>
+              )}
             </div>
           ))}
           {selected?.status === "ready" && (
             <div style={{ marginTop: 10 }}>
               <video key={selected.id} className="live-video" src={videoVersionFileUrl(tutorialId, selected.id, token)} controls playsInline preload="metadata" aria-label={`Video guide version ${selected.version_number}`} />
               <p className="muted small-text" style={{ marginTop: 6 }}>
-                {(selected.scenes || []).length} scenes · original-voice cut · reproducible from its saved scene plan.
+                {(selected.scenes || []).length} scenes · {voiceLabel(selected)} ·{" "}
+                {selected.simulated ? "deterministic fallback plan" : "Muse Spark plan"} · reproducible from the saved composition.
               </p>
             </div>
           )}

@@ -30,6 +30,22 @@ def _fixture_video(path, duration=5, salt=77):
     assert r.returncode == 0, r.stderr.decode("utf-8", "replace")[-300:]
 
 
+def _tiny_mp4(path, duration=1.0):
+    """A real, ffprobe-valid minimal MP4 for render-pipeline tests.
+
+    Must be a genuine container (not magic bytes): the worker validates
+    every render with stream + duration checks before marking it ready.
+    """
+    import subprocess
+    ff = tutorial._ffmpeg()
+    r = subprocess.run(
+        [ff, "-y", "-f", "lavfi", "-i",
+         f"testsrc=duration={duration}:size=320x240:rate=30",
+         "-pix_fmt", "yuv420p", "-c:v", "mpeg4", str(path)],
+        capture_output=True, timeout=120)
+    assert r.returncode == 0, r.stderr.decode("utf-8", "replace")[-300:]
+
+
 def _wait_done(job_id, token, timeout=60.0):
     hdr = {**TECH, "X-Tutorial-Token": token}
     end = time.time() + timeout
@@ -107,12 +123,11 @@ def test_video_guide_endpoint_flow(monkeypatch, tmp_path):
     done = _video_pipeline(monkeypatch, tmp_path, salt=81)
 
     def fake_render(props_path, paths):
-        out = paths["dir"] / "guide-video-render.mp4"
-        out.write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 64)
-        return out
+        _tiny_mp4(paths["dir"] / "guide-video-render.mp4")
+        return paths["dir"] / "guide-video-render.mp4"
 
     monkeypatch.setattr(vgmod, "_render_video", fake_render)
-    monkeypatch.setattr(vgmod.ai, "plan_video_scenes", lambda title, steps, objects, segs: {
+    monkeypatch.setattr(vgmod.ai, "plan_video_scenes", lambda title, steps, objects, segs, **kw: {
         "scenes": [{"step_number": 1, "title": "Turn the knob", "narration": "Do it now.",
                     "caption": "Do it now.", "audio_start": 0.0, "audio_end": 2.0,
                     "objects_used": [1], "visual": {"kind": "overlay", "name": "obj-1-overlay.png", "label": "knob"}}],

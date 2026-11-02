@@ -23,6 +23,13 @@ from .tutorial import BASE, _ffmpeg
 VIDEO_QUOTA_PER_DAY = int(os.getenv("MAX_VIDEO_OPS_PER_DAY", "10"))
 VIDEO_FPS = 30
 VIDEO_W, VIDEO_H = 1280, 720
+TITLE_LEAD_SEC = 1.5
+# Longest source tutorial a video guide may be built from. Renders are
+# real-time-ish SSR; beyond this the job is rejected up front (422, before
+# any VideoGuide row exists) instead of dying mid-render. The 600s default
+# aligns with the transcription window so any fully-processed tutorial
+# can get a video.
+MAX_VIDEO_GUIDE_SEC = int(os.getenv("MAX_VIDEO_GUIDE_SEC", "600"))
 
 
 def _check_video_quota(db, actor: str) -> None:
@@ -46,23 +53,62 @@ def _video_paths(job_id: str) -> dict:
             "progress": d / "render-progress.json", "output": d / "guide-video-render.mp4"}
 
 
-def cut_voiceover(job: M.TutorialJob, scenes: list[dict]) -> tuple[Path | None, float]:
+def _wav_seconds(path: Path) -> float:
+    """Measured duration of a WAV file from its own header.
+
+    Never estimated from requested slice ranges — the render timeline and
+    the reported voiceover length must reflect actual bytes on disk.
+    """
+    import wave as _wave
+    try:
+        with _wave.open(str(path), "rb") as w:
+            rate = w.getframerate() or 0
+            if rate <= 0:
+                return 0.0
+            return w.getnframes() / float(rate)
+    except Exception:
+        return 0.0
+
+
+def _record_voiceover(db, job_id: str, actor: str, status: str, summary: dict) -> None:
+    """Best-effort processing-event record for the voiceover step."""
+    try:
+        from . import processing as _proc
+        _proc.safe_record(db, "tutorial", job_id, "video_guide", status,
+                          operation="extract_voiceover", actor=actor,
+                          summary=summary)
+    except Exception:
+        pass
+
+
+def cut_voiceover(job: M.TutorialJob, scenes: list[dict], db=None, actor: str = "") -> tuple[Path | None, float]:
     """Cut per-scene narration from the USER's own recording; concat to one track.
 
-    Returns (voiceover_wav_path_or_None, total_seconds). Slices come from
+    Returns (voiceover_wav_path_or_None, measured_seconds). Slices come from
     timed transcript ranges overlapping each step — the voiceover is a cut of
     the original audio, never synthesized. A 0.4s silence tail pads each
     scene so captions don't clip.
+
+    No audio track (or an unreadable source) is an expected *silent* outcome:
+    returns (None, 0.0) with a "skipped" event. Genuine ffmpeg failures are
+    recorded as "failed" with diagnostics — and still return (None, 0.0) so
+    a valid silent video can render instead of killing the whole job.
     """
     from . import storage as _storage
     try:
         source = _storage.media_path(job.video_storage_key)
     except ValueError:
+        _record_voiceover(db, job.id, actor, "skipped",
+                          {"reason": "invalid source storage key"})
         return None, 0.0
     if not source.is_file():
+        _record_voiceover(db, job.id, actor, "skipped",
+                          {"reason": "source video file missing"})
         return None, 0.0
     total = sum(max(0.0, float(s.get("audio_end", 0)) - float(s.get("audio_start", 0))) for s in scenes)
     if total <= 0:
+        _record_voiceover(db, job.id, actor, "skipped",
+                          {"reason": "scene plan holds no audio ranges — silent video"})
         return None, 0.0
     parts: list[Path] = []
     try:
@@ -84,6 +130,9 @@ def cut_voiceover(job: M.TutorialJob, scenes: list[dict]) -> tuple[Path | None, 
                           "-c:a", "pcm_s16le", str(tail)], capture_output=True, timeout=60)
             parts.extend([part] + ([tail] if r2.returncode == 0 and tail.exists() else []))
         if not parts:
+            _record_voiceover(db, job.id, actor, "failed",
+                              {"reason": "no audio slices could be extracted",
+                               "scenes": len(scenes)})
             return None, 0.0
         lst = vdir / "concat.txt"
         lst.write_text("".join(f"file '{p.name}'\n" for p in parts), encoding="utf-8")
@@ -91,10 +140,22 @@ def cut_voiceover(job: M.TutorialJob, scenes: list[dict]) -> tuple[Path | None, 
         r = _sp.run([_ffmpeg(), "-y", "-f", "concat", "-safe", "0", "-i", str(lst),
                      "-c:a", "pcm_s16le", str(out)], capture_output=True, timeout=180)
         if r.returncode != 0 or not out.exists():
+            tail = (r.stderr or b"").decode("utf-8", "replace")[-300:]
+            _record_voiceover(db, job.id, actor, "failed",
+                              {"reason": "voiceover concat failed", "ffmpeg": tail})
             return None, 0.0
-        _ = job_dir  # voiceover lives under the video/ subdir by design
-        return out, total + 0.4 * len(scenes)
-    except Exception:
+        measured = _wav_seconds(out)
+        if measured <= 0:
+            _record_voiceover(db, job.id, actor, "failed",
+                              {"reason": "rendered voiceover is empty or unreadable"})
+            return None, 0.0
+        _record_voiceover(db, job.id, actor, "succeeded",
+                          {"voiceover_sec": round(measured, 2), "scenes": len(scenes),
+                           "silent_tail_per_scene": 0.4})
+        return out, measured
+    except Exception as e:
+        _record_voiceover(db, job.id, actor, "failed",
+                          {"reason": f"{type(e).__name__}: {str(e)[:200]}"})
         return None, 0.0
 
 
@@ -116,9 +177,13 @@ def build_video_props(job: M.TutorialJob, scenes: list[dict], voiceover: Path | 
         img = None
         vis = s.get("visual") or {}
         if vis.get("name"):
-            p = job_dir / Path(str(vis["name"])).name
-            if p.is_file():
-                img = str(p)
+            # Illustrations live directly under the job dir; accepted visual
+            # assets live under visuals/. Both are real files — check each.
+            for cand in (job_dir / Path(str(vis["name"])).name,
+                         job_dir / "visuals" / Path(str(vis["name"])).name):
+                if cand.is_file():
+                    img = str(cand)
+                    break
         cap_text = str(s.get("caption") or s.get("narration") or "")
         out_scenes.append({
             "step": int(s.get("step_number", len(out_scenes) + 1)),
@@ -188,23 +253,26 @@ def validate_scene_plan(scenes: object, duration_sec: float) -> list[dict]:
     return clean
 
 
-def suggest_scene_plan(job: M.TutorialJob) -> dict:
+def suggest_scene_plan(job: M.TutorialJob, db=None) -> dict:
     """AI-planned initial scene plan from the processed tutorial content.
 
-    Uses the same planner as the automatic render path (Muse Spark with a
-    deterministic fallback, never inventing narration or visuals), then maps
-    the plan into the editable StudioScene shape and validates it so the
-    suggestion is guaranteed render-acceptable. Read-only: creates no
-    versions, saves no drafts. Raises ValueError when there is nothing to
-    plan from (no steps).
+    Same guide-aware planner as the automatic render path (Muse Spark with
+    a deterministic fallback, never inventing narration or visuals), mapped
+    into the editable StudioScene shape and validated so the suggestion is
+    guaranteed render-acceptable. Read-only: creates no versions, saves no
+    drafts. Raises ValueError when there is nothing to plan from (no steps).
     """
     from . import ai as _ai
 
     steps = job.steps or []
     if not steps:
         raise ValueError("No guide steps yet — the tutorial has no processed content to plan scenes from")
+    hints = accepted_visual_hints(db, job.id) if db is not None else []
     plan = _ai.plan_video_scenes(job.title, steps, job.objects or [],
-                                 job.timed_segments or [])
+                                 job.timed_segments or [],
+                                 guide_markdown=job.guide_markdown or "",
+                                 guide_format=job.guide_format or "",
+                                 accepted_visuals=hints)
     raw = plan.get("scenes") or []
     if not raw:
         raise ValueError("Could not plan video scenes from this tutorial")
@@ -229,6 +297,65 @@ def suggest_scene_plan(job: M.TutorialJob) -> dict:
             "note": str(plan.get("note", "") or "")}
 
 
+def accepted_visual_hints(db, job_id: str) -> list[dict]:
+    """Accepted visuals eligible for video composition.
+
+    Accepted, human-reviewed assets only; illustrative alternatives are
+    never eligible as factual evidence. Each hint carries the storage
+    basename so the planner's choice resolves to a real file.
+    """
+    try:
+        rows = db.scalars(select(M.VisualAsset).where(
+            M.VisualAsset.tutorial_id == job_id,
+            M.VisualAsset.status == "accepted")).all()
+    except Exception:
+        return []
+    out = []
+    for a in rows:
+        if (a.kind or "") == "illustrative_alternative":
+            continue
+        name = Path(a.storage_key or "").name if a.storage_key else ""
+        if not name:
+            continue
+        out.append({"label": a.instruction or a.kind or "visual", "name": name,
+                    "asset_id": a.id, "kind": a.kind})
+    return out
+
+
+def _latest_guide_snapshot(db, job_id: str):
+    try:
+        return db.scalars(select(M.GuideSnapshot).where(
+            M.GuideSnapshot.tutorial_id == job_id
+        ).order_by(M.GuideSnapshot.created_at.desc())).first()
+    except Exception:
+        return None
+
+
+def _video_fingerprint(db, job: M.TutorialJob) -> dict:
+    """Content fingerprint for idempotent reuse: steps hash + guide state.
+
+    A finished render is only reused as duplicate when the canonical steps,
+    the latest guide snapshot, the content revision, and the guide format
+    all match. Legacy rows without the new keys compare equal on None —
+    backward compatible.
+    """
+    from .tutorial import _canonical_hash
+    snap = _latest_guide_snapshot(db, job.id)
+    return {"canonical_hash": _canonical_hash(job.steps or []),
+            "guide_snapshot_id": snap.id if snap is not None else None,
+            "content_revision": int(getattr(job, "content_revision", 0) or 0),
+            "guide_format": job.guide_format or ""}
+
+
+def describe_staleness(db, job: M.TutorialJob, vg: M.VideoGuide) -> dict:
+    """Whether the guide/content moved on since this video version rendered."""
+    fp = _video_fingerprint(db, job)
+    prov = vg.provenance or {}
+    changed = sorted(k for k in fp if prov.get(k) != fp[k])
+    return {"stale": bool(changed), "changed": changed,
+            "video_guide_id": vg.id, "version_number": vg.version_number or 0}
+
+
 def start_video_guide(job_id: str, actor: str = "", force: bool = False, scenes: list[dict] | None = None) -> tuple[M.VideoGuide, bool]:
     """Queue (or reuse) a video-guide render. Returns (row, duplicate).
 
@@ -246,6 +373,11 @@ def start_video_guide(job_id: str, actor: str = "", force: bool = False, scenes:
             raise ValueError("Tutorial not found")
         if job.status != "done":
             raise ValueError("The tutorial has not finished processing yet")
+        if (job.duration_sec or 0) > MAX_VIDEO_GUIDE_SEC:
+            mins = int(MAX_VIDEO_GUIDE_SEC // 60)
+            raise ValueError(
+                f"This recording is {round((job.duration_sec or 0) / 60)} min; video guides support up to "
+                f"{mins} min per render. Split the tutorial or trim the source, then generate again.")
         try:
             _check_video_quota(db, actor or job.actor)
         except ValueError as e:
@@ -262,17 +394,15 @@ def start_video_guide(job_id: str, actor: str = "", force: bool = False, scenes:
                 if age < 1800:
                     return r, True
         if not force:
-            from .tutorial import _canonical_hash
-            canon = _canonical_hash(job.steps or [])
+            fp = _video_fingerprint(db, job)
             for r in rows:
-                if r.status == "ready" and (r.provenance or {}).get("canonical_hash") == canon:
+                if r.status == "ready" and all((r.provenance or {}).get(k) == v for k, v in fp.items()):
                     return r, True
         else:
-            from .tutorial import _canonical_hash
-            canon = _canonical_hash(job.steps or [])
+            fp = _video_fingerprint(db, job)
         if scenes is not None:
             clean = validate_scene_plan(scenes, job.duration_sec or 0)
-            canon = _canonical_hash(job.steps or [])
+            fp = _video_fingerprint(db, job)
         max_ver = 0
         for r in rows:
             try:
@@ -281,8 +411,8 @@ def start_video_guide(job_id: str, actor: str = "", force: bool = False, scenes:
                 pass
         vg = M.VideoGuide(tutorial_id=job_id, status="queued", progress=2, created_by=actor or job.actor,
                           version_number=max_ver + 1,
-                          provenance={"trigger": "studio_scene_plan" if scenes is not None else "user_request",
-                                      "canonical_hash": canon, "forced": bool(force)})
+                          provenance={"trigger": "studio_scene_plan" if scenes is not None else "auto_guide_composition",
+                                      **fp, "forced": bool(force)})
         if scenes is not None:
             vg.scenes = [{"step": c["step"], "title": c["title"], "caption": c["caption"],
                           "audio_start": c["audio_start"], "audio_end": c["audio_end"],
@@ -302,6 +432,54 @@ def start_video_guide(job_id: str, actor: str = "", force: bool = False, scenes:
         return db2.get(M.VideoGuide, vid), False
     finally:
         db2.close()
+
+
+def _inspect_mp4(path: Path) -> dict:
+    """Stream inventory for a rendered file via `ffmpeg -i` output.
+
+    Uses the bundled ffmpeg binary (no ffprobe ships with it) with the
+    same parsing style as tutorial.probe_video. Returns
+    {video, audio, duration_sec, codec}.
+    """
+    import re as _re
+    import subprocess as _sp
+    out = {"video": False, "audio": False, "duration_sec": 0.0, "codec": ""}
+    try:
+        r = _sp.run([_ffmpeg(), "-i", str(path)], capture_output=True, timeout=60)
+    except Exception:
+        return out
+    err = (r.stderr or b"").decode("utf-8", "replace")
+    m = _re.search(r"Duration: (\d+):(\d+):([\d.]+)", err)
+    if m:
+        out["duration_sec"] = round(
+            int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3)), 2)
+    vm = _re.search(r"Stream #\d+:\d+.*Video:\s*([a-z0-9_]+)", err)
+    if vm:
+        out["video"] = True
+        out["codec"] = vm.group(1)
+    if _re.search(r"Stream #\d+:\d+.*Audio:", err, _re.S):
+        out["audio"] = True
+    return out
+
+
+def _validate_mp4(path: Path) -> dict:
+    """Validate a rendered MP4 before it is marked ready. Raises RuntimeError.
+
+    Checks: file exists and is non-empty; at least one video stream;
+    a positive duration. Never lets a corrupt render become a 'ready'
+    version. Audio presence is reported (not required — silent tutorials
+    render valid silent videos).
+    """
+    if not path.is_file() or path.stat().st_size == 0:
+        raise RuntimeError("Video render produced no file.")
+    info = _inspect_mp4(path)
+    if not info["video"]:
+        raise RuntimeError("Rendered file has no video stream.")
+    if info["duration_sec"] <= 0:
+        raise RuntimeError("Rendered file has no measurable duration.")
+    return {"duration_sec": info["duration_sec"],
+            "streams": (["video"] + (["audio"] if info["audio"] else [])),
+            "codec": info["codec"], "bytes": path.stat().st_size}
 
 
 def _next_video_filename(video_dir: Path, job_id: str) -> tuple[Path, str]:
@@ -346,7 +524,10 @@ def run_video_guide_job(vg_id: str) -> dict:
         else:
             with proc.timed() as t:
                 plan = ai.plan_video_scenes(job.title, job.steps or [], job.objects or [],
-                                            job.timed_segments or [])
+                                            job.timed_segments or [],
+                                            guide_markdown=job.guide_markdown or "",
+                                            guide_format=job.guide_format or "",
+                                            accepted_visuals=accepted_visual_hints(db, job.id))
             plan_ms = t.ms
             scenes = plan.get("scenes", [])
             if not scenes:
@@ -355,7 +536,7 @@ def run_video_guide_job(vg_id: str) -> dict:
             plan_ms = 0
         vg.progress = 25
         db.commit()
-        voiceover, voice_sec = cut_voiceover(job, scenes)
+        voiceover, voice_sec = cut_voiceover(job, scenes, db=db, actor=actor)
         vg.progress = 40
         db.commit()
         props = build_video_props(job, scenes, voiceover, voice_sec)
@@ -363,16 +544,22 @@ def run_video_guide_job(vg_id: str) -> dict:
         import json as _json
         paths["props"].write_text(_json.dumps(props), encoding="utf-8")
         out = _render_video(paths["props"], paths)
-        if out is None or not out.exists():
+        vg.status, vg.progress = "validating", 85
+        db.commit()
+        checked = _validate_mp4(out) if out is not None and out.exists() else None
+        if checked is None:
             raise RuntimeError("Video render produced no file.")
         final, storage_key = _next_video_filename(paths["dir"], job.id)
         out.replace(final)
         a = M.VisualAsset(tutorial_id=job.id, parent_id="", kind="video_guide", status="review",
                           storage_key=storage_key, mime_type="video/mp4",
                           width=VIDEO_W, height=VIDEO_H,
-                          instruction=f"Video guide for “{job.title}” ({len(scenes)} scenes, original-voice cut).",
+                          instruction=(f"Video guide for “{job.title}” ({len(scenes)} scenes, "
+                                       f"{'original-voice cut' if voiceover else 'silent captions, no narration track'})."),
                           model=plan.get("model", ""), simulated=bool(plan.get("simulated", True)),
-                          provenance={"scenes": len(scenes), "voiceover": "original-recording-cut",
+                          provenance={"scenes": len(scenes),
+                                      "voiceover": ("original-recording-cut" if voiceover else
+                                                    "silent-captions-only"),
                                       "voiceover_sec": round(voice_sec, 1),
                                       "model": plan.get("model", ""), "note": plan.get("note", ""),
                                       "warning": "AI-planned edit of the user's own recording. Verify narration matches the approved procedure before sharing."},
@@ -388,9 +575,12 @@ def run_video_guide_job(vg_id: str) -> dict:
                       "audio_end": float(s.get("audio_end", 0) or 0),
                       "visual": s.get("visual") or {}, "include": True} for i, s in enumerate(scenes)]
         vg.simulated = bool(plan.get("simulated", True))
-        vg.provenance = {"model": plan.get("model", ""), "note": plan.get("note", ""),
+        vg.provenance = {**_video_fingerprint(db, job),
+                         "model": plan.get("model", ""), "note": plan.get("note", ""),
                          "voiceover_sec": round(voice_sec, 1),
-                     "canonical_hash": (vg.provenance or {}).get("canonical_hash", "")}
+                         "voiceover": ("original-recording-cut" if voiceover else
+                                       "silent-captions-only"),
+                         "render": checked}
         db.commit()
         db.refresh(vg)
         proc.safe_record(db, "tutorial", job.id, "video_guide", "succeeded", operation="render_video_guide",
