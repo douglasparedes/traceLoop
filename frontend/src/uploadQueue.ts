@@ -123,6 +123,42 @@ export interface UploadedTutorialJob {
   [k: string]: unknown;
 }
 
+/** Parse an upload response that may not be JSON.
+
+ * Proxies, CDNs, and mis-addressed API URLs answer with HTML error pages;
+ * blind JSON.parse turns those into "Unexpected token '<'…" which tells the
+ * technician nothing. This maps the outcome to an actionable message while
+ * keeping the queued local copy intact (callers must NOT delete the queue
+ * entry on these errors).
+ */
+export function parseUploadResponse(status: number, text: string, contentType: string | null): UploadedTutorialJob {
+  let body: (UploadedTutorialJob & { detail?: string; message?: string }) | null = null;
+  try {
+    body = JSON.parse(text) as UploadedTutorialJob & { detail?: string; message?: string };
+  } catch {
+    body = null;
+  }
+  if (body && typeof body === "object") {
+    if (status >= 400) throw new Error(body.detail || (body as { message?: string }).message || `Upload failed (${status})`);
+    return body as UploadedTutorialJob;
+  }
+  const looksHtml = /<\s*(!doctype|html)/i.test((text || "").slice(0, 500)) || (contentType || "").includes("text/html");
+  if (looksHtml) {
+    if (status === 413) {
+      throw new Error("The upload was rejected as too large before reaching TraceLoop (likely a proxy or mobile-network limit below the app's 300 MB cap). Try a shorter or lower-resolution video, or upload over Wi-Fi. Your file is still queued on this device.");
+    }
+    if (status >= 200 && status < 300) {
+      throw new Error("The server answered the upload with a web page instead of data. The app is probably talking to the wrong address — install/open the PWA from the same server that runs the API, reload, and retry. Your file is still queued on this device.");
+    }
+    if (status === 401 || status === 403) {
+      throw new Error("The server refused the upload (sign-in required or expired). Sign in again, then retry — your file is still queued on this device.");
+    }
+    throw new Error(`Upload failed (HTTP ${status || "unknown"}): the server returned an unreadable error page instead of data. Your file is still queued on this device — check the connection and retry.`);
+  }
+  if (status >= 400) throw new Error(`Upload failed (${status}). Your file is still queued on this device — retry when connected.`);
+  throw new Error("Upload failed: the server returned an empty or unreadable response. Your file is still queued on this device.");
+}
+
 /** Stream the file to POST /api/tutorial/start with progress + cancel.
  * Resolves only after the server confirms persistence (it created the job). */
 export function uploadTutorialFile(opts: {
@@ -162,9 +198,7 @@ export function uploadTutorialFile(opts: {
     xhr.onload = () => {
       window.clearInterval(cancelTick);
       try {
-        const body = JSON.parse(xhr.responseText) as UploadedTutorialJob & { detail?: string };
-        if (xhr.status >= 400) throw new Error(body.detail || `Upload failed (${xhr.status})`);
-        resolve(body);
+        resolve(parseUploadResponse(xhr.status, xhr.responseText, xhr.getResponseHeader("Content-Type")));
       } catch (e) { reject(e instanceof Error ? e : new Error("Upload failed")); }
     };
     xhr.onerror = () => { window.clearInterval(cancelTick); reject(new Error("Upload failed — check the connection and retry. Your file is still queued on this device.")); };

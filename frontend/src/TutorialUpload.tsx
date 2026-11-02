@@ -7,7 +7,7 @@ import { API, authHeaders, getIdentity } from "./api";
 import { Icon } from "./icons";
 import {
   ANALYSIS_MODES, validateTutorialFile, checkStorageFor, queueTutorialUpload,
-  runQueuedUpload, listQueuedUploads, removeQueuedUpload,
+  runQueuedUpload, listQueuedUploads, removeQueuedUpload, parseUploadResponse,
   type AnalysisMode, type QueuedTutorialUpload,
 } from "./uploadQueue";
 import type { LibraryItem } from "./TutorialLibrary";
@@ -67,8 +67,12 @@ export default function TutorialUpload({ mode, onModeChange, onOpenStudio, onUpl
         const res = await fetch(`${API}/api/tutorial/${job.id}`, {
           headers: authHeaders({ "X-Tutorial-Token": job.access_token, "X-User": idn.user, "X-Role": idn.role }),
         });
-        if (res.ok) setJob(await res.json());
-      } catch { /* keep polling */ }
+        const text = await res.text();
+        setJob(parseUploadResponse(res.status, text, res.headers.get("content-type")) as unknown as typeof job);
+      } catch (e) {
+        // Keep polling through transient failures; surface only a real error state.
+        if (e instanceof Error && /wrong address|proxy|sign-in/i.test(e.message)) setError(e.message);
+      }
     }, POLL_MS);
     return () => window.clearInterval(t);
   }, [job?.id, job?.status, job?.access_token]);

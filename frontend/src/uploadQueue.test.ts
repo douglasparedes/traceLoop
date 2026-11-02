@@ -1,5 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
-import { validateTutorialFile, queueTutorialUpload, listQueuedUploads, removeQueuedUpload, MAX_TUTORIAL_BYTES } from "./uploadQueue";
+import { validateTutorialFile, queueTutorialUpload, listQueuedUploads, removeQueuedUpload, parseUploadResponse, MAX_TUTORIAL_BYTES } from "./uploadQueue";
 
 vi.mock("./db", () => {
   const stores = new Map<string, Map<string, unknown>>();
@@ -54,6 +54,40 @@ describe("validateTutorialFile", () => {
     expect(validateTutorialFile(file("empty.mp4", "video/mp4", 0))).toMatch(/empty/i);
     const big = validateTutorialFile(file("huge.mp4", "video/mp4", MAX_TUTORIAL_BYTES + 1));
     expect(big).toMatch(/300 MB/);
+  });
+});
+
+describe("parseUploadResponse", () => {
+  it("accepts valid JSON success bodies", () => {
+    const body = { id: "t1", title: "T", status: "uploaded", progress: 2, access_token: "tok" };
+    expect(parseUploadResponse(200, JSON.stringify(body), "application/json")).toEqual(body);
+  });
+
+  it("surfaces server JSON errors with their detail", () => {
+    expect(() => parseUploadResponse(413, JSON.stringify({ detail: "Too large" }), "application/json"))
+      .toThrow("Too large");
+  });
+
+  it("explains HTML 413 pages as proxy limits, not app errors", () => {
+    const html = "<html><head><title>413 Request Entity Too Large</title></head><body>...</body></html>";
+    expect(() => parseUploadResponse(413, html, "text/html")).toThrow(/proxy|mobile-network limit/i);
+  });
+
+  it("explains HTML 200 pages as a wrong-server API mismatch", () => {
+    const html = "<html><head></head><body><h1>TraceLoop</h1></body></html>";
+    expect(() => parseUploadResponse(200, html, "text/html")).toThrow(/wrong address|same server/i);
+  });
+
+  it("never throws the raw JSON SyntaxError for HTML bodies", () => {
+    const html = "<html> <h1>oops</h1></html>";
+    try {
+      parseUploadResponse(502, html, "text/html");
+      expect.unreachable();
+    } catch (e) {
+      expect(e).toBeInstanceOf(Error);
+      expect((e as Error).message).not.toMatch(/Unexpected token/);
+      expect((e as Error).message).toMatch(/queued/);
+    }
   });
 });
 
