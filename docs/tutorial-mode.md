@@ -58,6 +58,19 @@ click-to-seek, and Copy Markdown / Download .md /
   concurrency via `expected_revision`); guides/drafts update only on
   explicit regeneration, and locked drafts fork new revisions instead of
   mutating — approved versions are never touched.
+- **Processing visibility**: Studio Overview shows a per-stage AI summary
+  (`GET /api/tutorial/{jid}/stages`, aggregated from ProcessingEvents:
+  pending/running/completed/failed/skipped/needs_review with
+  live/simulated/mixed mode per stage). Illustration crops carry automated
+  quality flags (mask validity, resolution, edge cutoff, context) shown in
+  Objects/Visuals; flagged crops stay visible with a recovery note.
+- **Evidence linkage**: review drafts and approved versions embed the
+  transcript segments overlapping each step (`transcript_segments` in
+  `ver_out`); step illustrations, SAM overlays, and accepted visuals ride
+  the existing `evidence_refs`/`visual_refs` columns. Canonical identity
+  covers title, instruction, expected result, verification notes, and
+  tools, so expert edits there join 3-way sync instead of being silently
+  overwritten.
 
 ## Config & cost
 

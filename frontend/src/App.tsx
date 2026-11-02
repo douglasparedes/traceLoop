@@ -439,8 +439,8 @@ export default function App() {
             : <div className="card"><div className="empty"><h3>No tutorial selected</h3><p>Pick a tutorial from the library to edit it in the Studio.</p><button className="btn" onClick={() => setView("tutorials")}>Open Tutorials</button></div></div>)}
           {view === "review" && <ReviewView version={reviewVersion} setVersion={setReviewVersion} procs={procs} openVersion={openVersion} role={role} reload={loadLists} notify={notify} />}
           {view === "job" && <JobView job={activeJob} version={activeVersion} queueEvent={queueEvent} setJob={handleSetJob} notify={notify} reload={loadLists} go={setView} pending={pending} online={online} offlineReady={activeVersion ? cachedIds.has(activeVersion.id) : false} />}
-          {view === "activity" && <Activity jobs={jobs} pending={pending} pendingReview={pendingReview} reload={loadLists} go={setView} syncNow={() => void syncNow()} syncing={syncState === "syncing"} role={role} onProposeRevision={async (vid) => { const v = await openVersion(vid); if (v) { setReviewVersion(v); setView("review"); notify("Opened the job's exact revision. Use “Propose new revision” there — it goes through normal review."); } else notify("That revision is not available offline yet.", "error"); }} />}
-          {view === "history" && <Activity jobs={jobs} pending={pending} pendingReview={pendingReview} reload={loadLists} go={setView} syncNow={() => void syncNow()} syncing={syncState === "syncing"} role={role} onProposeRevision={async (vid) => { const v = await openVersion(vid); if (v) { setReviewVersion(v); setView("review"); notify("Opened the job's exact revision. Use “Propose new revision” there — it goes through normal review."); } else notify("That revision is not available offline yet.", "error"); }} />}
+          {view === "activity" && <Activity jobs={jobs} pending={pending} pendingReview={pendingReview} reload={loadLists} go={setView} syncNow={() => void syncNow()} syncing={syncState === "syncing"} role={role} notify={notify} onProposeRevision={async (vid) => { const v = await openVersion(vid); if (v) { setReviewVersion(v); setView("review"); notify("Opened the job's exact revision. Use “Propose new revision” there — it goes through normal review."); } else notify("That revision is not available offline yet.", "error"); }} />}
+          {view === "history" && <Activity jobs={jobs} pending={pending} pendingReview={pendingReview} reload={loadLists} go={setView} syncNow={() => void syncNow()} syncing={syncState === "syncing"} role={role} notify={notify} onProposeRevision={async (vid) => { const v = await openVersion(vid); if (v) { setReviewVersion(v); setView("review"); notify("Opened the job's exact revision. Use “Propose new revision” there — it goes through normal review."); } else notify("That revision is not available offline yet.", "error"); }} />}
           {view === "manuals" && <Manuals notify={notify} />}
           {view === "settings" && <Settings pending={pending} role={role} setRole={setRole} onSignOut={doLogout} pwa={pwa} clearCache={async () => { await idb.clear("versions"); await refreshCached(); notify("Offline procedure cache cleared. Downloaded jobs and queued events were kept."); }} />}
         </main>
@@ -660,7 +660,7 @@ function ProcessingLog() {
   );
 }
 
-function Activity({ jobs, pending, pendingReview, reload, go, syncNow, syncing, role, onProposeRevision }: { jobs: JobRow[]; pending: number; pendingReview: number; reload: () => void; go: (v: View) => void; syncNow: () => void; syncing: boolean; role: Role; onProposeRevision: (versionId: string) => void }) {
+function Activity({ jobs, pending, pendingReview, reload, go, syncNow, syncing, role, notify, onProposeRevision }: { jobs: JobRow[]; pending: number; pendingReview: number; reload: () => void; go: (v: View) => void; syncNow: () => void; syncing: boolean; role: Role; notify: (s: string, kind?: "ok" | "error" | "info") => void; onProposeRevision: (versionId: string) => void }) {
   return (
     <div>
       <div className="card"><h2><Icon name="schedule" size={20} /> Activity</h2>
@@ -672,7 +672,7 @@ function Activity({ jobs, pending, pendingReview, reload, go, syncNow, syncing, 
           <button className="btn secondary" onClick={() => go("settings")}><Icon name="cog" size={17} /> Settings</button>
         </div>
       </div>
-      <History jobs={jobs} reload={reload} role={role} onProposeRevision={onProposeRevision} />
+      <History jobs={jobs} reload={reload} role={role} notify={notify} onProposeRevision={onProposeRevision} />
       <ProcessingLog />
     </div>
   );
@@ -952,6 +952,51 @@ function ReviewEvidence({ versionId }: { versionId: string }) {
   );
 }
 
+function ProposalBanner({ version }: { version: Version }) {
+  const proposal = (version.source_evidence as { proposal?: {
+    job_id?: string; base_version_id?: string; base_version_number?: number; base_changed_since_job?: boolean;
+    feedback_event_id?: string; feedback_summary?: { step_outcomes?: { step_id: string; status: string; note: string }[]; missing_info?: string; unexpected?: string; visual_correct?: boolean | null; assistance_needed?: boolean; overall?: string };
+    changes?: { step_order: number; field: string; before: string; after: string; reason: string; confidence: string }[];
+    simulated?: boolean; model?: string; note?: string;
+  } }).proposal;
+  if (!proposal) return null;
+  const changes = proposal.changes || [];
+  const fb = proposal.feedback_summary || {};
+  const flagged = (fb.step_outcomes || []).filter((o) => o.status !== "ok");
+  return (
+    <div className="notice info" role="status">
+      <strong><Icon name="flag" size={17} /> Field-feedback proposal.</strong>{" "}
+      Suggested from job <span className="num">{(proposal.job_id || "").slice(0, 8)}</span>
+      {proposal.base_changed_since_job ? " (based on the latest approved revision — the job ran an older one)" : ` (based on approved v${proposal.base_version_number ?? "?"})`}.{" "}
+      {proposal.simulated ? <span className="tag warn">simulated analysis (no Meta key)</span> : <span className="tag ai">Muse Spark analysis{proposal.model ? ` · ${proposal.model}` : ""}</span>}{" "}
+      Review every change below before approving — nothing here modifies the approved revision until you approve this draft.
+      {changes.length > 0 && (
+        <div style={{ marginTop: 8 }}>
+          {changes.map((c, i) => (
+            <div key={i} className="card" style={{ marginBottom: 8 }}>
+              <strong>Step {c.step_order} · {c.field.replace(/_/g, " ")}</strong>{" "}
+              <span className="tag">{c.confidence} confidence</span>
+              <p className="small-text" style={{ margin: "6px 0 0" }}><span className="muted">Before:</span> {c.before || <em className="muted">empty</em>}</p>
+              <p className="small-text" style={{ margin: "4px 0 0" }}><span className="muted">After:</span> {c.after}</p>
+              {c.reason && <p className="muted small-text" style={{ margin: "4px 0 0" }}>Why: {c.reason}</p>}
+            </div>
+          ))}
+        </div>
+      )}
+      {(flagged.length > 0 || fb.missing_info || fb.unexpected || fb.overall) && (
+        <details style={{ marginTop: 6 }}>
+          <summary className="small-text"><strong>Technician feedback behind this proposal</strong></summary>
+          {flagged.length > 0 && <p className="small-text">Flagged steps: {flagged.map((o) => `${o.status}${o.note ? ` — “${o.note}”` : ""}`).join("; ")}</p>}
+          {fb.missing_info && <p className="small-text"><strong>Missing info:</strong> {fb.missing_info}</p>}
+          {fb.unexpected && <p className="small-text"><strong>Unexpected condition:</strong> {fb.unexpected}</p>}
+          {fb.visual_correct === false && <p className="small-text"><strong>Visual guidance reported incorrect</strong> by the technician.</p>}
+          {fb.overall && <p className="small-text"><strong>Overall:</strong> {fb.overall}</p>}
+        </details>
+      )}
+    </div>
+  );
+}
+
 function ReviewView({ version, setVersion, procs, openVersion, role, reload, notify }: { version: Version | null; setVersion: (v: Version | null) => void; procs: ProcSummary[]; openVersion: (id: string) => Promise<Version | null>; role: Role; reload: () => void; notify: (s: string, kind?: "ok" | "error" | "info") => void }) {
   const [busy, setBusy] = useState(false);
   const [comment, setComment] = useState("");
@@ -1013,6 +1058,7 @@ function ReviewView({ version, setVersion, procs, openVersion, role, reload, not
           {Array.isArray((version.source_evidence as { missing_information?: string[] }).missing_information) && ((version.source_evidence as { missing_information?: string[] }).missing_information || []).length > 0 && <div className="notice warn"><strong>Missing information:</strong> {((version.source_evidence as { missing_information?: string[] }).missing_information || []).join(" ")}</div>}
           {Array.isArray((version.source_evidence as { safety_notes?: string[] }).safety_notes) && ((version.source_evidence as { safety_notes?: string[] }).safety_notes || []).length > 0 && <div className="notice info"><strong>Safety notes (from capture):</strong> {((version.source_evidence as { safety_notes?: string[] }).safety_notes || []).join(" ")}</div>}
           <ReviewEvidence versionId={version.id} />
+          <ProposalBanner version={version} />
           {(() => {
             const sync = (version.source_evidence as { sync?: { action?: string; conflicting_steps?: number[]; changed_steps?: number[] } }).sync;
             if (!sync || (sync.action !== "conflict" && !(sync.conflicting_steps || []).length)) return null;
@@ -1032,6 +1078,17 @@ function ReviewView({ version, setVersion, procs, openVersion, role, reload, not
               <label htmlFor={`st-${s.id}`}>Instruction</label>
               <textarea id={`st-${s.id}`} rows={2} value={s.instruction} disabled={version.status === "approved"} onChange={(e) => { const steps = [...version.steps]; steps[i] = { ...s, instruction: e.target.value }; setVersion({ ...version, steps }); }} />
               <p className="muted">Expected: {s.expected_result || "—"} · Evidence refs: {s.evidence_refs.length ? s.evidence_refs.join(", ") : "none linked"} {s.verification_notes ? `· Check: ${s.verification_notes}` : ""}</p>
+              {(s.transcript_segments || []).length > 0 && (
+                <details>
+                  <summary className="small-text"><strong>Supporting narration ({(s.transcript_segments || []).length})</strong> — transcript behind this step</summary>
+                  <ul className="small-text" style={{ paddingLeft: 18 }}>
+                    {(s.transcript_segments || []).slice(0, 4).map((t) => (
+                      <li key={t.index}><span className="muted num">{Math.floor(t.start / 60)}:{String(Math.floor(t.start % 60)).padStart(2, "0")}</span> — {t.text}</li>
+                    ))}
+                    {(s.transcript_segments || []).length > 4 && <li className="muted">…and {(s.transcript_segments || []).length - 4} more</li>}
+                  </ul>
+                </details>
+              )}
               {((version.source_evidence as { sync?: { conflicting_steps?: number[] } }).sync?.conflicting_steps || []).includes(s.step_order) && (version.status === "draft" || version.status === "rejected") && (
                 <div className="row" style={{ marginTop: 6 }}>
                   <span className="tag warn">Edited here and changed upstream — your text kept</span>
@@ -1405,7 +1462,142 @@ interface JobDetail {
   evidence: JobPhoto[];
 }
 
-function History({ jobs, reload, role, onProposeRevision }: { jobs: JobRow[]; reload: () => void; role: Role; onProposeRevision: (versionId: string) => void }) {
+const FEEDBACK_STATUSES = ["ok", "confusing", "blocked", "incorrect"] as const;
+
+function FeedbackPanel({ jobId, finished, versionId, role, notify, onProposeRevision }: {
+  jobId: string; finished: boolean; versionId: string; role: Role;
+  notify: (s: string, kind?: "ok" | "error" | "info") => void;
+  onProposeRevision: (versionId: string) => void;
+}) {
+  const [steps, setSteps] = useState<Step[]>([]);
+  const [existing, setExisting] = useState<{ event_id: string; payload: Record<string, unknown> }[]>([]);
+  const [ratings, setRatings] = useState<Record<string, { status: string; note: string }>>({});
+  const [missing, setMissing] = useState("");
+  const [unexpected, setUnexpected] = useState("");
+  const [visual, setVisual] = useState<"unknown" | "yes" | "no">("unknown");
+  const [assistance, setAssistance] = useState(false);
+  const [overall, setOverall] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [loaded, setLoaded] = useState(false);
+
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const [v, fb] = await Promise.all([
+          api.get<Version>(`/api/procedure-versions/${versionId}`),
+          api.get<{ feedback: { event_id: string; payload: Record<string, unknown> }[] }>(`/api/jobs/${jobId}/feedback`),
+        ]);
+        if (!alive) return;
+        setSteps(v.steps || []);
+        setExisting(fb.feedback || []);
+        const init: Record<string, { status: string; note: string }> = {};
+        for (const s of v.steps || []) init[s.id] = { status: "ok", note: "" };
+        setRatings(init);
+      } catch { /* offline: form stays unavailable with a note */ }
+      finally { if (alive) setLoaded(true); }
+    })();
+    return () => { alive = false; };
+  }, [jobId, versionId]);
+
+  async function submit(replace: boolean) {
+    setBusy(true);
+    try {
+      await api.post(`/api/jobs/${jobId}/feedback`, {
+        step_outcomes: Object.entries(ratings).map(([step_id, r]) => ({ step_id, status: r.status, note: r.note })),
+        missing_info: missing, unexpected,
+        visual_correct: visual === "unknown" ? null : visual === "yes",
+        assistance_needed: assistance, overall, replace,
+      });
+      notify(replace ? "Feedback superseded — history preserved, latest will be used for proposals." : "Field feedback recorded and linked to this job.", "ok");
+      const fb = await api.get<{ feedback: { event_id: string; payload: Record<string, unknown> }[] }>(`/api/jobs/${jobId}/feedback`);
+      setExisting(fb.feedback || []);
+    } catch (e) { notify(e instanceof Error ? e.message : "Feedback save failed", "error"); }
+    finally { setBusy(false); }
+  }
+
+  async function propose() {
+    if (!window.confirm("Generate an AI-assisted improvement draft from this job's feedback? The approved revision stays untouched; you review the draft next.")) return;
+    setBusy(true);
+    try {
+      const r = await api.post<{ ok: boolean; version_id: string; changes: unknown[]; simulated: boolean; summary: string }>(
+        `/api/jobs/${jobId}/propose-improvement`, {});
+      notify(r.simulated
+        ? `Draft created with ${r.changes.length} suggestion(s) from labelled simulated analysis — verify every change in Review.`
+        : `Draft created with ${r.changes.length} Muse Spark suggestion(s). Review it next.`, "ok");
+      onProposeRevision(r.version_id);
+    } catch (e) { notify(e instanceof Error ? e.message : "Proposal failed", "error"); }
+    finally { setBusy(false); }
+  }
+
+  const canReview = role === "reviewer" || role === "expert";
+  return (
+    <div style={{ marginTop: 8 }}>
+      <span className="eyebrow">Field feedback → improvement</span>
+      {!loaded && <p className="muted small-text">Loading feedback…</p>}
+      {loaded && steps.length === 0 && <p className="muted small-text">Step list unavailable offline — feedback needs the server copy of this revision.</p>}
+      {loaded && steps.length > 0 && (
+        <>
+          {existing.length > 0 && (
+            <div className="notice ok" role="status">
+              <strong>{existing.length} feedback record(s)</strong> linked to this job.{" "}
+              {(() => {
+                const latest = existing[existing.length - 1].payload as { step_outcomes?: { status: string }[]; overall?: string };
+                const bad = (latest.step_outcomes || []).filter((o) => o.status !== "ok").length;
+                return <span className="muted small-text">Latest: {bad} flagged step(s){latest.overall ? ` — “${latest.overall}”` : ""}.</span>;
+              })()}
+            </div>
+          )}
+          <h4>How did each step go?</h4>
+          {steps.map((s) => (
+            <div key={s.id} className="list-row">
+              <p style={{ margin: "0 0 4px" }}><strong>Step {s.step_order}: {s.title}</strong></p>
+              <div className="row" role="group" aria-label={`Outcome for step ${s.step_order}`}>
+                {FEEDBACK_STATUSES.map((st) => (
+                  <button key={st} className={`btn small ${ratings[s.id]?.status === st ? "" : "secondary"}`}
+                    aria-pressed={ratings[s.id]?.status === st} disabled={busy}
+                    onClick={() => setRatings((r) => ({ ...r, [s.id]: { status: st, note: r[s.id]?.note || "" } }))}>{st}</button>
+                ))}
+              </div>
+              {ratings[s.id]?.status !== "ok" && (
+                <label>What went wrong on step {s.step_order}?<textarea rows={2} value={ratings[s.id]?.note || ""}
+                  onChange={(e) => setRatings((r) => ({ ...r, [s.id]: { status: r[s.id].status, note: e.target.value } }))}
+                  placeholder="e.g. Unclear which screw — photo would help." maxLength={2000} /></label>
+              )}
+            </div>
+          ))}
+          <div className="grid" style={{ gridTemplateColumns: "1fr 1fr" }}>
+            <label>Missing steps or info<textarea rows={2} value={missing} onChange={(e) => setMissing(e.target.value)} maxLength={4000} placeholder="Anything the procedure left out?" /></label>
+            <label>Unexpected condition<textarea rows={2} value={unexpected} onChange={(e) => setUnexpected(e.target.value)} maxLength={4000} placeholder="Anything surprising in the field?" /></label>
+          </div>
+          <div className="row" role="group" aria-label="Did the visuals identify the right component?">
+            <span className="small-text"><strong>Visuals identified the right component?</strong></span>
+            {(["unknown", "yes", "no"] as const).map((v) => (
+              <button key={v} className={`btn small ${visual === v ? "" : "secondary"}`} aria-pressed={visual === v} disabled={busy} onClick={() => setVisual(v)}>
+                {v === "unknown" ? "Not sure" : v === "yes" ? "Yes" : "No"}
+              </button>
+            ))}
+            <label className="check-row" htmlFor={`assist-${jobId}`}><input id={`assist-${jobId}`} type="checkbox" checked={assistance} disabled={busy} onChange={(e) => setAssistance(e.target.checked)} /> Expert assistance was needed</label>
+          </div>
+          <label>Overall notes<textarea rows={2} value={overall} onChange={(e) => setOverall(e.target.value)} maxLength={4000} placeholder="Would you follow this procedure again as written?" /></label>
+          <div className="row" style={{ marginTop: 8 }}>
+            <button className="btn" disabled={busy} onClick={() => void submit(false)}>{existing.length ? "Add another record" : "Submit feedback"}</button>
+            {existing.length > 0 && <button className="btn secondary" disabled={busy} onClick={() => void submit(true)}>Supersede with this version</button>}
+            {finished && existing.length > 0 && canReview && (
+              <button className="btn secondary" disabled={busy} onClick={() => void propose()}>Create improvement proposal</button>
+            )}
+          </div>
+          {finished && existing.length > 0 && !canReview && (
+            <p className="muted small-text">A reviewer can turn this feedback into a draft revision.</p>
+          )}
+          {!finished && <p className="muted small-text">Proposals unlock once the job is finished.</p>}
+        </>
+      )}
+    </div>
+  );
+}
+
+function History({ jobs, reload, role, onProposeRevision, notify }: { jobs: JobRow[]; reload: () => void; role: Role; onProposeRevision: (versionId: string) => void; notify: (s: string, kind?: "ok" | "error" | "info") => void }) {
   const [openId, setOpenId] = useState<string | null>(null);
   const [detail, setDetail] = useState<JobDetail | null>(null);
   const [detailError, setDetailError] = useState("");
@@ -1439,11 +1631,14 @@ function History({ jobs, reload, role, onProposeRevision }: { jobs: JobRow[]; re
                   {e.event_type === "issue_recorded" && <> · {String((e.payload as { issue_type?: string }).issue_type || "Issue")}: {String((e.payload as { note?: string }).note || "")}</>}
                   {e.event_type === "field_note" && <> · {String((e.payload as { note?: string }).note || "")}</>}
                   {e.event_type === "evidence_attached" && <> · photo: {String((e.payload as { description?: string }).description || "")}</>}
+                  {e.event_type === "field_feedback" && <> · structured feedback ({((e.payload as { step_outcomes?: unknown[] }).step_outcomes || []).length} step rating(s)){String((e.payload as { overall?: string }).overall || "") ? `: “${String((e.payload as { overall?: string }).overall)}”` : ""}</>}
                   {e.event_type === "issue_recorded" && (role === "reviewer" || role === "expert") && (
                     <> <button className="btn small secondary" onClick={() => onProposeRevision(detail.procedure_version_id)}>Propose revision from this feedback</button></>
                   )}
                 </p>
               ))}
+              <FeedbackPanel jobId={detail.id} finished={detail.status === "finished"} versionId={detail.procedure_version_id}
+                role={role} notify={notify} onProposeRevision={onProposeRevision} />
               {detail.evidence && detail.evidence.length > 0 && (
                 <div style={{ marginTop: 8 }}>
                   <span className="eyebrow">Field photos ({detail.evidence.length})</span>

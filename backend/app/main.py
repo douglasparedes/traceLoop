@@ -75,7 +75,42 @@ def audit(db: Session, who: str, action: str, etype: str, eid: str, detail=None)
     db.add(M.AuditLog(actor=who, action=action, entity_type=etype, entity_id=eid, detail=detail or {}))
 
 
-def ver_out(v: M.ProcedureVersion) -> dict:
+def ver_out(v: M.ProcedureVersion, db: Session | None = None) -> dict:
+    """Serialize a procedure version with per-step evidence linkage.
+
+    When the version is linked to a tutorial (source_evidence.tutorial_id),
+    each step carries the transcript segments overlapping its time range, so
+    a reviewer can answer "which part of the narration supports this step?"
+    without guessing. Steps without timing get an empty list — never
+    fabricated references.
+    """
+    segs: list[dict] = []
+    if db is not None:
+        try:
+            tut_id = (v.source_evidence or {}).get("tutorial_id", "")
+            if tut_id:
+                tut = db.get(M.TutorialJob, tut_id)
+                if tut is not None:
+                    segs = [s for s in (tut.timed_segments or []) if isinstance(s, dict)]
+        except Exception:
+            segs = []
+
+    def _step_segments(start, end) -> list[dict]:
+        if start is None and end is None:
+            return []
+        s0 = float(start or 0)
+        e0 = float(end if end is not None else s0)
+        out = []
+        for idx, s in enumerate(segs):
+            try:
+                ss, ee = float(s.get("start", 0) or 0), float(s.get("end", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if ee >= s0 and (not e0 or ss <= e0):
+                out.append({"index": idx, "text": str(s.get("text", "") or ""),
+                            "start": ss, "end": ee})
+        return out
+
     return {
         "id": v.id, "procedure_id": v.procedure_id, "version_number": v.version_number,
         "status": v.status, "summary": v.summary, "prerequisites": v.prerequisites,
@@ -87,7 +122,8 @@ def ver_out(v: M.ProcedureVersion) -> dict:
                    "expected_result": s.expected_result, "required_tools": s.required_tools or [],
                    "evidence_refs": s.evidence_refs or [], "visual_refs": s.visual_refs or [],
                    "verification_notes": s.verification_notes,
-                   "start_sec": s.start_sec, "end_sec": s.end_sec} for s in v.steps],
+                   "start_sec": s.start_sec, "end_sec": s.end_sec,
+                   "transcript_segments": _step_segments(s.start_sec, s.end_sec)} for s in v.steps],
     }
 
 
@@ -451,7 +487,7 @@ def make_draft(body: S.DraftRequest, db: Session = Depends(get_db), who=Depends(
     c.status = "draft-generated"
     audit(db, who["id"], "procedure.draft", "procedure_version", ver.id, {"simulated": result["simulated"]})
     db.commit(); db.refresh(ver)
-    return ver_out(ver)
+    return ver_out(ver, db)
 
 
 @app.get("/api/procedures")
@@ -520,7 +556,7 @@ def evidence_image(eid: str, db: Session = Depends(get_db)):
 def get_version(vid: str, db: Session = Depends(get_db)):
     v = db.get(M.ProcedureVersion, vid)
     if not v: raise HTTPException(404, "Version not found")
-    return ver_out(v)
+    return ver_out(v, db)
 
 
 @app.put("/api/procedure-versions/{vid}")
@@ -541,7 +577,7 @@ def edit_version(vid: str, body: S.VersionEdit, db: Session = Depends(get_db), w
                                    verification_notes=s.verification_notes,
                                    start_sec=s.start_sec, end_sec=s.end_sec))
     db.commit(); db.refresh(v)
-    return ver_out(v)
+    return ver_out(v, db)
 
 
 @app.post("/api/procedure-versions/{vid}/new-revision")
@@ -559,17 +595,17 @@ def new_revision(vid: str, db: Session = Depends(get_db), who=Depends(actor)):
                                evidence_refs=s.evidence_refs or [], visual_refs=s.visual_refs or [],
                                verification_notes=s.verification_notes, start_sec=s.start_sec, end_sec=s.end_sec))
     db.commit(); db.refresh(nv)
-    return ver_out(nv)
+    return ver_out(nv, db)
 
 
 @app.post("/api/procedure-versions/{vid}/resolve-conflict")
 def resolve_conflict(vid: str, body: dict, db: Session = Depends(get_db), who=Depends(actor)):
     """Apply canonical text to chosen conflicted steps (expert keeps the rest).
 
-    Only editable versions. Each listed step takes the title/instruction from
-    the stored canonical snapshot; unresolved steps stay exactly as the
-    expert left them. When nothing remains flagged, the sync action flips
-    to "resolved".
+    Only editable versions. Each listed step takes the title, instruction,
+    expected result, verification notes, and tools from the stored canonical
+    snapshot; unresolved steps stay exactly as the expert left them. When
+    nothing remains flagged, the sync action flips to "resolved".
     """
     v = db.get(M.ProcedureVersion, vid)
     if not v:
@@ -584,8 +620,12 @@ def resolve_conflict(vid: str, body: dict, db: Session = Depends(get_db), who=De
     applied: list[int] = []
     for s in v.steps:
         if s.step_order in orders and s.step_order in canon:
-            s.title = str(canon[s.step_order].get("t", "") or s.title)
-            s.instruction = str(canon[s.step_order].get("i", "") or "")
+            c = canon[s.step_order]
+            s.title = str(c.get("t", "") or s.title)
+            s.instruction = str(c.get("i", "") or "")
+            s.expected_result = str(c.get("e", "") or "") or None
+            s.verification_notes = str(c.get("v", "") or "") or s.verification_notes
+            s.required_tools = [str(t)[:120] for t in (c.get("r", []) or []) if str(t).strip()][:20]
             applied.append(s.step_order)
     se = dict(v.source_evidence or {})
     sync = dict(se.get("sync") or {})
@@ -992,6 +1032,84 @@ def refresh_guide(jid: str, x_tutorial_token: str = Header(default=""), db: Sess
     out = tut.regenerate_guide_for_job(db, job, "refresh", actor=who["id"])
     return {"ok": True, "guide_markdown": job.guide_markdown, "snapshot_id": out["snapshot_id"],
             "draft_version_id": out["draft_version_id"], "draft_action": out["draft_action"]}
+
+
+@app.get("/api/tutorial/{jid}/stages")
+def tutorial_stages(jid: str, x_tutorial_token: str = Header(default=""), db: Session = Depends(get_db)):
+    """Per-stage processing rollup for Tutorial Studio.
+
+    Aggregates ProcessingEvents into the canonical pipeline stages with an
+    explicit state (pending/running/completed/failed/skipped/needs_review)
+    and execution mode (live/simulated/mixed) per stage. A pipeline with
+    mixed stages is never labelled live as a whole — the mode is per stage.
+    """
+    job = _get_tutorial(db, jid, x_tutorial_token)
+    evs = db.scalars(select(M.ProcessingEvent).where(
+        M.ProcessingEvent.entity_type == "tutorial",
+        M.ProcessingEvent.entity_id == job.id).order_by(M.ProcessingEvent.created_at)).all()
+    by_stage: dict[str, list] = {}
+    for e in evs:
+        by_stage.setdefault(e.stage or "", []).append(e)
+
+    ORDER = [
+        ("ingest", "Source ingestion", ["probe", "extract_audio"]),
+        ("transcribe", "Voice transcription", ["transcribe"]),
+        ("understand", "Task understanding", ["understand"]),
+        ("segment", "Component segmentation", ["segment"]),
+        ("guide", "Procedure generation", ["guide"]),
+        ("draft", "Review draft", ["draft"]),
+    ]
+    CURRENT = {"uploaded": "ingest", "transcribing": "transcribe",
+               "understanding": "understand", "segmenting": "segment",
+               "generating": "guide"}
+    terminal = job.status in ("done", "error")
+    out = []
+    for key, label, raw_stages in ORDER:
+        events = [e for rs in raw_stages for e in by_stage.get(rs, [])]
+        statuses = [e.status or "" for e in events]
+        models = [e.model for e in events if e.model]
+        duration = sum(e.duration_ms or 0 for e in events)
+        sim = sum(1 for e in events if (e.status == "simulated") or bool((e.summary or {}).get("simulated")))
+        live = sum(1 for e in events if e.status == "succeeded" and (e.provider or "").startswith("meta"))
+        if live and sim:
+            mode = "mixed"
+        elif live:
+            mode = "live"
+        elif sim or any(s == "simulated" for s in statuses):
+            mode = "simulated"
+        elif events:
+            mode = "unknown"
+        else:
+            mode = "unknown"
+        if any(s in ("failed", "error") for s in statuses):
+            state = "failed"
+        elif any(s in ("needs_tap", "no_match", "needs_review") for s in statuses):
+            state = "needs_review"
+        elif any(s in ("succeeded", "simulated", "ok", "recorded", "user") for s in statuses):
+            state = "completed"
+        elif not terminal and CURRENT.get(job.status) == key:
+            state = "running"
+        elif not events:
+            if key == "segment" and not (job.objects or []) and any(
+                    e.stage == "guide" for e in evs):
+                state, mode = "skipped", "unknown"
+                note = "No objects to segment — pipeline continued to guide generation."
+                out.append({"stage": key, "label": label, "state": state, "mode": mode,
+                            "model": "", "duration_ms": 0, "attempts": 0, "note": note})
+                continue
+            state = "pending"
+        else:
+            state = "running"
+        last = events[-1] if events else None
+        note = ""
+        if last is not None:
+            summ = last.summary or {}
+            note = str(summ.get("note", "") or summ.get("error", "") or "")
+        out.append({"stage": key, "label": label, "state": state, "mode": mode,
+                    "model": models[-1] if models else "",
+                    "duration_ms": duration, "attempts": len(events), "note": note})
+    return {"tutorial_id": job.id, "job_status": job.status,
+            "stages": out}
 
 
 @app.get("/api/tutorial/{jid}/snapshots")
@@ -2327,6 +2445,193 @@ def list_jobs(db: Session = Depends(get_db)):
                     "technician_id": j.technician_id, "started_at": j.started_at.isoformat(),
                     "ended_at": j.ended_at.isoformat() if j.ended_at else None, "events": n})
     return out
+
+
+_FEEDBACK_STATUSES = {"ok", "confusing", "blocked", "incorrect"}
+
+
+def _validate_feedback(db, v: M.ProcedureVersion, body: dict) -> dict:
+    """Validate structured field feedback against the executed revision.
+
+    step_outcomes reference step IDs of the pinned revision (unknown IDs are
+    rejected, not silently dropped). Free text is length-capped; nothing is
+    invented server-side.
+    """
+    if not isinstance(body, dict):
+        raise HTTPException(422, "Request body must be an object")
+    valid_ids = {s.id for s in v.steps}
+    outcomes = body.get("step_outcomes", [])
+    if not isinstance(outcomes, list) or len(outcomes) > 200:
+        raise HTTPException(422, "step_outcomes must be a list (max 200)")
+    clean_outcomes = []
+    for i, o in enumerate(outcomes):
+        if not isinstance(o, dict):
+            raise HTTPException(422, f"step_outcomes[{i}] must be an object")
+        sid = str(o.get("step_id", "") or "")
+        if sid not in valid_ids:
+            raise HTTPException(422, f"step_outcomes[{i}]: unknown step_id for this revision")
+        status = str(o.get("status", "") or "")
+        if status not in _FEEDBACK_STATUSES:
+            raise HTTPException(422, f"step_outcomes[{i}]: status must be one of {sorted(_FEEDBACK_STATUSES)}")
+        clean_outcomes.append({"step_id": sid, "status": status,
+                               "note": str(o.get("note", "") or "")[:2000]})
+    visual = body.get("visual_correct", None)
+    if visual is not None and not isinstance(visual, bool):
+        raise HTTPException(422, "visual_correct must be true, false, or omitted")
+    assistance = body.get("assistance_needed", False)
+    if not isinstance(assistance, bool):
+        raise HTTPException(422, "assistance_needed must be a boolean")
+    return {"step_outcomes": clean_outcomes,
+            "missing_info": str(body.get("missing_info", "") or "")[:4000],
+            "unexpected": str(body.get("unexpected", "") or "")[:4000],
+            "visual_correct": visual, "assistance_needed": assistance,
+            "overall": str(body.get("overall", "") or "")[:4000]}
+
+
+@app.post("/api/jobs/{jid}/feedback")
+def submit_job_feedback(jid: str, body: dict, db: Session = Depends(get_db), who=Depends(actor)):
+    """Record structured field feedback for an executed job.
+
+    Linked to the job and its pinned revision. One feedback per job unless
+    replace:true is given (history is preserved; the latest is used for
+    proposals). Never modifies any procedure version.
+    """
+    j = db.get(M.JobSession, jid)
+    if not j: raise HTTPException(404, "Job not found")
+    v = db.get(M.ProcedureVersion, j.procedure_version_id)
+    if not v: raise HTTPException(409, "The job's procedure revision is missing")
+    clean = _validate_feedback(db, v, body or {})
+    existing = db.scalars(select(M.JobEvent).where(
+        M.JobEvent.session_id == jid, M.JobEvent.event_type == "field_feedback")).all()
+    if existing and not (body or {}).get("replace"):
+        raise HTTPException(409, "Feedback already recorded for this job (pass replace:true to supersede it)")
+    ev = M.JobEvent(event_id=M.uid(), session_id=jid, step_id=None, event_type="field_feedback",
+                    payload={"technician_id": who["id"], "procedure_version_id": v.id, **clean},
+                    created_by=who["id"])
+    db.add(ev)
+    db.flush()
+    audit(db, who["id"], "job.feedback", "job_session", jid, {"event_id": ev.event_id})
+    db.commit()
+    return {"ok": True, "event_id": ev.event_id, "superseded": len(existing)}
+
+
+@app.get("/api/jobs/{jid}/feedback")
+def list_job_feedback(jid: str, db: Session = Depends(get_db)):
+    """All structured feedback records for a job, oldest first."""
+    j = db.get(M.JobSession, jid)
+    if not j: raise HTTPException(404, "Job not found")
+    evs = db.scalars(select(M.JobEvent).where(
+        M.JobEvent.session_id == jid, M.JobEvent.event_type == "field_feedback"
+    ).order_by(M.JobEvent.occurred_at)).all()
+    return {"job_id": jid, "feedback": [
+        {"event_id": e.event_id, "payload": e.payload,
+         "occurred_at": e.occurred_at.isoformat()} for e in evs]}
+
+
+@app.post("/api/jobs/{jid}/propose-improvement")
+def propose_improvement(jid: str, body: dict, db: Session = Depends(get_db), who=Depends(actor)):
+    """Create a draft revision from field execution evidence (reviewer+ only).
+
+    Gathers the job's events and latest structured feedback, asks Muse Spark
+    (or the labelled deterministic fallback) for minimal per-step text
+    improvements, and forks a NEW draft revision with the suggestions
+    applied and before/after recorded in source_evidence.proposal. The
+    approved revision is never touched; the draft goes through normal
+    submit → review → approve. Requires a finished job with feedback.
+    """
+    from . import processing as proc
+    if who["role"] not in ("reviewer", "admin", "expert"):
+        raise HTTPException(403, "Reviewer role required to propose improvements")
+    j = db.get(M.JobSession, jid)
+    if not j: raise HTTPException(404, "Job not found")
+    if j.status != "finished":
+        raise HTTPException(409, "Proposals require a finished job — finish execution first")
+    pinned = db.get(M.ProcedureVersion, j.procedure_version_id)
+    if not pinned: raise HTTPException(409, "The job's procedure revision is missing")
+    # Base the proposal on the latest approved revision when the pinned one
+    # has been superseded (jobs stay pinned, but improvements target current).
+    base = pinned
+    base_changed = False
+    if pinned.status != "approved":
+        latest = db.scalars(select(M.ProcedureVersion).where(
+            M.ProcedureVersion.procedure_id == j.procedure_id,
+            M.ProcedureVersion.status == "approved").order_by(
+            M.ProcedureVersion.version_number.desc())).first()
+        if latest is None:
+            raise HTTPException(409, "No approved revision to improve — approve one first")
+        base, base_changed = latest, True
+    fbs = db.scalars(select(M.JobEvent).where(
+        M.JobEvent.session_id == jid, M.JobEvent.event_type == "field_feedback"
+    ).order_by(M.JobEvent.occurred_at)).all()
+    if not fbs:
+        raise HTTPException(409, "Collect structured field feedback first (POST /api/jobs/{jid}/feedback)")
+    feedback = dict(fbs[-1].payload or {})
+    evs = db.scalars(select(M.JobEvent).where(
+        M.JobEvent.session_id == jid).order_by(M.JobEvent.occurred_at)).all()
+    event_dicts = [{"event_type": e.event_type, "step_id": e.step_id,
+                    "payload": e.payload,
+                    "occurred_at": e.occurred_at.isoformat()} for e in evs[:200]]
+    proc_steps = [{"id": s.id, "step_order": s.step_order, "title": s.title, "instruction": s.instruction,
+                   "expected_result": s.expected_result or "",
+                   "verification_notes": s.verification_notes or ""} for s in base.steps]
+    with proc.timed() as t:
+        proposal = ai.propose_improvement(j.procedure_id, proc_steps, event_dicts, feedback)
+    changes = proposal.get("changes") or []
+    nxt = (db.scalar(select(func.max(M.ProcedureVersion.version_number)).where(
+        M.ProcedureVersion.procedure_id == base.procedure_id)) or 0) + 1
+    by_order_field = {(c.get("step_order"), c.get("field")): c for c in changes
+                      if isinstance(c, dict)}
+    nv = M.ProcedureVersion(procedure_id=base.procedure_id, version_number=nxt, status="draft",
+                            summary=f"Field-feedback proposal from job {jid[:8]} — review every change before approval.",
+                            prerequisites=base.prerequisites,
+                            source_evidence={**(base.source_evidence or {}),
+                                             "proposal": {
+                                                 "job_id": jid, "base_version_id": base.id,
+                                                 "base_version_number": base.version_number,
+                                                 "base_changed_since_job": base_changed,
+                                                 "feedback_event_id": fbs[-1].event_id,
+                                                 "feedback_summary": {
+                                                     "step_outcomes": feedback.get("step_outcomes", []),
+                                                     "missing_info": feedback.get("missing_info", ""),
+                                                     "unexpected": feedback.get("unexpected", ""),
+                                                     "visual_correct": feedback.get("visual_correct"),
+                                                     "assistance_needed": feedback.get("assistance_needed", False),
+                                                     "overall": feedback.get("overall", "")},
+                                                 "changes": changes,
+                                                 "simulated": bool(proposal.get("simulated", True)),
+                                                 "model": proposal.get("model", ""),
+                                                 "note": proposal.get("note", "") or proposal.get("summary", "")}},
+                            ai_model=proposal.get("model", ""), ai_simulated=1 if proposal.get("simulated", True) else 0,
+                            created_by=who["id"])
+    db.add(nv)
+    db.flush()
+    for s in base.steps:
+        vals = {"title": s.title, "instruction": s.instruction,
+                "expected_result": s.expected_result, "verification_notes": s.verification_notes}
+        for field in ("title", "instruction", "expected_result", "verification_notes"):
+            hit = by_order_field.get((s.step_order, field))
+            if hit:
+                vals[field] = hit.get("after")
+        db.add(M.ProcedureStep(procedure_version_id=nv.id, step_order=s.step_order,
+                               title=vals["title"], instruction=vals["instruction"],
+                               expected_result=vals["expected_result"],
+                               required_tools=list(s.required_tools or []),
+                               evidence_refs=list(s.evidence_refs or []),
+                               visual_refs=list(s.visual_refs or []),
+                               verification_notes=vals["verification_notes"],
+                               start_sec=s.start_sec, end_sec=s.end_sec))
+    audit(db, who["id"], "procedure.proposal", "procedure_version", nv.id,
+          {"job_id": jid, "base_version_id": base.id, "changes": len(changes),
+           "simulated": bool(proposal.get("simulated", True))})
+    proc.safe_record(db, "job", jid, "proposal", "succeeded", operation="propose_improvement",
+                     actor=who["id"], duration_ms=t.ms,
+                     summary={"version_id": nv.id, "changes": len(changes),
+                              "simulated": bool(proposal.get("simulated", True))})
+    db.commit()
+    db.refresh(nv)
+    return {"ok": True, "version_id": nv.id, "changes": changes,
+            "simulated": bool(proposal.get("simulated", True)),
+            "summary": proposal.get("summary", "")}
 
 
 @app.get("/api/jobs/{jid}")
