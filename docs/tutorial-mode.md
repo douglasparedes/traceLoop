@@ -1,10 +1,12 @@
 # TutorialMode + Tutorial Studio
 
-Record a 2-10 minute tutorial (camera + mic, in-browser
+Record a tutorial (camera + mic, in-browser
 `MediaRecorder`), **or upload an existing MP4/WebM/MOV/MKV file** (same
-endpoint, same pipeline), and get back a shareable guide - then
-refine everything in **Tutorial Studio** (Overview / Content / Guide /
-Video / Visuals). Tutorials live in a persistent library under the
+endpoint, same pipeline), and get back a shareable guide - there is
+currently no duration limit, so walkthroughs of any length are accepted
+(processing time grows with length). Then refine everything in
+**Tutorial Studio** (Overview / Content / Guide / Video / Visuals).
+Tutorials live in a persistent library under the
 Tutorials destination, independent of the recording phase. Uploaded
 files are queued on-device first and only removed after the server
 confirms persistence.
@@ -107,9 +109,10 @@ click-to-seek, and Copy Markdown / Download .md /
 
 ## Config & cost
 
-`frontend/src/museTutorialConfig.ts` (limits, polling) and backend
-constants in `backend/app/tutorial.py` (`MAX_VIDEO_SEC=600`,
-`TRACKING_FPS=6`, `CONF_THRESHOLD=0.4`). Rough cost per tutorial:
+`frontend/src/museTutorialConfig.ts` (polling) and backend
+constants in `backend/app/tutorial.py`
+(`TRACKING_FPS=6`, `CONF_THRESHOLD=0.4`). There is currently no tutorial
+duration limit. Rough cost per tutorial:
 Muse Voice $0.18/audio-hour, SAM video $0.20/1k frames on the
 6 FPS tracking copy (≈360 frames/min), plus 2 Spark calls.
 No keys ever reach the frontend.

@@ -136,17 +136,13 @@ def test_video_guide_endpoint_flow(monkeypatch, tmp_path):
 
 
 def test_video_guide_guards(monkeypatch, tmp_path):
-    """Unfinished tutorials, over-long tutorials, and quota breaches are refused honestly."""
+    """Unfinished tutorials and quota breaches are refused honestly. Long
+    tutorials are accepted — video guides render the full procedure."""
     from app import videoguide as vgmod
     from app.db import SessionLocal
     from app import models as _M
     done = _video_pipeline(monkeypatch, tmp_path, salt=82)
     hdr = {**TECH, "X-Tutorial-Token": done["access_token"]}
-    # Over-long tutorial refused.
-    monkeypatch.setattr(vgmod, "VIDEO_MAX_SEC", 1)
-    r = c.post(f"/api/tutorial/{done['id']}/video-guide", json={}, headers=hdr)
-    assert r.status_code == 422
-    monkeypatch.setattr(vgmod, "VIDEO_MAX_SEC", 180)
     # Unfinished tutorial refused (deterministic: job row created directly).
     import uuid as _uuid
     db2 = SessionLocal()

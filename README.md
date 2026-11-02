@@ -58,7 +58,7 @@ Visuals (VisualStudio improve/highlight/alternative/annotate with
 accept/reject and provenance).
 
 ```powershell
-cd backend; .\.venv\Scripts\python.exe -m pytest tests -q   # 98 passed, 1 skipped
+cd backend; .\.venv\Scripts\python.exe -m pytest tests -q   # 99 passed, 1 skipped
 cd frontend; npm run test                                    # 95 passed
 ```
 

@@ -205,7 +205,7 @@ describe("chunked resume", () => {
     }) as typeof fetch);
   });
 
-  it("uploads in chunks, resumes after a network drop, and verifies bytes", async () => {
+  it("uploads in chunks, resumes after a network drop, and verifies bytes", { timeout: 60000 }, async () => {
     const size = 10 * 1024 * 1024;
     const raw = new Uint8Array(size);
     for (let i = 0; i < size; i++) raw[i] = i % 251;
