@@ -2,6 +2,23 @@ import { useMemo, useRef, useState } from "react";
 import type { AnnotShape, VisualAsset } from "./guideFormats";
 import { acceptVisual, annotateVisual, generateAlternative, improveVisual, parseDimension, rejectVisual, validateAnnotation, visualFileUrl } from "./guideFormats";
 
+/** Image that never renders a broken/empty frame: missing URLs and load
+ *  failures become an explicit message instead of invisible content. */
+export function SafeImg({ src, alt, style, maxWidth }: {
+  src: string | null | undefined; alt: string; style?: React.CSSProperties; maxWidth?: number;
+}) {
+  const [failedSrc, setFailedSrc] = useState<string | null>(null);
+  const width = maxWidth || 120;
+  if (!src || failedSrc === src) {
+    return (
+      <div className="notice warn small-text" role="status" style={{ maxWidth: width, margin: 0 }}>
+        Preview unavailable{!src ? " — no file was generated for this asset" : " — the file could not be loaded (deleted or link expired)"}.
+      </div>
+    );
+  }
+  return <img src={src} alt={alt} style={{ maxWidth: "100%", borderRadius: 8, ...style }} loading="lazy" onError={() => setFailedSrc(src)} />;
+}
+
 function OverlaySvg({ shapes, w, h }: { shapes: AnnotShape[]; w: number; h: number }) {
   const X = (x: number) => (x * w);
   const Y = (y: number) => (y * h);
@@ -42,11 +59,14 @@ export function TechnicalImageViewer({ src, alt, bbox, maskSvg, annotations, onT
   annotations?: { shapes: AnnotShape[] }[];
   onTap?: (nx: number, ny: number) => void;
 }) {
+  const [failedSrc, setFailedSrc] = useState<string | null>(null);
   return (
     <div className="overlay-wrap" role={onTap ? "button" : "img"} aria-label={onTap ? `${alt}. Activate, then click the part you mean.` : alt}
       onClick={onTap ? (e) => { const r = e.currentTarget.getBoundingClientRect(); onTap((e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height); } : undefined}
       style={onTap ? { cursor: "crosshair" } : undefined}>
-      <img src={src} alt="" />
+      {failedSrc === src
+        ? <div className="notice warn small-text" role="status" style={{ margin: 0 }}>Source image could not be loaded (deleted or link expired). Pick another source.</div>
+        : <img src={src} alt="" onError={() => setFailedSrc(src)} />}
       {bbox && (
         <div className="bbox" style={{ left: `${bbox[0] * 100}%`, top: `${bbox[1] * 100}%`, width: `${(bbox[2] - bbox[0]) * 100}%`, height: `${(bbox[3] - bbox[1]) * 100}%` }} />
       )}
@@ -255,17 +275,17 @@ export default function VisualStudio({ tutorialId, token, sourceAsset, reference
         {showSource ? (
           <div className="grid" style={{ gridTemplateColumns: "1fr 1fr" }}>
             <figure style={{ margin: 0 }}>
-              <img src={sourceAsset.imageUrl} alt={`Original source: ${sourceAsset.label}`} style={{ maxWidth: "100%", borderRadius: 8 }} />
+              <SafeImg src={sourceAsset.imageUrl} alt={`Original source: ${sourceAsset.label}`} maxWidth={400} />
               <figcaption className="muted small-text">Original source — never modified</figcaption>
             </figure>
             <figure style={{ margin: 0 }}>
-              <img src={visualFileUrl(a, token)} alt={a.instruction || "Generated visual"} style={{ maxWidth: "100%", borderRadius: 8 }} />
+              <SafeImg src={a.image_url ? visualFileUrl(a, token) : null} alt={a.instruction || "Generated visual"} maxWidth={400} />
               <figcaption className="muted small-text">AI-generated proposal — compare carefully before accepting</figcaption>
             </figure>
           </div>
         ) : a.kind === "annotation"
-          ? <div className="overlay-wrap"><img src={visualFileUrl(a, token)} alt="Annotation overlay" style={{ maxWidth: "100%" }} /></div>
-          : <img src={visualFileUrl(a, token)} alt={a.instruction || "Generated visual"} style={{ maxWidth: "100%", borderRadius: 8 }} />}
+          ? <div className="overlay-wrap"><SafeImg src={a.image_url ? visualFileUrl(a, token) : null} alt="Annotation overlay" maxWidth={400} /></div>
+          : <SafeImg src={a.image_url ? visualFileUrl(a, token) : null} alt={a.instruction || "Generated visual"} maxWidth={400} />}
         <Provenance asset={a} />
         {extra}
         <div className="row" style={{ marginTop: 8 }}>

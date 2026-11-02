@@ -2,9 +2,9 @@
 // Every render creates a NEW persistent MP4 version — prior versions stay
 // available. Captions are presentation text; the voiceover is always a cut
 // of the user's own original recording (never synthesized).
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type { StudioScene, StudioVideoVersion } from "./studioApi";
-import { fetchVideoVersions, renderScenePlan, saveScenePlan, sceneRange, sceneStep, videoVersionFileUrl } from "./studioApi";
+import { fetchSuggestedScenes, fetchVideoVersions, renderScenePlan, saveScenePlan, sceneRange, sceneStep, videoVersionFileUrl } from "./studioApi";
 
 function fmtT(sec: number): string {
   if (!isFinite(sec) || sec < 0) return "0:00";
@@ -31,6 +31,8 @@ export default function VideoStudio({ tutorialId, token, durationSec, visuals, j
   const [busy, setBusy] = useState(false);
   const [dirty, setDirty] = useState(false);
   const [selScene, setSelScene] = useState(0);
+  const [suggestBusy, setSuggestBusy] = useState(false);
+  const suggestTriedRef = useRef(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -145,6 +147,42 @@ export default function VideoStudio({ tutorialId, token, durationSec, visuals, j
   const active = scenes[selScene];
   const readyVersions = versions.filter((v) => v.status === "ready");
 
+  /** AI-planned initial scenes from the processed tutorial content (steps,
+   *  transcript, illustrations). Read-only on the server: review the plan
+   *  here, then Save + Render as usual — the Remotion render is unchanged. */
+  async function suggestScenes(auto = false) {
+    if (suggestBusy || !jobDone) return;
+    if (!auto && scenes.length > 0 && !window.confirm("Replace the current scene plan with a fresh AI-planned one? Unsaved edits will be lost.")) return;
+    setSuggestBusy(true);
+    if (!auto) { setError(""); setNote(""); }
+    try {
+      const plan = await fetchSuggestedScenes(tutorialId, token);
+      setScenes(plan.scenes.map((s, i) => ({ ...s, include: s.include !== false, step: sceneStep(s, i + 1) })));
+      setSelScene(0);
+      setDirty(true);
+      setNote(plan.note || (plan.simulated
+        ? `Deterministic scene plan from your guide steps (no live AI). Review, then Render.`
+        : `AI-planned ${plan.scenes.length} scenes from your processed tutorial. Review, then Render.`));
+    } catch (e) {
+      if (!auto) setError(e instanceof Error ? e.message : "Could not suggest scenes");
+      else setNote("Could not auto-plan scenes — generate them below or add the first scene manually.");
+    } finally {
+      setSuggestBusy(false);
+    }
+  }
+
+  // First open of a finished tutorial with no versions yet: the scenes
+  // should already exist from the processed content, so auto-plan once
+  // instead of asking the user to hand-build what the pipeline knows.
+  useEffect(() => { suggestTriedRef.current = false; }, [tutorialId]);
+  useEffect(() => {
+    if (!loading && jobDone && versions.length === 0 && scenes.length === 0 && !suggestTriedRef.current) {
+      suggestTriedRef.current = true;
+      void suggestScenes(true);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loading, jobDone, versions.length, scenes.length]);
+
   return (
     <div>
       <h3 style={{ marginTop: 0 }}>Video</h3>
@@ -158,9 +196,16 @@ export default function VideoStudio({ tutorialId, token, durationSec, visuals, j
 
       {!loading && versions.length === 0 && scenes.length === 0 && (
         <div className="card"><div className="empty">
-          <p><strong>No video version yet</strong></p>
-          <p>{jobDone ? "Add scenes below and render the first MP4 version." : "Video editing unlocks once the tutorial finishes processing."}</p>
-          {jobDone && <button className="btn" style={{ marginTop: 8 }} onClick={addScene}>Add first scene</button>}
+          <p><strong>{suggestBusy ? "Planning scenes from your guide…" : "No video version yet"}</strong></p>
+          <p>{suggestBusy
+            ? "Reading your steps, transcript, and illustrations — one scene per step."
+            : jobDone ? "Generate the scene plan from your processed tutorial, or build it by hand." : "Video editing unlocks once the tutorial finishes processing."}</p>
+          {jobDone && !suggestBusy && (
+            <div className="row" style={{ justifyContent: "center", marginTop: 8 }}>
+              <button className="btn" onClick={() => void suggestScenes(false)}>Generate scenes with AI</button>
+              <button className="btn secondary" onClick={addScene}>Add first scene</button>
+            </div>
+          )}
         </div></div>
       )}
 
@@ -169,7 +214,10 @@ export default function VideoStudio({ tutorialId, token, durationSec, visuals, j
           <div className="card" style={{ margin: 0 }}>
             <div className="row" style={{ justifyContent: "space-between" }}>
               <strong>Scenes ({scenes.length})</strong>
-              <button className="btn small secondary" onClick={addScene} disabled={!jobDone}>Add scene</button>
+              <span className="row">
+                <button className="btn small secondary" onClick={() => void suggestScenes(false)} disabled={!jobDone || busy || suggestBusy}>{suggestBusy ? "Planning…" : "Generate scenes with AI"}</button>
+                <button className="btn small secondary" onClick={addScene} disabled={!jobDone}>Add scene</button>
+              </span>
             </div>
             {scenes.length === 0 && <p className="muted small-text">No scenes yet — add the first one to describe the opening of the recording.</p>}
             <ol className="scene-list">

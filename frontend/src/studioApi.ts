@@ -130,6 +130,24 @@ export async function fetchVideoVersions(tutorialId: string, token: string): Pro
   return ((await res.json()).versions || []) as StudioVideoVersion[];
 }
 
+export interface SuggestedScenePlan {
+  scenes: StudioScene[];
+  simulated: boolean;
+  model: string;
+  note: string;
+}
+
+export async function fetchSuggestedScenes(tutorialId: string, token: string): Promise<SuggestedScenePlan> {
+  const idn = getIdentity();
+  const res = await fetch(`${API}/api/tutorial/${tutorialId}/video-guide/suggest`, { headers: tutHeaders(token, { "X-User": idn.user, "X-Role": idn.role }) });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new Error((body as { detail?: string }).detail || `Scene suggestion failed (${res.status})`);
+  }
+  const body = await res.json();
+  return { scenes: body.scenes || [], simulated: !!body.simulated, model: body.model || "", note: body.note || "" };
+}
+
 export async function saveScenePlan(tutorialId: string, token: string, scenes: StudioScene[]) {
   return api.put<{ ok: boolean; video_guide_id: string; scenes: StudioScene[] }>(
     `/api/tutorial/${tutorialId}/video-guide/scenes`, { scenes }, { "X-Tutorial-Token": token });

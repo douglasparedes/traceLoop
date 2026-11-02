@@ -37,7 +37,7 @@ interface PastItem {
 }
 
 import GuideFormatSelector from "./GuideFormatSelector";
-import VisualStudio from "./VisualStudio";
+import VisualStudio, { SafeImg } from "./VisualStudio";
 import VideoGuidePanel from "./VideoGuidePanel";
 import type { GuideSnapshotItem, VisualAsset } from "./guideFormats";
 import { acceptVisual, rejectVisual, visualFileUrl } from "./guideFormats";
@@ -919,8 +919,8 @@ export default function TutorialMode({ onOpenReview, onOpenStudio, hideLibrary, 
                   <div key={a.id} className="card" style={{ marginBottom: 8 }}>
                     <div className="row" style={{ alignItems: "flex-start" }}>
                       {a.mime_type === "image/svg+xml"
-                        ? <div className="overlay-wrap" style={{ width: 120 }}><img src={visualFileUrl(a, job.access_token)} alt={a.instruction || "Annotation overlay"} style={{ width: "100%", borderRadius: 8 }} /></div>
-                        : <img src={a.image_url ? visualFileUrl(a, job.access_token) : ""} alt={a.instruction || a.kind} style={{ width: 120, borderRadius: 8 }} />}
+                        ? <div className="overlay-wrap" style={{ width: 120 }}><SafeImg src={a.image_url ? visualFileUrl(a, job.access_token) : null} alt={a.instruction || "Annotation overlay"} maxWidth={120} /></div>
+                        : <SafeImg src={a.image_url ? visualFileUrl(a, job.access_token) : null} alt={a.instruction || a.kind} maxWidth={120} />}
                       <div style={{ flex: "1 1 auto" }}>
                         <span className={`tag ${a.kind === "illustrative_alternative" ? "warn" : a.kind === "annotation" ? "ai" : ""}`}>{a.kind.replace(/_/g, " ")}</span>{" "}
                         <span className={`tag ${a.status === "accepted" ? "approved" : ""}`}>{a.status}</span>
@@ -928,7 +928,9 @@ export default function TutorialMode({ onOpenReview, onOpenStudio, hideLibrary, 
                         {a.instruction && <p className="small-text" style={{ margin: "4px 0" }}>{a.instruction}</p>}
                         {typeof (a.provenance as { warning?: unknown }).warning === "string" && <p className="muted small-text" style={{ margin: 0 }}>{String((a.provenance as { warning?: unknown }).warning)}</p>}
                         <div className="row" style={{ marginTop: 6 }}>
-                          <button className="btn small secondary" aria-pressed={visualSource?.id === a.id} onClick={() => a.image_url && setVisualSource({ id: a.id, label: a.instruction || a.kind, imageUrl: visualFileUrl(a, job.access_token), kind: a.kind, source: { kind: "asset", id: a.id } })}>Use as source</button>
+                          <button className="btn small secondary" aria-pressed={visualSource?.id === a.id}
+                            disabled={!a.image_url} title={a.image_url ? "Work on this image" : "No viewable file for this asset"}
+                            onClick={() => a.image_url && setVisualSource({ id: a.id, label: a.instruction || a.kind, imageUrl: visualFileUrl(a, job.access_token), kind: a.kind, source: { kind: "asset", id: a.id } })}>Use as source</button>
                           <button className="btn small" disabled={a.status === "accepted"} onClick={async () => { try { await acceptVisual(a.id, {}); setVisualSource((s) => s); void loadVisuals(); } catch (e) { setStatus(e instanceof Error ? e.message : "Accept failed"); } }}>{a.status === "accepted" ? "Accepted" : "Accept"}</button>
                           <button className="btn small secondary" disabled={a.status !== "review"} onClick={async () => { try { await rejectVisual(a.id); void loadVisuals(); } catch (e) { setStatus(e instanceof Error ? e.message : "Reject failed"); } }}>Reject</button>
                         </div>
