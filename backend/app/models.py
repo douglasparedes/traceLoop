@@ -232,6 +232,7 @@ class GuideSnapshot(Base):
     guide_format: Mapped[str] = mapped_column(String, default="")  # work_instruction|reference_manual|interactive
     format_source: Mapped[str] = mapped_column(String, default="")  # user|recommended
     format_rationale: Mapped[str] = mapped_column(String, default="")
+    content_revision: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
 
 
@@ -310,6 +311,10 @@ class TutorialJob(Base):
     access_token: Mapped[str] = mapped_column(String, default="")
     actor: Mapped[str] = mapped_column(String, default="demo-tech")
     title: Mapped[str] = mapped_column(String, default="Untitled tutorial")
+    equipment_name: Mapped[str] = mapped_column(String, default="")
+    task_description: Mapped[str] = mapped_column(Text, default="")
+    context_notes: Mapped[str] = mapped_column(Text, default="")
+    content_revision: Mapped[int] = mapped_column(Integer, default=1)
     status: Mapped[str] = mapped_column(String, default="uploaded")  # uploaded|transcribing|understanding|segmenting|illustrating|generating|done|error
     progress: Mapped[int] = mapped_column(Integer, default=0)
     error: Mapped[str] = mapped_column(Text, default="")
@@ -321,6 +326,8 @@ class TutorialJob(Base):
     track_width: Mapped[int] = mapped_column(Integer, default=0)
     track_height: Mapped[int] = mapped_column(Integer, default=0)
     full_transcript: Mapped[str] = mapped_column(Text, default="")
+    transcript_original: Mapped[str] = mapped_column(Text, default="")
+    transcript_corrected: Mapped[str] = mapped_column(Text, default="")
     timed_segments: Mapped[list] = mapped_column(JSON, default=list)
     objects: Mapped[list] = mapped_column(JSON, default=list)
     steps: Mapped[list] = mapped_column(JSON, default=list)
@@ -335,6 +342,28 @@ class TutorialJob(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
 
 
+class TutorialContentRevision(Base):
+    """Versioned working draft of editable canonical tutorial content.
+
+    One row per explicit user save in Tutorial Studio. The live columns on
+    TutorialJob keep moving; revisions preserve what each save contained, by
+    whom, and from which prior revision — so restores and conflict detection
+    never lose work. Original recording/transcript/snapshots/videos are
+    separate records and are never mutated by a content save.
+    """
+    __tablename__ = "tutorial_content_revisions"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
+    tutorial_id: Mapped[str] = mapped_column(ForeignKey("tutorial_jobs.id"), nullable=False, index=True)
+    revision_number: Mapped[int] = mapped_column(Integer, default=1)
+    transcript_corrected: Mapped[str] = mapped_column(Text, default="")
+    timed_segments: Mapped[list] = mapped_column(JSON, default=list)
+    steps: Mapped[list] = mapped_column(JSON, default=list)
+    materials: Mapped[list] = mapped_column(JSON, default=list)
+    actor: Mapped[str] = mapped_column(String, default="")
+    note: Mapped[str] = mapped_column(String, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+
+
 class VideoGuide(Base):
     """A rendered MP4 video guide cut from one tutorial.
 
@@ -346,6 +375,7 @@ class VideoGuide(Base):
     __tablename__ = "video_guides"
     id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
     tutorial_id: Mapped[str] = mapped_column(String, default="", index=True)
+    version_number: Mapped[int] = mapped_column(Integer, default=1)
     status: Mapped[str] = mapped_column(String, default="queued")
     progress: Mapped[int] = mapped_column(Integer, default=0)
     error: Mapped[str] = mapped_column(Text, default="")

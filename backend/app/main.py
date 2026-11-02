@@ -35,9 +35,17 @@ with engine.begin() as _conn:
                                 ("guide_snapshots", "guide_format", "VARCHAR DEFAULT ''"),
                                 ("guide_snapshots", "format_source", "VARCHAR DEFAULT ''"),
                                 ("guide_snapshots", "format_rationale", "TEXT DEFAULT ''"),
+                                ("guide_snapshots", "content_revision", "INTEGER DEFAULT 0"),
                                 ("visual_assets", "idempotency_key", "VARCHAR DEFAULT ''"),
                                 ("procedure_steps", "start_sec", "FLOAT"),
-                                ("procedure_steps", "end_sec", "FLOAT")):
+                                ("procedure_steps", "end_sec", "FLOAT"),
+                                ("tutorial_jobs", "equipment_name", "VARCHAR DEFAULT ''"),
+                                ("tutorial_jobs", "task_description", "TEXT DEFAULT ''"),
+                                ("tutorial_jobs", "context_notes", "TEXT DEFAULT ''"),
+                                ("tutorial_jobs", "content_revision", "INTEGER DEFAULT 1"),
+                                ("tutorial_jobs", "transcript_original", "TEXT DEFAULT ''"),
+                                ("tutorial_jobs", "transcript_corrected", "TEXT DEFAULT ''"),
+                                ("video_guides", "version_number", "INTEGER DEFAULT 1")):
         if _insp.has_table(_table) and _col not in {c["name"] for c in _insp.get_columns(_table)}:
             _conn.execute(_text(f"ALTER TABLE {_table} ADD COLUMN {_col} {_type}"))
 
@@ -725,8 +733,15 @@ def _tutorial_out(job: M.TutorialJob) -> dict:
             "access_token": job.access_token,
             "video_url": f"/api/tutorial/{job.id}/video",
             "full_transcript": job.full_transcript, "timed_segments": job.timed_segments or [],
+            "transcript_original": getattr(job, "transcript_original", "") or "",
+            "transcript_corrected": getattr(job, "transcript_corrected", "") or "",
+            "equipment_name": getattr(job, "equipment_name", "") or "",
+            "task_description": getattr(job, "task_description", "") or "",
+            "context_notes": getattr(job, "context_notes", "") or "",
+            "content_revision": getattr(job, "content_revision", 1) or 1,
             "objects": job.objects or [], "steps": job.steps or [], "materials": job.materials or [],
             "guide_markdown": job.guide_markdown, "created_at": job.created_at.isoformat(),
+            "updated_at": job.updated_at.isoformat() if getattr(job, "updated_at", None) else job.created_at.isoformat(),
             "guide_format": job.guide_format or "", "format_source": job.format_source or "",
             "format_rationale": job.format_rationale or "",
             "draft_procedure_id": job.draft_procedure_id or None,
@@ -892,11 +907,21 @@ def tutorial_generate_guide(jid: str, body: dict, x_tutorial_token: str = Header
     objects = job.objects or []
     # Idempotency: an identical format generation completed moments ago
     # (double-click / retry) returns the existing snapshot, no new version.
+    # The dedup is deliberately narrow: it is skipped when canonical content
+    # changed since that snapshot (job.updated_at is bumped by every Studio
+    # save) or when the linked draft is locked (regen must fork a new
+    # revision via the normal review flow, never silently reuse).
     try:
         latest = db.scalars(select(M.GuideSnapshot).where(M.GuideSnapshot.tutorial_id == job.id).order_by(M.GuideSnapshot.created_at.desc())).first()
     except Exception:
         latest = None
-    if latest is not None and latest.trigger == "format" and (latest.guide_format or "") == fmt:
+    draft_locked = False
+    if job.draft_version_id:
+        _dv = db.get(M.ProcedureVersion, job.draft_version_id)
+        draft_locked = _dv is not None and _dv.status not in ("draft", "rejected")
+    content_changed = bool((getattr(latest, "content_revision", 0) or 0) != (int(getattr(job, "content_revision", 1) or 1)))
+    if latest is not None and latest.trigger == "format" and (latest.guide_format or "") == fmt \
+            and not draft_locked and not content_changed:
         try:
             import datetime as _dt
             age = (_dt.datetime.now(_dt.timezone.utc) - latest.created_at.replace(tzinfo=_dt.timezone.utc)).total_seconds()
@@ -1056,6 +1081,351 @@ def tutorial_ensure_draft(jid: str, x_tutorial_token: str = Header(default=""), 
     return {"ok": True, "procedure_id": ver.procedure_id, "version_id": ver.id, "created": True}
 
 
+# ------------------------------------------------ Tutorial Studio: editing
+
+def _check_content_revision(job: M.TutorialJob, body: dict) -> None:
+    """Optimistic concurrency: reject stale Studio saves instead of merging."""
+    exp = (body or {}).get("expected_revision")
+    if exp is None or exp == "":
+        return
+    try:
+        exp_n = int(exp)
+    except (TypeError, ValueError):
+        raise HTTPException(422, "expected_revision must be a number")
+    if int(getattr(job, "content_revision", 1) or 1) != exp_n:
+        raise HTTPException(409, "This tutorial changed in another session. Reload to get the latest content, then save again.")
+
+
+def _normalize_studio_steps(raw: object, duration_sec: float) -> list[dict]:
+    """Validate + normalize the Studio step list into canonical step dicts.
+
+    Accepts {title, summary|instruction, start|audio_start, end|audio_end,
+    objects_used, expected_result, verification_notes, tools|required_tools}.
+    Rejects empty titles, negative/inverted ranges, and ranges beyond the
+    source recording. Never fabricates timing.
+    """
+    if not isinstance(raw, list) or not raw:
+        raise HTTPException(422, "Provide at least one step")
+    if len(raw) > 100:
+        raise HTTPException(422, "Too many steps (max 100)")
+    clean: list[dict] = []
+    for i, s in enumerate(raw):
+        if not isinstance(s, dict):
+            raise HTTPException(422, f"Step {i + 1} must be an object")
+        title = str(s.get("title", "") or "").strip()[:200]
+        if not title:
+            raise HTTPException(422, f"Step {i + 1} needs a title")
+        summary = str(s.get("summary", s.get("instruction", "")) or "")[:8000]
+        if not summary.strip():
+            raise HTTPException(422, f"Step {i + 1} needs an instruction")
+        try:
+            start = float(s.get("start", s.get("audio_start", 0)) or 0)
+            end = float(s.get("end", s.get("audio_end", 0)) or 0)
+        except (TypeError, ValueError):
+            raise HTTPException(422, f"Step {i + 1}: time range must be numbers")
+        if start < 0 or end < 0:
+            raise HTTPException(422, f"Step {i + 1}: time range cannot be negative")
+        if end and end <= start:
+            raise HTTPException(422, f"Step {i + 1}: end must be after start")
+        if duration_sec > 0 and (start > duration_sec or (end and end > duration_sec + 0.01)):
+            raise HTTPException(422, f"Step {i + 1}: range exceeds the {duration_sec:.0f}s source recording")
+        used = s.get("objects_used", [])
+        if not isinstance(used, list):
+            raise HTTPException(422, f"Step {i + 1}: objects_used must be a list")
+        obj_ids: list[int] = []
+        for o in used:
+            try:
+                obj_ids.append(int(o))
+            except (TypeError, ValueError):
+                raise HTTPException(422, f"Step {i + 1}: object ids must be numbers")
+        tools = s.get("required_tools", s.get("tools", []))
+        if not isinstance(tools, list):
+            raise HTTPException(422, f"Step {i + 1}: tools must be a list")
+        clean.append({
+            "step_number": i + 1,
+            "title": title,
+            "summary": summary,
+            "start": round(start, 2),
+            "end": round(end, 2),
+            "objects_used": obj_ids,
+            "expected_result": str(s.get("expected_result", "") or "")[:2000],
+            "verification_notes": str(s.get("verification_notes", "") or "")[:2000],
+            "required_tools": [str(t)[:120] for t in tools if str(t).strip()][:20],
+        })
+    return clean
+
+
+def _normalize_segments(raw: object, duration_sec: float) -> list[dict]:
+    if raw is None:
+        raise HTTPException(422, "Timed segments must be a list to replace them")
+    if not isinstance(raw, list):
+        raise HTTPException(422, "Timed segments must be a list")
+    if len(raw) > 2000:
+        raise HTTPException(422, "Too many transcript segments (max 2000)")
+    clean: list[dict] = []
+    for i, s in enumerate(raw):
+        if not isinstance(s, dict):
+            raise HTTPException(422, f"Segment {i + 1} must be an object")
+        try:
+            start = float(s.get("start", 0) or 0)
+            end = float(s.get("end", 0) or 0)
+        except (TypeError, ValueError):
+            raise HTTPException(422, f"Segment {i + 1}: time range must be numbers")
+        if start < 0 or end < 0 or (end and end < start):
+            raise HTTPException(422, f"Segment {i + 1}: invalid time range")
+        clean.append({"text": str(s.get("text", "") or "")[:4000],
+                      "start": round(start, 2), "end": round(end, 2)})
+    return clean
+
+
+@app.put("/api/tutorial/{jid}")
+def tutorial_update_meta(jid: str, body: dict, x_tutorial_token: str = Header(default=""), db: Session = Depends(get_db), who=Depends(actor)):
+    """Edit Tutorial Studio overview metadata. The original video is untouched."""
+    from . import processing as proc
+    job = _get_tutorial(db, jid, x_tutorial_token)
+    _check_content_revision(job, body or {})
+    title = str((body or {}).get("title", "") or "")
+    if "title" in (body or {}):
+        if not title.strip():
+            raise HTTPException(422, "Title cannot be empty")
+        if len(title) > 200:
+            raise HTTPException(422, "Title too long (max 200 chars)")
+        job.title = title.strip()
+    if "equipment_name" in (body or {}):
+        job.equipment_name = str((body or {}).get("equipment_name") or "")[:200]
+    if "task_description" in (body or {}):
+        job.task_description = str((body or {}).get("task_description") or "")[:4000]
+    if "context_notes" in (body or {}):
+        job.context_notes = str((body or {}).get("context_notes") or "")[:8000]
+    db.commit()
+    db.refresh(job)
+    proc.safe_record(db, "tutorial", job.id, "studio", "succeeded", operation="update_metadata",
+                     actor=who["id"], summary={"title_chars": len(job.title)})
+    return _tutorial_out(job)
+
+
+@app.get("/api/tutorial/{jid}/content")
+def tutorial_get_content(jid: str, x_tutorial_token: str = Header(default=""), db: Session = Depends(get_db)):
+    """Current editable canonical content for Tutorial Studio."""
+    job = _get_tutorial(db, jid, x_tutorial_token)
+    return {"tutorial_id": job.id,
+            "content_revision": int(getattr(job, "content_revision", 1) or 1),
+            "transcript_original": getattr(job, "transcript_original", "") or job.full_transcript or "",
+            "transcript_corrected": getattr(job, "transcript_corrected", "") or "",
+            "timed_segments": job.timed_segments or [],
+            "steps": job.steps or [],
+            "materials": job.materials or [],
+            "updated_at": job.updated_at.isoformat() if getattr(job, "updated_at", None) else job.created_at.isoformat()}
+
+
+@app.put("/api/tutorial/{jid}/content")
+def tutorial_save_content(jid: str, body: dict, x_tutorial_token: str = Header(default=""), db: Session = Depends(get_db), who=Depends(actor)):
+    """Save canonical Studio content as a new immutable revision.
+
+    Preserves the original AI transcription separately, bumps
+    content_revision (optimistic concurrency via expected_revision), and
+    records a TutorialContentRevision row. Does NOT touch guides, drafts,
+    or approved procedures — regenerate explicitly via /guide.
+    """
+    from . import processing as proc
+    job = _get_tutorial(db, jid, x_tutorial_token)
+    _check_content_revision(job, body or {})
+    if not isinstance(body, dict):
+        raise HTTPException(422, "Request body must be an object")
+    touched: list[str] = []
+    if "transcript_corrected" in body:
+        corrected = str(body.get("transcript_corrected") or "")[:60000]
+        if not getattr(job, "transcript_original", ""):
+            job.transcript_original = job.full_transcript or ""
+        job.transcript_corrected = corrected
+        touched.append("transcript")
+    if "timed_segments" in body:
+        job.timed_segments = _normalize_segments(body.get("timed_segments"), job.duration_sec or 0)
+        touched.append("segments")
+    if "steps" in body:
+        job.steps = _normalize_studio_steps(body.get("steps"), job.duration_sec or 0)
+        touched.append("steps")
+    if "materials" in body:
+        mats = body.get("materials")
+        if not isinstance(mats, list):
+            raise HTTPException(422, "Materials must be a list")
+        job.materials = [str(m)[:300] for m in mats if str(m).strip()][:50]
+        touched.append("materials")
+    if not touched:
+        raise HTTPException(422, "Nothing to save: provide transcript_corrected, timed_segments, steps, or materials")
+    job.content_revision = int(getattr(job, "content_revision", 1) or 1) + 1
+    from sqlalchemy import func as _func
+    max_rev = db.scalar(select(_func.max(M.TutorialContentRevision.revision_number)).where(
+        M.TutorialContentRevision.tutorial_id == job.id)) or 0
+    rev = M.TutorialContentRevision(
+        tutorial_id=job.id, revision_number=int(max_rev) + 1,
+        transcript_corrected=getattr(job, "transcript_corrected", "") or "",
+        timed_segments=list(job.timed_segments or []),
+        steps=list(job.steps or []),
+        materials=list(job.materials or []),
+        actor=who["id"], note=str((body or {}).get("note", "") or "")[:500])
+    db.add(rev)
+    db.commit()
+    db.refresh(job)
+    db.refresh(rev)
+    proc.safe_record(db, "tutorial", job.id, "studio", "succeeded", operation="save_content",
+                     actor=who["id"], summary={"revision": rev.revision_number,
+                                              "touched": touched,
+                                              "steps": len(job.steps or [])})
+    return {"ok": True, "tutorial_id": job.id, "content_revision": job.content_revision,
+            "revision_id": rev.id, "revision_number": rev.revision_number, "touched": touched}
+
+
+@app.get("/api/tutorial/{jid}/revisions")
+def tutorial_list_revisions(jid: str, x_tutorial_token: str = Header(default=""), db: Session = Depends(get_db)):
+    """Saved content revisions, newest last. Originals live on the tutorial."""
+    job = _get_tutorial(db, jid, x_tutorial_token)
+    rows = db.scalars(select(M.TutorialContentRevision).where(
+        M.TutorialContentRevision.tutorial_id == job.id).order_by(M.TutorialContentRevision.revision_number)).all()
+    return {"tutorial_id": job.id, "current_revision": int(getattr(job, "content_revision", 1) or 1),
+            "revisions": [{"id": r.id, "revision_number": r.revision_number,
+                           "steps": len(r.steps or []),
+                           "transcript_chars": len(r.transcript_corrected or ""),
+                           "actor": r.actor, "note": r.note or "",
+                           "created_at": r.created_at.isoformat()} for r in rows]}
+
+
+@app.post("/api/tutorial/{jid}/revisions/{rid}/restore")
+def tutorial_restore_revision(jid: str, rid: str, body: dict, x_tutorial_token: str = Header(default=""), db: Session = Depends(get_db), who=Depends(actor)):
+    """Restore a prior content revision as a NEW revision (history preserved)."""
+    from . import processing as proc
+    job = _get_tutorial(db, jid, x_tutorial_token)
+    _check_content_revision(job, body or {})
+    rev = db.get(M.TutorialContentRevision, rid)
+    if rev is None or rev.tutorial_id != job.id:
+        raise HTTPException(404, "Content revision not found")
+    job.transcript_corrected = rev.transcript_corrected or ""
+    job.timed_segments = list(rev.timed_segments or [])
+    job.steps = list(rev.steps or [])
+    job.materials = list(rev.materials or [])
+    job.content_revision = int(getattr(job, "content_revision", 1) or 1) + 1
+    from sqlalchemy import func as _func
+    max_rev = db.scalar(select(_func.max(M.TutorialContentRevision.revision_number)).where(
+        M.TutorialContentRevision.tutorial_id == job.id)) or 0
+    nxt = M.TutorialContentRevision(
+        tutorial_id=job.id, revision_number=int(max_rev) + 1,
+        transcript_corrected=job.transcript_corrected or "",
+        timed_segments=list(job.timed_segments or []),
+        steps=list(job.steps or []), materials=list(job.materials or []),
+        actor=who["id"], note=f"Restored from revision {rev.revision_number}")
+    db.add(nxt)
+    db.commit()
+    db.refresh(job)
+    proc.safe_record(db, "tutorial", job.id, "studio", "succeeded", operation="restore_content",
+                     actor=who["id"], summary={"from_revision": rev.revision_number,
+                                              "to_revision": nxt.revision_number})
+    return {"ok": True, "tutorial_id": job.id, "content_revision": job.content_revision,
+            "revision_number": nxt.revision_number}
+
+
+@app.get("/api/tutorial/{jid}/video-guides")
+def tutorial_video_guide_history(jid: str, x_tutorial_token: str = Header(default=""), db: Session = Depends(get_db)):
+    """Every rendered video-guide version, oldest first. MP4s are never overwritten."""
+    job = _get_tutorial(db, jid, x_tutorial_token)
+    rows = db.scalars(select(M.VideoGuide).where(
+        M.VideoGuide.tutorial_id == job.id).order_by(M.VideoGuide.created_at)).all()
+    return {"tutorial_id": job.id,
+            "versions": [_video_guide_out(vg) for vg in rows]}
+
+
+@app.get("/api/tutorial/{jid}/video-guides/{vgid}/file")
+def tutorial_video_guide_version_file(jid: str, vgid: str, token: str = "", db: Session = Depends(get_db)):
+    """Serve one specific rendered MP4 version (token-gated, like other media)."""
+    from fastapi.responses import FileResponse
+    job = _get_tutorial(db, jid, token)
+    vg = db.get(M.VideoGuide, vgid)
+    if vg is None or vg.tutorial_id != job.id:
+        raise HTTPException(404, "Video guide version not found")
+    if vg.status != "ready" or not vg.storage_key:
+        raise HTTPException(409, "That video version is not finished rendering yet")
+    path = Path(__file__).resolve().parent.parent / vg.storage_key
+    if not path.is_file():
+        raise HTTPException(404, "Video guide file missing")
+    return FileResponse(path, media_type="video/mp4",
+                        filename=f"{(job.title or 'tutorial-guide').strip() or 'tutorial-guide'}-v{getattr(vg, 'version_number', 0) or 0}.mp4")
+
+
+@app.put("/api/tutorial/{jid}/video-guide/scenes")
+def tutorial_video_guide_save_scenes(jid: str, body: dict, x_tutorial_token: str = Header(default=""), db: Session = Depends(get_db), who=Depends(actor)):
+    """Save an edited scene plan as a draft (no render yet, no prior MP4 touched).
+
+    Validates ranges against the source duration and rejects references to
+    missing files by basename. Rendering happens explicitly via /render.
+    """
+    from . import videoguide as vgmod
+    from . import processing as proc
+    job = _get_tutorial(db, jid, x_tutorial_token)
+    scenes = (body or {}).get("scenes")
+    try:
+        clean = vgmod.validate_scene_plan(scenes, job.duration_sec or 0)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    for c in clean:
+        name = (c.get("visual") or {}).get("name", "")
+        if name:
+            safe = Path(str(name)).name
+            if safe != str(name) or Path(safe).suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp"):
+                raise HTTPException(422, f"Scene {c['step']}: invalid visual name")
+    job_dir = Path(__file__).resolve().parent.parent / "data" / "tutorials" / job.id
+    missing: list[str] = []
+    for c in clean:
+        name = (c.get("visual") or {}).get("name", "")
+        if name and not (job_dir / Path(str(name)).name).is_file():
+            missing.append(f"scene {c['step']}: {name}")
+    if missing:
+        raise HTTPException(422, "Visual not found for " + "; ".join(missing[:5]))
+    draft = db.scalar(select(M.VideoGuide).where(
+        M.VideoGuide.tutorial_id == job.id, M.VideoGuide.status == "draft"
+    ).order_by(M.VideoGuide.created_at.desc()))
+    if draft is None:
+        draft = M.VideoGuide(tutorial_id=job.id, status="draft", progress=0,
+                             version_number=0, created_by=who["id"],
+                             provenance={"trigger": "studio_scene_draft"})
+        db.add(draft)
+        db.flush()
+    draft.scenes = clean
+    from sqlalchemy.orm.attributes import flag_modified as _flag_modified
+    _flag_modified(draft, "scenes")
+    db.commit()
+    db.refresh(draft)
+    proc.safe_record(db, "tutorial", job.id, "video_guide", "succeeded", operation="save_scene_plan",
+                     actor=who["id"], summary={"scenes": len(clean)})
+    return {"ok": True, "tutorial_id": job.id, "video_guide_id": draft.id, "scenes": clean}
+
+
+@app.post("/api/tutorial/{jid}/video-guide/render")
+def tutorial_video_guide_render(jid: str, body: dict, x_tutorial_token: str = Header(default=""), db: Session = Depends(get_db), who=Depends(actor)):
+    """Render a NEW versioned MP4 from an edited scene plan (or the saved draft).
+
+    Every render creates a separate persistent VideoGuide version — prior
+    MP4s are never overwritten. The voiceover stays a cut of the user's own
+    original recording; captions never imply changed narration.
+    """
+    from . import videoguide as vgmod
+    job = _get_tutorial(db, jid, x_tutorial_token)
+    scenes = (body or {}).get("scenes") if isinstance(body, dict) else None
+    if scenes is None:
+        draft = db.scalar(select(M.VideoGuide).where(
+            M.VideoGuide.tutorial_id == job.id, M.VideoGuide.status == "draft"
+        ).order_by(M.VideoGuide.created_at.desc()))
+        if draft is not None and draft.scenes:
+            scenes = draft.scenes
+    if scenes is None:
+        raise HTTPException(422, "No scene plan saved yet — edit scenes first, then render")
+    try:
+        vg, dup = vgmod.start_video_guide(job.id, actor=who["id"], force=True, scenes=scenes)
+    except ValueError as e:
+        msg = str(e)
+        code = 429 if "limit" in msg else 409 if "finished processing" in msg else 422
+        raise HTTPException(code, msg)
+    return {"ok": True, "video_guide": _video_guide_out(vg), "duplicate": dup}
+
+
 def _visual_out(a: M.VisualAsset) -> dict:
     return {"id": a.id, "tutorial_id": a.tutorial_id, "parent_id": a.parent_id, "kind": a.kind,
             "status": a.status, "step_id": a.step_id or None, "version_id": a.version_id or None,
@@ -1193,6 +1563,7 @@ def visual_file(aid: str, token: str = "", x_tutorial_token: str = Header(defaul
 
 def _video_guide_out(vg) -> dict:
     return {"id": vg.id, "tutorial_id": vg.tutorial_id, "status": vg.status,
+            "version_number": getattr(vg, "version_number", 0) or 0,
             "progress": vg.progress, "error": vg.error or "",
             "asset_id": vg.asset_id or None,
             "video_url": f"/api/tutorial/{vg.tutorial_id}/video-guide/file" if vg.status == "ready" else None,
