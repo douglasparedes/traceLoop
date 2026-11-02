@@ -1,12 +1,13 @@
 // Video guide (MP4 cut from the user's own recorded narration) contracts + API.
 import { api, authHeaders, API, getIdentity } from "./api";
 
-export type VideoGuideStatus = "none" | "queued" | "rendering" | "ready" | "error";
+export type VideoGuideStatus = "none" | "queued" | "rendering" | "validating" | "ready" | "error";
 
 export interface VideoGuide {
   id: string;
   tutorial_id: string;
   status: Exclude<VideoGuideStatus, "none">;
+  version_number: number;
   progress: number;
   error: string;
   asset_id: string | null;
@@ -14,6 +15,12 @@ export interface VideoGuide {
   scenes: { step: number; title: string; caption: string }[];
   simulated: boolean;
   provenance: Record<string, unknown>;
+  staleness?: {
+    stale: boolean;
+    changed: string[];
+    video_guide_id: string;
+    version_number: number;
+  };
   created_at: string;
 }
 
@@ -36,4 +43,9 @@ export async function fetchVideoGuide(tutorialId: string, token: string): Promis
 
 export function videoGuideFileUrl(tutorialId: string, token: string): string {
   return `${API}/api/tutorial/${tutorialId}/video-guide/file?token=${encodeURIComponent(token)}`;
+}
+
+/** Version-aware file URL: preview and download the exact selected version. */
+export function videoGuideVersionFileUrl(tutorialId: string, versionId: string, token: string): string {
+  return `${API}/api/tutorial/${tutorialId}/video-guides/${versionId}/file?token=${encodeURIComponent(token)}`;
 }

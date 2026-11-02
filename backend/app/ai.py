@@ -528,8 +528,9 @@ _IMAGE_TOOLS_OFF = {"enable_image_search": False, "enable_web_search": False, "e
 def _image_error(e: Exception, op: str) -> dict:
     """Honest failure envelope. Never fabricates image bytes.
 
-    503 (retryable) and 5xx are surfaced distinctly from 400 validation /
-    safety blocks so callers can decide whether a retry makes sense.
+    Retryable outages, auth/key problems (unauthorized), safety blocks
+    (blocked), and validation bugs (error) are surfaced distinctly so
+    callers map to the right HTTP code and the UI can explain next steps.
     """
     status = getattr(getattr(e, "response", None), "status_code", None)
     detail = f" HTTP {status}" if status else ""
@@ -540,6 +541,9 @@ def _image_error(e: Exception, op: str) -> dict:
         msg = str(err.get("message", "") or "")
     except Exception:
         code, msg = "", ""
+    if status in (401, 403):
+        return {"ok": False, "model": IMAGE_MODEL, "simulated": False, "status": "unauthorized",
+                "note": f"Muse Image rejected the API key (HTTP {status}). Check META_API_KEY — original kept."}
     if status == 503:
         return {"ok": False, "model": IMAGE_MODEL, "simulated": False, "status": "retryable",
                 "note": f"Muse Image temporarily unavailable{detail} — safe to retry once. {msg}".strip()}
@@ -548,6 +552,24 @@ def _image_error(e: Exception, op: str) -> dict:
                 "note": "Muse Image declined this prompt (safety filter). Rephrase the request."}
     return {"ok": False, "model": IMAGE_MODEL, "simulated": False, "status": "error",
             "note": f"Muse Image {op} failed ({type(e).__name__}{detail}). Original image kept." + (f" {msg}" if msg and len(msg) < 200 else "")}
+
+
+def valid_image_bytes(raw: bytes) -> str | None:
+    """File-signature check for generated image bytes.
+
+    Returns the verified MIME type (png/jpeg/webp) or None. Trusts magic
+    bytes, never the provider's output_format label. Limited to the types
+    the visual store serves.
+    """
+    if not raw or len(raw) < 12:
+        return None
+    if raw[:8] == b"\x89PNG\r\n\x1a\n":
+        return "image/png"
+    if raw[:3] == b"\xff\xd8\xff":
+        return "image/jpeg"
+    if raw[:4] == b"RIFF" and raw[8:12] == b"WEBP":
+        return "image/webp"
+    return None
 
 
 def _image_result(data: dict, usage: dict | None) -> dict:
@@ -1484,14 +1506,17 @@ def _segments_for_range(segments: list[dict], start: float, end: float) -> list[
     return out
 
 
-def _fallback_scenes(title: str, steps: list[dict], objects: list[dict], segments: list[dict]) -> list[dict]:
+def _fallback_scenes(title: str, steps: list[dict], objects: list[dict], segments: list[dict],
+                   accepted_visuals: list[dict] | None = None) -> list[dict]:
     """Deterministic scene plan from the canonical procedure (no model call).
 
     Narration is verbatim transcript where it overlaps the step, else the
     step summary (labelled as such in the caption). Visuals reuse only real
-    object illustration files. Nothing is invented.
+    object illustration files — accepted step visuals preferred.
+    Nothing is invented.
     """
     by_obj = {o.get("obj_id"): o for o in (objects or [])}
+    by_label = {str(o.get("label", "")).lower(): o for o in (objects or []) if o.get("label")}
     scenes = []
     for s in (steps or []):
         try:
@@ -1515,6 +1540,18 @@ def _fallback_scenes(title: str, steps: list[dict], objects: list[dict], segment
                           "name": o.get("overlay") or o.get("illustration"),
                           "label": o.get("label", "object")}
                 break
+        if accepted_visuals:
+            step_labels = {str(by_obj.get(int(oid), {}).get("label", "")).lower()
+                           for oid in (s.get("objects_used") or [])
+                           if isinstance(oid, int) or (isinstance(oid, str) and oid.isdigit())}
+            for av in accepted_visuals:
+                av_label = str(av.get("label", "") or "").lower()
+                if av.get("name") and (not step_labels or
+                                       any(av_label and ((av_label in (lbl or "")) or ((lbl or "") in av_label))
+                                           for lbl in step_labels)):
+                    visual = {"kind": "accepted", "name": str(av["name"]),
+                              "label": av.get("label", "accepted visual")}
+                    break
         scenes.append({"step_number": int(s.get("step_number", len(scenes) + 1)),
                        "title": str(s.get("title", "") or f"Step {len(scenes) + 1}"),
                        "narration": narration, "caption": narration,
@@ -1525,25 +1562,55 @@ def _fallback_scenes(title: str, steps: list[dict], objects: list[dict], segment
     return scenes
 
 
-def plan_video_scenes(title: str, steps: list[dict], objects: list[dict], segments: list[dict]) -> dict:
+_GUIDE_FORMAT_DIRECTION = {
+    "work_instruction": "Present the procedure step-by-step as short imperative cards, in guide order.",
+    "reference_manual": "This is a REFERENCE manual, not a linear procedure: plan a concise explanatory overview of the key procedures instead of dumping the whole document on screen.",
+    "interactive": "This guide is for INTERACTIVE guided execution: keep each scene to a short action plus its expected result and verification check.",
+}
+
+
+def plan_video_scenes(title: str, steps: list[dict], objects: list[dict], segments: list[dict],
+                      guide_markdown: str = "", guide_format: str = "",
+                      accepted_visuals: list[dict] | None = None) -> dict:
     """Muse Spark: plan video scenes (title, narration, caption, visual) per step.
 
-    Narration must quote the recorded transcript; the voiceover track is cut
-    from the user's own audio, so invented lines would desync picture and
-    sound. Visuals may only reference real object illustration files.
+    The generated guide is the source of truth: when guide_markdown is
+    supplied it steers scene order, captions, and emphasis (plus
+    format-specific direction), and accepted step visuals are preferred
+    over raw segmentation cutouts. Narration must quote the recorded
+    transcript; the voiceover track is cut from the user's own audio, so
+    invented lines would desync picture and sound. Visuals may only
+    reference real files (accepted assets or object illustrations) — never
+    illustrative alternatives, never invented imagery.
     Returns {scenes, simulated, model, note?} — scenes always present.
     """
-    fallback = _fallback_scenes(title, steps, objects, segments)
+    fallback = _fallback_scenes(title, steps, objects, segments,
+                                accepted_visuals=accepted_visuals)
     if not live_enabled():
-        return {"scenes": fallback, "simulated": True, "model": SPARK_MODEL,
-                "note": "Deterministic scene plan (no META_API_KEY). Configure the key for live Muse Spark planning."}
+        note = "Deterministic scene plan (no META_API_KEY). Configure the key for live Muse Spark planning."
+        if guide_markdown:
+            note += " Guided by the generated guide's structure."
+        return {"scenes": fallback, "simulated": True, "model": SPARK_MODEL, "note": note}
     known = {o.get("label", "") for o in (objects or []) if o.get("label")}
+    guide_ctx = ""
+    if guide_markdown:
+        direction = _GUIDE_FORMAT_DIRECTION.get((guide_format or "").strip(),
+                                                "Follow the guide's structure and order.")
+        guide_ctx = (f"\nGenerated guide (format: {guide_format or 'unspecified'} — {direction})\n"
+                     f"--- guide begins ---\n{(guide_markdown or '')[:4000]}\n--- guide ends ---\n"
+                     "Scene titles/captions must stay consistent with this guide; never contradict it.")
+    accepted_ctx = ""
+    if accepted_visuals:
+        accepted_ctx = ("\nAccepted step visuals (prefer these over raw cutouts; match by label): " +
+                        ", ".join(f"{a.get('label', '')} -> {a.get('name', '')}"
+                                   for a in accepted_visuals[:20]))
     system = (
         "Plan a step-by-step tutorial video from the validated procedure steps, objects, and transcript excerpts. "
         "One scene per step, in order. For each scene: step_number, a short title, narration QUOTING the transcript "
         "excerpts for that step's time range (never invent lines — the voiceover is cut from the user's own recording, "
         "so invented narration would desync), a one-line caption, and visual_label naming which listed object to show "
         "(must be one of the known object labels, or empty if none fits). Never invent tools, values, warnings, or steps."
+        + guide_ctx + accepted_ctx
     )
     user = (f"Title: {title}\nSteps: {json.dumps(steps)}\nObjects: {json.dumps(objects)}\n"
             f"Known object labels: {sorted(known)}\nTranscript excerpts:\n" + "\n".join(
@@ -1585,6 +1652,22 @@ def plan_video_scenes(title: str, steps: list[dict], objects: list[dict], segmen
                               "name": o.get("overlay") or o.get("illustration"),
                               "label": o.get("label", "object")}
                     break
+            # Accepted step visuals win over raw cutouts: they are reviewed,
+            # human-approved, and already linked to the guide. Illustrative
+            # alternatives are never eligible (filtered at the source).
+            if accepted_visuals:
+                for av in accepted_visuals:
+                    av_label = str(av.get("label", "") or "").lower()
+                    av_name = str(av.get("name", "") or "")
+                    if not av_name:
+                        continue
+                    if (want and (want in av_label or av_label in want)) or \
+                       (not want and any(av_label and av_label in str(o.get("label", "") or "").lower()
+                                         for o in (objects or [])
+                                         if str(o.get("obj_id", "")) in [str(x) for x in (base.get("objects_used") or [])])):
+                        visual = {"kind": "accepted", "name": av_name,
+                                  "label": av.get("label", "accepted visual")}
+                        break
             segs = _segments_for_range(segments, start, end)
             quoted = " ".join(str(x.get("text", "")) for x in segs)
             grounded = bool(quoted and narration and (narration[:40] in quoted or quoted[:40] in narration))
@@ -1598,7 +1681,8 @@ def plan_video_scenes(title: str, steps: list[dict], objects: list[dict], segmen
             raise ValueError("no valid scenes")
         return {"scenes": sorted(scenes, key=lambda s: s["step_number"]), "simulated": False, "model": SPARK_MODEL}
     except Exception as e:
-        out = _fallback_scenes(title, steps, objects, segments)
+        out = _fallback_scenes(title, steps, objects, segments,
+                               accepted_visuals=accepted_visuals)
         for s in out:
             s["simulated"] = True
         return {"scenes": out, "simulated": True, "model": SPARK_MODEL,

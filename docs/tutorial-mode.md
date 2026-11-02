@@ -94,10 +94,11 @@ click-to-seek, and Copy Markdown / Download .md /
   timed segments + canonical structured steps with reorder/tools/object
   links, saved as `tutorial_content_revisions`), Guide (format change,
   regenerate, immutable snapshot history with compare, Review draft
-  link), Video (AI-suggested scene plan from the processed content via
-  `GET /api/tutorial/{id}/video-guide/suggest` — one scene per guide
-  step, editable before render — + versioned MP4 renders, original-voice
-  cuts only), Visuals (VisualStudio integration with accept/reject and
+  link), Video (one-click automatic generation: server composes the video
+  from the current guide via `GET /api/tutorial/{id}/video-guide/suggest`
+  planning + `POST /api/tutorial/{id}/video-guide` render — no scene
+  editing required; versioned MP4 renders, original-voice cuts or silent
+  captions; staleness shown when the guide moves on), Visuals (VisualStudio integration with accept/reject and
   provenance; missing/unloadable images render an explicit message,
   never an empty frame). Content saves bump `content_revision` (optimistic
   concurrency via `expected_revision`); guides/drafts update only on

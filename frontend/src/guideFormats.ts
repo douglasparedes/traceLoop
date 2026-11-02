@@ -156,7 +156,7 @@ export async function annotateVisual(tutorialId: string, token: string, body: Re
 }
 
 export async function acceptVisual(id: string, opts: { step_id?: string; version_id?: string } = {}) {
-  return api.post<{ ok: boolean; asset: VisualAsset; already?: boolean; evidence_id?: string | null }>(`/api/visuals/${id}/accept`, opts, {});
+  return api.post<{ ok: boolean; asset: VisualAsset; already?: boolean; evidence_id?: string | null; snapshot_id?: string | null }>(`/api/visuals/${id}/accept`, opts, {});
 }
 
 export async function rejectVisual(id: string) {

@@ -18,6 +18,7 @@ from PIL import Image, ImageDraw
 from . import ai
 from .db import SessionLocal
 from . import models as M
+from . import storage as _storage
 from sqlalchemy import func, select
 
 TRACKING_FPS = 6
@@ -643,7 +644,10 @@ def _ensure_object_evidence(db, job: M.TutorialJob, objects: list) -> tuple[dict
             key = f"data/tutorials/{job.id}/{name}"
             eid = existing.get(key)
             if eid is None:
-                path = BASE / "data" / "tutorials" / job.id / name
+                try:
+                    path = _storage.media_path(key)
+                except ValueError:
+                    continue
                 if not path.is_file():
                     continue
                 e = M.Evidence(capture_session_id=None, evidence_type="image",
@@ -1148,9 +1152,12 @@ def run_job(job_id: str) -> None:
         if job is None:
             return
         actor = job.actor or ""
-        job_dir = BASE / "data" / "tutorials" / job_id
+        job_dir = _storage.media_root() / "tutorials" / job_id
         job_dir.mkdir(parents=True, exist_ok=True)
-        source = BASE / job.video_storage_key
+        try:
+            source = _storage.media_path(job.video_storage_key or "")
+        except ValueError:
+            raise RuntimeError("The uploaded video file is missing or has an invalid storage reference")
         try:
             with proc.timed() as t:
                 info = probe_video(source)
@@ -1461,8 +1468,11 @@ def resegment_object_tap(job_id: str, obj_id: int, nx: float, ny: float) -> dict
         job = db.get(M.TutorialJob, job_id)
         if job is None:
             raise ValueError("Tutorial not found")
-        job_dir = BASE / "data" / "tutorials" / job_id
-        source = BASE / job.video_storage_key
+        job_dir = _storage.media_root() / "tutorials" / job_id
+        try:
+            source = _storage.media_path(job.video_storage_key or "")
+        except ValueError:
+            raise ValueError("The uploaded video file is missing or has an invalid storage reference")
         tracking = job_dir / "tracking.mp4"
         if ai.live_enabled() and not tracking.exists():
             # Live SAM needs the tracking copy; simulated tap only needs the

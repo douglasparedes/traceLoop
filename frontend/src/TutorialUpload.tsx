@@ -8,6 +8,7 @@ import { Icon } from "./icons";
 import {
   ANALYSIS_MODES, validateTutorialFile, checkStorageFor, queueTutorialUpload,
   runQueuedUpload, listQueuedUploads, removeQueuedUpload, parseUploadResponse,
+  refreshQueuedUpload, findReusableUpload,
   type AnalysisMode, type QueuedTutorialUpload,
 } from "./uploadQueue";
 import type { LibraryItem } from "./TutorialLibrary";
@@ -90,6 +91,7 @@ export default function TutorialUpload({ mode, onModeChange, onOpenStudio, onUpl
     }
     setJob(null);
     setUploadFailed(false);
+    setQueuedKey(null);
   }
 
   const [uploadFailed, setUploadFailed] = useState(false);
@@ -105,11 +107,24 @@ export default function TutorialUpload({ mode, onModeChange, onOpenStudio, onUpl
     setUploading(true);
     setPct(0);
     try {
-      // Queue first: the blob survives reloads until the server confirms.
-      const entry = await queueTutorialUpload({
-        blob: file, filename: file.name, title: title.trim(),
-        equipment, task, notes, mode, origin: "uploaded",
-      });
+      // Reuse the existing queue entry for this file when retrying: a retry
+      // must resume the same server session, not create a duplicate entry
+      // (and a second TutorialJob) for the same selected file.
+      let entry: QueuedTutorialUpload | null = null;
+      if (queuedKey) {
+        const existing = findReusableUpload(await listQueuedUploads(), queuedKey, file.size);
+        if (existing) {
+          entry = await refreshQueuedUpload(existing.key, {
+            title: title.trim(), equipment, task, notes, mode,
+          });
+        }
+      }
+      if (!entry) {
+        entry = await queueTutorialUpload({
+          blob: file, filename: file.name, title: title.trim(),
+          equipment, task, notes, mode, origin: "uploaded",
+        });
+      }
       setQueuedKey(entry.key);
       const j = await runQueuedUpload(entry, setPct, cancelRef.current);
       setPct(null);
@@ -157,6 +172,7 @@ export default function TutorialUpload({ mode, onModeChange, onOpenStudio, onUpl
             <button className="btn secondary" onClick={() => { setFile(null); setJob(null); setUploadFailed(false); setError(""); }} disabled={uploading}>Clear file</button>
           </div>
           {pct !== null && <div className="progress" role="progressbar" aria-valuenow={pct} aria-valuemin={0} aria-valuemax={100} aria-label="Upload progress" style={{ marginTop: 8 }}><div style={{ width: `${pct}%` }} /></div>}
+          {pct !== null && <p className="muted small-text num" role="status">Uploading… server confirmed {pct}% — safe to leave; retry resumes where the server stopped.</p>}
           {queuedKey && pct === null && !job && (
             <p className="muted small-text" role="status">Queued on this device — safe to leave; retry resumes the same file.</p>
           )}

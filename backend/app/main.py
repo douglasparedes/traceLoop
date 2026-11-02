@@ -17,6 +17,22 @@ from . import models as M, schemas as S
 from . import ai
 from . import live as live_mod
 from . import tutorial as tut
+from . import storage as _storage
+
+
+def _key_file(key: str):
+    """Resolve a DB storage key to its file, or None when missing/invalid.
+
+    Never raises and never escapes the media root — use for existence
+    checks and for serving media under a configured MEDIA_ROOT.
+    """
+    if not key:
+        return None
+    try:
+        p = _storage.media_path(key)
+    except ValueError:
+        return None
+    return p if p.is_file() else None
 
 Base.metadata.create_all(bind=engine)
 
@@ -421,7 +437,7 @@ async def add_image(cid: str, file: UploadFile = File(...), description: str = F
                    source_reference=file.filename or "photo", created_by=who["id"], extra={"sha256_16": digest, "size": len(data)})
     db.add(e); db.flush()
     suffix = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}.get(file.content_type or "", ".jpg")
-    store_dir = Path(__file__).resolve().parent.parent / "data" / "evidence"
+    store_dir = _storage.media_root() / "evidence"
     store_dir.mkdir(parents=True, exist_ok=True)
     (store_dir / f"{e.id}{suffix}").write_bytes(data)
     e.storage_key = f"data/evidence/{e.id}{suffix}"
@@ -549,7 +565,7 @@ def version_evidence(vid: str, db: Session = Depends(get_db)):
         if seg is not None:
             seg_out = {"id": seg.id, "geometry": seg.normalized_geometry, "simulated": bool(seg.simulated),
                        "status": seg.result_status, "prompt": seg.prompt_text, "model": seg.provider_model}
-        has_file = bool(e.storage_key) and (Path(__file__).resolve().parent.parent / e.storage_key).is_file()
+        has_file = _key_file(e.storage_key) is not None
         items.append({"id": e.id, "evidence_type": e.evidence_type, "description": e.description,
                       "text_content": e.text_content, "source_reference": e.source_reference,
                       "image_url": f"/api/evidence/{e.id}/image" if e.evidence_type == "image" and has_file else None,
@@ -569,8 +585,8 @@ def evidence_image(eid: str, db: Session = Depends(get_db)):
     from fastapi.responses import FileResponse
     e = db.get(M.Evidence, eid)
     if not e or e.evidence_type != "image" or not e.storage_key: raise HTTPException(404, "Evidence image not found")
-    path = Path(__file__).resolve().parent.parent / e.storage_key
-    if not path.is_file(): raise HTTPException(404, "Evidence image file missing")
+    path = _key_file(e.storage_key)
+    if path is None: raise HTTPException(404, "Evidence image file missing")
     media = {".png": "image/png", ".webp": "image/webp"}.get(path.suffix.lower(), "image/jpeg")
     return FileResponse(path, media_type=media, filename=path.name)
 
@@ -722,11 +738,10 @@ def reject(vid: str, body: S.ReviewAction, db: Session = Depends(get_db), who=De
 
 
 def _evidence_image(e: M.Evidence) -> tuple[bytes | None, str]:
-    if e.storage_key:
-        path = Path(__file__).resolve().parent.parent / e.storage_key
-        if path.is_file():
-            ct = {".png": "image/png", ".webp": "image/webp"}.get(path.suffix.lower(), "image/jpeg")
-            return path.read_bytes(), ct
+    path = _key_file(e.storage_key or "")
+    if path is not None:
+        ct = {".png": "image/png", ".webp": "image/webp"}.get(path.suffix.lower(), "image/jpeg")
+        return path.read_bytes(), ct
     return None, "image/jpeg"
 
 
@@ -1219,8 +1234,8 @@ def get_tutorial(jid: str, x_tutorial_token: str = Header(default=""), db: Sessi
 def tutorial_video(jid: str, token: str = "", db: Session = Depends(get_db)):
     from fastapi.responses import FileResponse
     job = _get_tutorial(db, jid, token)
-    path = Path(__file__).resolve().parent.parent / job.video_storage_key
-    if not path.is_file(): raise HTTPException(404, "Tutorial video missing")
+    path = _key_file(job.video_storage_key or "")
+    if path is None: raise HTTPException(404, "Tutorial video missing")
     media = {".webm": "video/webm", ".mov": "video/quicktime", ".mkv": "video/x-matroska"}.get(path.suffix.lower(), "video/mp4")
     return FileResponse(path, media_type=media, filename=path.name)
 
@@ -1231,7 +1246,7 @@ def tutorial_illustration(jid: str, name: str, token: str = "", db: Session = De
     job = _get_tutorial(db, jid, token)
     safe = Path(name).name
     if safe != name or not safe.endswith(".png"): raise HTTPException(404, "Illustration not found")
-    path = Path(__file__).resolve().parent.parent / "data" / "tutorials" / jid / safe
+    path = _storage.media_root() / "tutorials" / jid / safe
     if not path.is_file(): raise HTTPException(404, "Illustration not found")
     return FileResponse(path, media_type="image/png", filename=safe)
 
@@ -1367,7 +1382,7 @@ def tutorial_retry(jid: str, x_tutorial_token: str = Header(default=""), db: Ses
 def tutorial_delete(jid: str, x_tutorial_token: str = Header(default=""), db: Session = Depends(get_db), who=Depends(actor)):
     import shutil as _shutil
     job = _get_tutorial(db, jid, x_tutorial_token)
-    store_dir = Path(__file__).resolve().parent.parent / "data" / "tutorials" / jid
+    store_dir = _storage.media_root() / "tutorials" / jid
     if store_dir.is_dir(): _shutil.rmtree(store_dir, ignore_errors=True)
     db.delete(job); db.commit()
     return {"ok": True}
@@ -1522,7 +1537,7 @@ def tutorial_diagnostic_frame(jid: str, obj_id: int, token: str = "", db: Sessio
     if obj is None: raise HTTPException(404, "Object not found")
     names = [n for n in [obj.get("diagnostic_frame")] if n]
     for n in names:
-        path = Path(__file__).resolve().parent.parent / "data" / "tutorials" / jid / Path(n).name
+        path = _storage.media_root() / "tutorials" / jid / Path(n).name
         if path.is_file():
             return FileResponse(path, media_type="image/jpeg", filename=path.name)
     raise HTTPException(404, "No diagnostic frame recorded for this object")
@@ -1830,11 +1845,19 @@ def tutorial_restore_revision(jid: str, rid: str, body: dict, x_tutorial_token: 
 @app.get("/api/tutorial/{jid}/video-guides")
 def tutorial_video_guide_history(jid: str, x_tutorial_token: str = Header(default=""), db: Session = Depends(get_db)):
     """Every rendered video-guide version, oldest first. MP4s are never overwritten."""
+    from . import videoguide as vgmod
     job = _get_tutorial(db, jid, x_tutorial_token)
     rows = db.scalars(select(M.VideoGuide).where(
         M.VideoGuide.tutorial_id == job.id).order_by(M.VideoGuide.created_at)).all()
+    versions = []
+    for vg in rows:
+        out = _video_guide_out(vg)
+        if vg.status == "ready":
+            out["staleness"] = vgmod.describe_staleness(db, job, vg)
+        versions.append(out)
     return {"tutorial_id": job.id,
-            "versions": [_video_guide_out(vg) for vg in rows]}
+            "versions": versions,
+            "limits": {"max_video_guide_sec": vgmod.MAX_VIDEO_GUIDE_SEC}}
 
 
 @app.get("/api/tutorial/{jid}/video-guides/{vgid}/file")
@@ -1847,8 +1870,8 @@ def tutorial_video_guide_version_file(jid: str, vgid: str, token: str = "", db: 
         raise HTTPException(404, "Video guide version not found")
     if vg.status != "ready" or not vg.storage_key:
         raise HTTPException(409, "That video version is not finished rendering yet")
-    path = Path(__file__).resolve().parent.parent / vg.storage_key
-    if not path.is_file():
+    path = _key_file(vg.storage_key or "")
+    if path is None:
         raise HTTPException(404, "Video guide file missing")
     return FileResponse(path, media_type="video/mp4",
                         filename=f"{(job.title or 'tutorial-guide').strip() or 'tutorial-guide'}-v{getattr(vg, 'version_number', 0) or 0}.mp4")
@@ -1875,12 +1898,15 @@ def tutorial_video_guide_save_scenes(jid: str, body: dict, x_tutorial_token: str
             safe = Path(str(name)).name
             if safe != str(name) or Path(safe).suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp"):
                 raise HTTPException(422, f"Scene {c['step']}: invalid visual name")
-    job_dir = Path(__file__).resolve().parent.parent / "data" / "tutorials" / job.id
+    job_dir = _storage.media_root() / "tutorials" / job.id
     missing: list[str] = []
     for c in clean:
         name = (c.get("visual") or {}).get("name", "")
-        if name and not (job_dir / Path(str(name)).name).is_file():
+        if name and not (job_dir / Path(str(name)).name).is_file() \
+                and not (job_dir / "visuals" / Path(str(name)).name).is_file():
             missing.append(f"scene {c['step']}: {name}")
+    if missing:
+        raise HTTPException(422, "Visual not found for " + "; ".join(missing[:5]))
     if missing:
         raise HTTPException(422, "Visual not found for " + "; ".join(missing[:5]))
     draft = db.scalar(select(M.VideoGuide).where(
@@ -1918,7 +1944,7 @@ def tutorial_video_guide_suggest(jid: str, x_tutorial_token: str = Header(defaul
     if job.status != "done":
         raise HTTPException(409, "The tutorial has not finished processing yet")
     try:
-        out = vgmod.suggest_scene_plan(job)
+        out = vgmod.suggest_scene_plan(job, db=db)
     except ValueError as e:
         raise HTTPException(422, str(e))
     proc.safe_record(db, "tutorial", job.id, "video_guide", "succeeded", operation="suggest_scene_plan",
@@ -1970,7 +1996,7 @@ def _visual_source_bytes(db: Session, job: M.TutorialJob, spec: dict) -> tuple[b
     to (bytes, mime, parent_id, label). Validates ownership and type."""
     from PIL import Image as _Image
     kind = str(spec.get("kind", ""))
-    job_dir = Path(__file__).resolve().parent.parent / "data" / "tutorials" / job.id
+    job_dir = _storage.media_root() / "tutorials" / job.id
     if kind == "evidence":
         e = db.get(M.Evidence, str(spec.get("id", "")))
         if not e or e.evidence_type != "image" or not e.storage_key:
@@ -1979,16 +2005,16 @@ def _visual_source_bytes(db: Session, job: M.TutorialJob, spec: dict) -> tuple[b
         # anything else is rejected.
         if e.source_reference != f"tutorial:{job.id}" and not str(e.source_reference or "").startswith("tutorial:"):
             raise HTTPException(403, "That evidence does not belong to this tutorial")
-        path = Path(__file__).resolve().parent.parent / e.storage_key
-        if not path.is_file():
+        path = _key_file(e.storage_key or "")
+        if path is None:
             raise HTTPException(404, "Source image file missing")
         return path.read_bytes(), "image/" + path.suffix.lstrip(".").lower().replace("jpg", "jpeg"), f"evidence:{e.id}", e.description or "evidence"
     if kind == "asset":
         a = db.get(M.VisualAsset, str(spec.get("id", "")))
         if not a or a.tutorial_id != job.id or not a.storage_key:
             raise HTTPException(404, "Source visual asset not found")
-        path = Path(__file__).resolve().parent.parent / a.storage_key
-        if not path.is_file():
+        path = _key_file(a.storage_key or "")
+        if path is None:
             raise HTTPException(404, "Source visual file missing")
         return path.read_bytes(), a.mime_type or "image/png", f"asset:{a.id}", a.instruction or a.kind
     if kind in ("illustration", "frame", "diagnostic"):
@@ -2046,7 +2072,7 @@ def _store_visual(db: Session, job: M.TutorialJob, kind: str, raw: bytes, mime: 
     with _Image.open(_io.BytesIO(raw)) as im:
         w, h = im.size
     ext = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp"}.get(mime, ".png")
-    store_dir = Path(__file__).resolve().parent.parent / "data" / "tutorials" / job.id / "visuals"
+    store_dir = _storage.media_root() / "tutorials" / job.id / "visuals"
     store_dir.mkdir(parents=True, exist_ok=True)
     name = f"{uuid.uuid4().hex}{ext}"
     (store_dir / name).write_bytes(raw)
@@ -2082,8 +2108,8 @@ def visual_file(aid: str, token: str = "", x_tutorial_token: str = Header(defaul
     import secrets as _secrets
     if not _secrets.compare_digest(job.access_token, tok):
         raise HTTPException(403, "Invalid tutorial token")
-    path = Path(__file__).resolve().parent.parent / a.storage_key
-    if not path.is_file():
+    path = _key_file(a.storage_key or "")
+    if path is None:
         raise HTTPException(404, "Visual file missing")
     media = {"image/png": "image/png", "image/jpeg": "image/jpeg", "image/svg+xml": "image/svg+xml",
              "image/webp": "image/webp"}.get(a.mime_type, "application/octet-stream")
@@ -2124,13 +2150,17 @@ def tutorial_video_guide(jid: str, body: dict, x_tutorial_token: str = Header(de
 
 @app.get("/api/tutorial/{jid}/video-guide")
 def tutorial_video_guide_status(jid: str, x_tutorial_token: str = Header(default=""), db: Session = Depends(get_db)):
-    from . import videoguide as vgmod  # noqa: F401 (keeps video surface next to its endpoints)
+    from . import videoguide as vgmod
     from . import models as _M
     job = _get_tutorial(db, jid, x_tutorial_token)
     vg = db.scalars(select(_M.VideoGuide).where(_M.VideoGuide.tutorial_id == job.id).order_by(_M.VideoGuide.created_at.desc())).first()
     if vg is None:
         return {"tutorial_id": job.id, "status": "none", "video_guide": None}
-    return {"tutorial_id": job.id, "status": vg.status, "video_guide": _video_guide_out(vg)}
+    out = _video_guide_out(vg)
+    if vg.status == "ready":
+        out["staleness"] = vgmod.describe_staleness(db, job, vg)
+    out["limits"] = {"max_video_guide_sec": vgmod.MAX_VIDEO_GUIDE_SEC}
+    return {"tutorial_id": job.id, "status": vg.status, "video_guide": out}
 
 
 @app.get("/api/tutorial/{jid}/video-guide/file")
@@ -2142,8 +2172,8 @@ def tutorial_video_guide_file(jid: str, token: str = "", db: Session = Depends(g
                                                M.VideoGuide.status == "ready").order_by(M.VideoGuide.created_at.desc())).first()
     if not vg or not vg.storage_key:
         raise HTTPException(404, "No finished video guide for this tutorial yet")
-    path = Path(__file__).resolve().parent.parent / vg.storage_key
-    if not path.is_file():
+    path = _key_file(vg.storage_key or "")
+    if path is None:
         raise HTTPException(404, "Video guide file missing")
     return FileResponse(path, media_type="video/mp4", filename=f"{(job.title or 'tutorial-guide').strip() or 'tutorial-guide'}-guide.mp4")
 
@@ -2171,6 +2201,34 @@ def _shape_instruction(intent: str, prompt: str, fallback_label: str = "") -> st
     prefix = _VISUAL_INTENT_PREFIX.get((intent or "").strip().lower(), "")
     body = prompt.strip() or fallback_label
     return (prefix + body).strip()
+
+
+def _image_status_code(status: str) -> int:
+    """Map Muse Image failure statuses to HTTP codes (never a bare 500).
+
+    502 retryable outage / bad key, 503 unavailable (incl. no API key),
+    422 policy block or bad request, 500 only for genuine errors.
+    """
+    return {"retryable": 502, "unauthorized": 502, "unavailable": 503,
+            "blocked": 422}.get(status or "", 500)
+
+
+def _decode_generated_image(image_b64: str) -> tuple[bytes, str]:
+    """Decode + file-signature-validate generated image bytes.
+
+    Trusts magic bytes, never the provider's output_format label. Raises
+    a 502 that keeps the original intact when bytes are undecodable or
+    not an image.
+    """
+    import base64 as _b64
+    try:
+        out = _b64.b64decode(image_b64 or "")
+    except Exception:
+        raise HTTPException(502, "Muse Image returned undecodable image data. Original kept.")
+    mime = ai.valid_image_bytes(out)
+    if mime is None:
+        raise HTTPException(502, "Muse Image returned bytes that are not a valid image. Original kept.")
+    return out, mime
 
 
 @app.post("/api/tutorial/{jid}/visuals/improve")
@@ -2209,11 +2267,10 @@ def visual_improve(jid: str, body: dict, x_tutorial_token: str = Header(default=
                      summary={"parent": parent_id, "prompt_chars": len(instruction),
                               "usage": res.get("usage", {}), "note": res.get("note", "")})
     if not res.get("ok"):
-        raise HTTPException(502 if res.get("status") == "retryable" else 500,
+        raise HTTPException(_image_status_code(str(res.get("status") or "")),
                             res.get("note") or "Image improvement failed")
-    import base64 as _b64
-    out = _b64.b64decode(res["image_b64"])
-    a = _store_visual(db, job, "enhanced", out, "image/" + (res.get("output_format") or "png"),
+    out, mime = _decode_generated_image(res.get("image_b64") or "")
+    a = _store_visual(db, job, "enhanced", out, mime,
                       instruction, res.get("model", ""), parent_id, who["id"],
                       {"intent": if_kind, "source_label": label, "obj_id": linked_obj, "usage": res.get("usage", {}),
                        "attempts": res.get("attempts", 1),
@@ -2269,11 +2326,10 @@ def visual_alternative(jid: str, body: dict, x_tutorial_token: str = Header(defa
                      summary={"intent": intent, "references": ref_ids, "prompt_chars": len(full_prompt),
                               "usage": res.get("usage", {}), "note": res.get("note", "")})
     if not res.get("ok"):
-        raise HTTPException(502 if res.get("status") == "retryable" else 500,
+        raise HTTPException(_image_status_code(str(res.get("status") or "")),
                             res.get("note") or "Illustrative generation failed")
-    import base64 as _b64
-    out = _b64.b64decode(res["image_b64"])
-    a = _store_visual(db, job, "illustrative_alternative", out, "image/" + (res.get("output_format") or "png"),
+    out, mime = _decode_generated_image(res.get("image_b64") or "")
+    a = _store_visual(db, job, "illustrative_alternative", out, mime,
                       prompt, res.get("model", ""), ref_ids[0] if ref_ids else f"tutorial:{job.id}",
                       who["id"],
                       {"intent": intent, "references": ref_ids, "obj_id": linked_obj, "usage": res.get("usage", {}),
@@ -2402,7 +2458,7 @@ def visual_annotate(jid: str, body: dict, x_tutorial_token: str = Header(default
     except Exception:
         raise HTTPException(422, "Source image could not be read")
     svg = _annotation_svg(shapes, max(1, w), max(1, h))
-    store_dir = Path(__file__).resolve().parent.parent / "data" / "tutorials" / job.id / "visuals"
+    store_dir = _storage.media_root() / "tutorials" / job.id / "visuals"
     store_dir.mkdir(parents=True, exist_ok=True)
     name = f"{uuid.uuid4().hex}.svg"
     (store_dir / name).write_text(svg, encoding="utf-8")
@@ -2575,7 +2631,7 @@ def tutorial_bundle(jid: str, token: str = "", db: Session = Depends(get_db)):
     buf = _io.BytesIO()
     with _zipfile.ZipFile(buf, "w", _zipfile.ZIP_DEFLATED) as z:
         z.writestr("guide.md", job.guide_markdown or "")
-        ill_dir = Path(__file__).resolve().parent.parent / "data" / "tutorials" / jid
+        ill_dir = _storage.media_root() / "tutorials" / jid
         for o in job.objects or []:
             for key in ("overlay", "illustration"):
                 name = (o or {}).get(key)
@@ -2616,8 +2672,8 @@ def recording_video(rid: str, idx: int, token: str = "", x_live_token: str = Hea
     rec = _get_recording(db, rid, x_live_token or token)
     ch = db.scalar(select(M.LiveChunk).where(M.LiveChunk.recording_id == rec.id, M.LiveChunk.chunk_index == idx))
     if not ch or not ch.storage_key: raise HTTPException(404, "Chunk video not found")
-    path = Path(__file__).resolve().parent.parent / ch.storage_key
-    if not path.is_file(): raise HTTPException(404, "Chunk video file missing")
+    path = _key_file(ch.storage_key)
+    if path is None: raise HTTPException(404, "Chunk video file missing")
     return FileResponse(path, media_type="video/mp4", filename=path.name)
 
 
@@ -2661,8 +2717,8 @@ def resegment_chunk(rid: str, idx: int, body: dict, x_live_token: str = Header(d
     rec = _get_recording(db, rid, x_live_token)
     ch = db.scalar(select(M.LiveChunk).where(M.LiveChunk.recording_id == rec.id, M.LiveChunk.chunk_index == idx))
     if not ch or not ch.storage_key: raise HTTPException(404, "Chunk not found")
-    path = Path(__file__).resolve().parent.parent / ch.storage_key
-    if not path.is_file(): raise HTTPException(404, "Chunk video file missing")
+    path = _key_file(ch.storage_key)
+    if path is None: raise HTTPException(404, "Chunk video file missing")
     prompt_text = str(body.get("prompt_text", "")).strip()
     nx, ny = body.get("prompt_nx"), body.get("prompt_ny")
     if nx is not None and ny is not None and ch.width and ch.height:
@@ -2697,8 +2753,8 @@ def frame_evidence(rid: str, idx: int, body: dict, x_live_token: str = Header(de
     if not cap: raise HTTPException(404, "Capture session not found")
     ch = db.scalar(select(M.LiveChunk).where(M.LiveChunk.recording_id == rec.id, M.LiveChunk.chunk_index == idx))
     if not ch or not ch.storage_key: raise HTTPException(404, "Chunk not found")
-    path = Path(__file__).resolve().parent.parent / ch.storage_key
-    if not path.is_file(): raise HTTPException(404, "Chunk video file missing")
+    path = _key_file(ch.storage_key)
+    if path is None: raise HTTPException(404, "Chunk video file missing")
     frame_idx = int(body.get("frame_index", 0))
     import subprocess as _sp
     import imageio_ffmpeg as _ff
@@ -2706,7 +2762,7 @@ def frame_evidence(rid: str, idx: int, body: dict, x_live_token: str = Header(de
                    description=f"Live recording frame (chunk {idx}, frame {frame_idx})",
                    source_reference=f"live:{rid}:{idx}:{frame_idx}", created_by=who["id"])
     db.add(e); db.flush()
-    store_dir = Path(__file__).resolve().parent.parent / "data" / "evidence"
+    store_dir = _storage.media_root() / "evidence"
     store_dir.mkdir(parents=True, exist_ok=True)
     out = store_dir / f"{e.id}.jpg"
     proc = _sp.run([_ff.get_ffmpeg_exe(), "-y", "-i", str(path), "-vf", f"select='eq(n\\,{frame_idx})'",
@@ -2726,22 +2782,22 @@ def delete_recording(rid: str, x_live_token: str = Header(default=""), db: Sessi
     rec = _get_recording(db, rid, x_live_token)
     for ch in db.scalars(select(M.LiveChunk).where(M.LiveChunk.recording_id == rec.id)).all():
         db.delete(ch)
-    store_dir = Path(__file__).resolve().parent.parent / "data" / "live" / rid
+    store_dir = _storage.media_root() / "live" / rid
     if store_dir.is_dir(): _shutil.rmtree(store_dir, ignore_errors=True)
     db.delete(rec); db.commit()
     return {"ok": True}
 
 
 def _delete_chunks(db: Session, rec: M.LiveRecording, indexes: list[int]) -> dict:
-    base = (Path(__file__).resolve().parent.parent / "data" / "live" / rec.id).resolve()
+    base = (_storage.media_root() / "live" / rec.id).resolve()
     deleted, not_found = [], []
     for idx in dict.fromkeys(indexes):  # dedupe, keep order
         ch = db.scalar(select(M.LiveChunk).where(M.LiveChunk.recording_id == rec.id, M.LiveChunk.chunk_index == idx))
         if ch is None:
             not_found.append(idx); continue
         if ch.storage_key:
-            path = (Path(__file__).resolve().parent.parent / ch.storage_key).resolve()
-            if base in path.parents and path.is_file():
+            path = _key_file(ch.storage_key)
+            if path is not None and base in path.parents and path.is_file():
                 path.unlink()
         db.delete(ch)
         deleted.append(idx)
@@ -3078,7 +3134,7 @@ def job_evidence_list(jid: str, db) -> list:
     """Photos attached during a job (source_reference "job:{jid}" or "job:{jid}:{step}")."""
     items = []
     for e in db.scalars(select(M.Evidence).where(M.Evidence.source_reference.like(f"job:{jid}%")).order_by(M.Evidence.captured_at)).all():
-        has_file = bool(e.storage_key) and (Path(__file__).resolve().parent.parent / e.storage_key).is_file()
+        has_file = _key_file(e.storage_key) is not None
         items.append({"id": e.id, "description": e.description, "step_id": (e.source_reference or "").split(":")[2] if (e.source_reference or "").count(":") >= 2 else None,
                       "captured_at": e.captured_at.isoformat() if e.captured_at else None,
                       "image_url": f"/api/evidence/{e.id}/image" if e.evidence_type == "image" and has_file else None})
@@ -3107,7 +3163,7 @@ async def add_job_evidence(jid: str, file: UploadFile = File(...), description: 
                    source_reference=ref, created_by=who["id"], extra={"sha256_16": digest, "size": len(data)})
     db.add(e); db.flush()
     suffix = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}.get(file.content_type or "", ".jpg")
-    store_dir = Path(__file__).resolve().parent.parent / "data" / "evidence"
+    store_dir = _storage.media_root() / "evidence"
     store_dir.mkdir(parents=True, exist_ok=True)
     (store_dir / f"{e.id}{suffix}").write_bytes(data)
     e.storage_key = f"data/evidence/{e.id}{suffix}"

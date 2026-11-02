@@ -185,6 +185,10 @@ const StepScene: React.FC<{ scene: z.infer<typeof SceneSchema>; total: number }>
 };
 
 export const ProcedureVideo: React.FC<VideoProps> = (props) => {
+  // The title card leads the composition; the original-voice track belongs
+  // to the step scenes, so it must start at the same frame the first scene
+  // does — otherwise narration plays over the title and drifts for the rest
+  // of the video. Volume and timeline stay deterministic (no randomness).
   const titleFrames = Math.round(1.5 * props.fps);
   return (
     <AbsoluteFill style={{ backgroundColor: BRAND_BG }}>
@@ -196,7 +200,11 @@ export const ProcedureVideo: React.FC<VideoProps> = (props) => {
           <StepScene scene={s} total={props.scenes.length} />
         </Sequence>
       ))}
-      {props.voiceover ? <Audio src={props.voiceover} volume={1} /> : null}
+      {props.voiceover ? (
+        <Sequence from={titleFrames} durationInFrames={Math.max(1, props.totalFrames - titleFrames)}>
+          <Audio src={props.voiceover} volume={1} />
+        </Sequence>
+      ) : null}
     </AbsoluteFill>
   );
 };
