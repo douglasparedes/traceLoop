@@ -20,7 +20,6 @@ from .db import SessionLocal
 from . import models as M
 from .tutorial import BASE, _ffmpeg
 
-VIDEO_MAX_SEC = int(os.getenv("VIDEO_GUIDE_MAX_SEC", "180"))
 VIDEO_QUOTA_PER_DAY = int(os.getenv("MAX_VIDEO_OPS_PER_DAY", "10"))
 VIDEO_FPS = 30
 VIDEO_W, VIDEO_H = 1280, 720
@@ -233,9 +232,6 @@ def start_video_guide(job_id: str, actor: str = "", force: bool = False, scenes:
         if scenes is not None:
             clean = validate_scene_plan(scenes, job.duration_sec or 0)
             canon = _canonical_hash(job.steps or [])
-        total = sum(max(0.0, float(s.get("end", 0)) - float(s.get("start", 0))) for s in (job.steps or []))
-        if total > VIDEO_MAX_SEC:
-            raise ValueError(f"This tutorial is {total:.0f}s — video guides are capped at {VIDEO_MAX_SEC}s. Record a shorter tutorial for video output.")
         max_ver = 0
         for r in rows:
             try:

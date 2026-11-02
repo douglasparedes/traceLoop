@@ -20,7 +20,6 @@ from .db import SessionLocal
 from . import models as M
 from sqlalchemy import func, select
 
-MAX_VIDEO_SEC = 600
 TRACKING_FPS = 6
 TRACKING_MAX_WIDTH = 512
 HIREZ_MAX_WIDTH = 960
@@ -1160,8 +1159,7 @@ def run_job(job_id: str) -> None:
                              summary={"duration_sec": info["duration"], "width": info["width"], "height": info["height"]})
             if info["duration"] <= 0:
                 raise RuntimeError("Could not read the uploaded video (unsupported format?)")
-            if info["duration"] > MAX_VIDEO_SEC + 5:
-                raise RuntimeError(f"Video is {info['duration']:.0f}s — tutorials are limited to {MAX_VIDEO_SEC}s (10 minutes)")
+            # NOTE: no maximum duration — long tutorials are accepted as-is.
             # NOTE: no-audio is handled below per input_mode (narrated fails
             # fast; auto/visual_first continue with visual analysis).
             _set(db, job, duration_sec=info["duration"], width=info["width"], height=info["height"], progress=8)

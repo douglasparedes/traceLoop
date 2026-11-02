@@ -76,6 +76,19 @@ def test_tutorial_pipeline_end_to_end(monkeypatch, tmp_path):
     assert done["timed_segments"][0]["start"] == 1.0
 
 
+def test_long_tutorial_has_no_duration_limit(monkeypatch):
+    # A 923-second recording must pipeline like any other — no duration cap.
+    _patch_pipeline(monkeypatch)
+    monkeypatch.setattr(tutorial, "probe_video",
+                        lambda p: {"duration": 923.0, "width": 320, "height": 240, "has_audio": True})
+    up = c.post("/api/tutorial/start", files={"file": ("long.mp4", b"fake-long-video-bytes", "video/mp4")},
+                data={"title": "Long tutorial"}, headers=TECH)
+    assert up.status_code == 200, up.text
+    done = _wait_done(up.json()["id"], up.json()["access_token"])
+    assert done["status"] == "done", done
+    assert done["duration_sec"] == 923.0
+
+
 def test_tutorial_upload_codec_qualified_content_types(monkeypatch):
     _patch_pipeline(monkeypatch)
     up = c.post("/api/tutorial/start",

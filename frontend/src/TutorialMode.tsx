@@ -278,7 +278,6 @@ export default function TutorialMode({ onOpenReview, onOpenStudio, hideLibrary, 
           setMicLevel(peak);
         } catch { /* meter unavailable on this browser */ }
       }
-      if (el >= TUTORIAL.MAX_VIDEO_SEC) stopRecording();
     }, 250);
     return () => window.clearInterval(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -549,12 +548,12 @@ export default function TutorialMode({ onOpenReview, onOpenStudio, hideLibrary, 
     <div>
       {phase === "record" && (
         <div>
-          <p className="muted">Record a 2–10 minute tutorial. Audio is transcribed by Muse Voice, objects are segmented by SAM 3.1, and the guide is written by Muse Spark — all processing happens on the server after upload.</p>
+          <p className="muted">Record a tutorial. Audio is transcribed by Muse Voice, objects are segmented by SAM 3.1, and the guide is written by Muse Spark — all processing happens on the server after upload.</p>
           <label htmlFor="tut-title">Tutorial title</label>
           <input id="tut-title" value={title} onChange={(e) => setTitle(e.target.value)} placeholder="e.g. Reseat the pump seal" maxLength={200} />
           <div className="live-stage" style={{ marginTop: 10 }}>
             <video ref={previewRef} className="live-video" autoPlay playsInline muted aria-label="Tutorial camera preview" />
-            {recording && <div className="live-processing"><span className="rec-dot" aria-hidden="true" /> REC {fmt(elapsed)} / {fmt(TUTORIAL.MAX_VIDEO_SEC)}</div>}
+            {recording && <div className="live-processing"><span className="rec-dot" aria-hidden="true" /> REC {fmt(elapsed)}</div>}
           </div>
           {recording && (
             <div role="status" aria-label={`Microphone level ${Math.round(micLevel * 100)} percent`} style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 8 }}>
