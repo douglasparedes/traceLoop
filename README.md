@@ -41,9 +41,25 @@ Set `META_API_KEY` for live Meta AI (Voice transcription, Spark understanding/gu
 
 ## Tests
 
+**Single workflow: Record a tutorial.** The Tutorials destination holds the
+recorder (camera + microphone, upload progress, cancellation, retry,
+original video preserved) above a persistent Tutorial Library (search,
+status filter, sorting, pagination, refresh, delete with confirmation).
+Quick capture and Live were removed from the UI; their server APIs and
+stored records are untouched. Opening a tutorial enters **Tutorial
+Studio**: Overview (metadata, immutable source video, processing state,
+Review draft link), Content (transcript correction with the original
+preserved, timed segments, structured step CRUD/reorder/tools/object
+links, content revision history with restore), Guide (format change,
+regenerate, immutable snapshot history with view/compare, draft
+link), Video (scene plan editing with validated audio ranges and
+visual choice, versioned MP4 renders with per-version preview/download),
+Visuals (VisualStudio improve/highlight/alternative/annotate with
+accept/reject and provenance).
+
 ```powershell
-cd backend; .\.venv\Scripts\python.exe -m pytest tests -q   # 57 passed, 1 skipped
-cd frontend; npm run test                                    # 33 passed
+cd backend; .\.venv\Scripts\python.exe -m pytest tests -q   # 65 passed, 1 skipped
+cd frontend; npm run test                                    # 58 passed
 ```
 
 Key suites: `test_canonical.py` (simulated end-to-end without network, correction propagation, regen/approval/pinning, fallback distinctness, intent shaping), `test_guides.py` (formats, versions, visuals), `test_observability.py`, `test_auth.py` (incl. media-gate exemptions), `test_tutorial.py`, `test_api.py`. CI (`.github/workflows/ci.yml`) runs backend tests, typecheck, frontend tests, and the production build.

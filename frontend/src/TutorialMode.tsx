@@ -176,10 +176,14 @@ function Markdown({ text, resolveImage }: { text: string; resolveImage?: (src: s
   return <div>{blocks}</div>;
 }
 
-export default function TutorialMode({ onUseTranscript, onOpenReview }: { onUseTranscript?: (text: string) => void; onOpenReview?: (versionId: string) => void }) {
+export default function TutorialMode({ onOpenReview, onOpenStudio, hideLibrary }: {
+  onOpenReview?: (versionId: string) => void;
+  onOpenStudio?: (t: { id: string; access_token: string; title: string }) => void;
+  hideLibrary?: boolean;
+}) {
   const [phase, setPhase] = useState<"record" | "review" | "processing" | "guide">("record");
   const [uploadFailed, setUploadFailed] = useState(false);
-  const [title, setTitle] = useState("How to reseat the trainer cable harness");
+  const [title, setTitle] = useState("");
   const [recording, setRecording] = useState(false);
   const [elapsed, setElapsed] = useState(0);
   const [recorded, setRecorded] = useState<{ blob: Blob; url: string } | null>(null);
@@ -542,7 +546,7 @@ export default function TutorialMode({ onUseTranscript, onOpenReview }: { onUseT
         <div>
           <p className="muted">Record a 2–10 minute tutorial. Audio is transcribed by Muse Voice, objects are segmented by SAM 3.1, and the guide is written by Muse Spark — all processing happens on the server after upload.</p>
           <label htmlFor="tut-title">Tutorial title</label>
-          <input id="tut-title" value={title} onChange={(e) => setTitle(e.target.value)} />
+          <input id="tut-title" value={title} onChange={(e) => setTitle(e.target.value)} placeholder="e.g. Reseat the pump seal" maxLength={200} />
           <div className="live-stage" style={{ marginTop: 10 }}>
             <video ref={previewRef} className="live-video" autoPlay playsInline muted aria-label="Tutorial camera preview" />
             {recording && <div className="live-processing"><span className="rec-dot" aria-hidden="true" /> REC {fmt(elapsed)} / {fmt(TUTORIAL.MAX_VIDEO_SEC)}</div>}
@@ -570,7 +574,7 @@ export default function TutorialMode({ onUseTranscript, onOpenReview }: { onUseT
               ? <button className="btn" onClick={startRecording}>Start recording</button>
               : <button className="btn danger" onClick={stopRecording}>Stop recording</button>}
           </div>
-          {past.length > 0 && (
+          {past.length > 0 && !hideLibrary && (
             <div style={{ marginTop: 14 }}>
               <h3>Tutorial library {pastTotal > 0 && <span className="muted">({pastTotal})</span>}</h3>
               <div className="row">
@@ -618,7 +622,7 @@ export default function TutorialMode({ onUseTranscript, onOpenReview }: { onUseT
             </div>
           )}
           <label htmlFor="tut-title2">Tutorial title</label>
-          <input id="tut-title2" value={title} onChange={(e) => setTitle(e.target.value)} disabled={uploadPct !== null} />
+          <input id="tut-title2" value={title} onChange={(e) => setTitle(e.target.value)} disabled={uploadPct !== null} placeholder="e.g. Reseat the pump seal" maxLength={200} />
           <div className="row" style={{ marginTop: 10 }}>
             {uploadPct !== null
               ? <button className="btn danger" onClick={cancelUpload}>Cancel upload</button>
@@ -661,6 +665,12 @@ export default function TutorialMode({ onUseTranscript, onOpenReview }: { onUseT
       {phase === "guide" && job && job.status === "done" && (
         <div>
           <h3>{job.title}</h3>
+          {onOpenStudio && (
+            <div className="row" style={{ marginBottom: 10 }}>
+              <button className="btn" onClick={() => onOpenStudio({ id: job.id, access_token: job.access_token, title: job.title })}>Open in Tutorial Studio</button>
+              <span className="muted small-text">Edit transcript, steps, guide, video scenes, and visuals in one workspace.</span>
+            </div>
+          )}
           <div className="live-stage"
             onClick={(e) => {
               if (tapTarget === null) return;
@@ -785,7 +795,6 @@ export default function TutorialMode({ onUseTranscript, onOpenReview }: { onUseT
                   <button className="btn small secondary" onClick={() => seek(s.start)}>{fmt(s.start)}</button> {s.text}
                 </p>
               ))}
-              <button className="btn secondary" style={{ marginTop: 10 }} onClick={() => onUseTranscript?.(job.full_transcript)}>Use as capture transcript</button>
             </div>
           )}
 
