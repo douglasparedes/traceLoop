@@ -4,7 +4,6 @@ export const TUTORIAL = {
   MUSE_TRANSCRIBE_MODEL: "muse-voice-transcribe-1.0",
   MUSE_LLM_MODEL: "muse-spark-1.3",
   SAM_MODEL: "sam-3.1",
-  MAX_VIDEO_SEC: 600,
   MAX_WIDTH: 1280,
   TRACKING_FPS: 6,
   CONF_THRESHOLD: 0.4,

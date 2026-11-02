@@ -830,7 +830,7 @@ function TutorialsView({ onOpenStudio, refreshKey }: { onOpenStudio: (t: Library
         <div className="row" style={{ justifyContent: "space-between" }}>
           <div>
             <h3 style={{ margin: 0 }}>Record a tutorial</h3>
-            <p className="muted small-text" style={{ margin: "2px 0 0" }}>2–10 minute video with narration. Processing runs on the server after upload.</p>
+            <p className="muted small-text" style={{ margin: "2px 0 0" }}>Record a video with narration. Processing runs on the server after upload.</p>
           </div>
           <button className="btn small secondary" aria-expanded={showRecord} onClick={() => setShowRecord((v) => !v)}>{showRecord ? "Hide recorder" : "Record a tutorial"}</button>
         </div>
