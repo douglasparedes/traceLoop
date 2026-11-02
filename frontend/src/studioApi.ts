@@ -49,7 +49,7 @@ export interface ContentRevisionItem {
 export interface StudioVideoVersion {
   id: string;
   tutorial_id: string;
-  status: "draft" | "queued" | "rendering" | "ready" | "error";
+  status: "draft" | "queued" | "rendering" | "validating" | "ready" | "error";
   version_number: number;
   progress: number;
   error: string;
@@ -58,6 +58,12 @@ export interface StudioVideoVersion {
   scenes: StudioScene[];
   simulated: boolean;
   provenance: Record<string, unknown>;
+  staleness?: {
+    stale: boolean;
+    changed: string[];
+    video_guide_id: string;
+    version_number: number;
+  };
   created_at: string;
 }
 
@@ -130,6 +136,14 @@ export async function fetchVideoVersions(tutorialId: string, token: string): Pro
   return ((await res.json()).versions || []) as StudioVideoVersion[];
 }
 
+export async function fetchVideoLimits(tutorialId: string, token: string): Promise<{ max_video_guide_sec: number } | null> {
+  const idn = getIdentity();
+  const res = await fetch(`${API}/api/tutorial/${tutorialId}/video-guides`, { headers: tutHeaders(token, { "X-User": idn.user, "X-Role": idn.role }) });
+  if (!res.ok) return null;
+  const body = await res.json();
+  return (body.limits as { max_video_guide_sec: number }) || null;
+}
+
 export interface SuggestedScenePlan {
   scenes: StudioScene[];
   simulated: boolean;
@@ -156,6 +170,14 @@ export async function saveScenePlan(tutorialId: string, token: string, scenes: S
 export async function renderScenePlan(tutorialId: string, token: string, scenes?: StudioScene[]) {
   return api.post<{ ok: boolean; video_guide: StudioVideoVersion; duplicate?: boolean }>(
     `/api/tutorial/${tutorialId}/video-guide/render`, scenes ? { scenes } : {}, { "X-Tutorial-Token": token });
+}
+
+/** One-click automatic generation: the server composes the video from the
+ *  current guide (no scene editing required). Regenerate forces a fresh
+ *  version; otherwise an in-flight or up-to-date render is reused. */
+export async function startVideoGuide(tutorialId: string, token: string, regenerate = false) {
+  return api.post<{ ok: boolean; video_guide: StudioVideoVersion; duplicate?: boolean }>(
+    `/api/tutorial/${tutorialId}/video-guide`, regenerate ? { regenerate: true } : {}, { "X-Tutorial-Token": token });
 }
 
 export function videoVersionFileUrl(tutorialId: string, versionId: string, token: string): string {

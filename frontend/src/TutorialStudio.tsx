@@ -150,11 +150,14 @@ export default function TutorialStudio({ item, onBack, onOpenReview, notify }: {
       {tab === "overview" && <OverviewEditor detail={detail} onSaved={(d) => { setDetail(d); setDirty(false); }} onDirty={() => setDirty(true)} notify={notify} onOpenReview={onOpenReview} />}
       {tab === "content" && <ContentEditor detail={detail} onSaved={(d) => { setDetail({ ...detail, ...d }); setDirty(false); void load(); }} onDirty={() => setDirty(true)} notify={notify} />}
       {tab === "guide" && <GuideEditor detail={detail} onChanged={() => void load()} onOpenReview={onOpenReview} notify={notify} />}
-      {tab === "video" && <VideoStudio tutorialId={detail.id} token={item.access_token} durationSec={detail.duration_sec} jobDone={detail.status === "done"}
-        visuals={(detail.objects || []).flatMap((o) => [
-          ...(o.overlay ? [{ name: o.overlay, label: `${o.label} — overlay` }] : []),
-          ...(o.illustration ? [{ name: o.illustration, label: `${o.label} — cutout` }] : []),
-        ])}
+      {tab === "video" && <VideoStudio tutorialId={detail.id} token={item.access_token} title={detail.title}
+        durationSec={detail.duration_sec} jobDone={detail.status === "done"}
+        guide={{
+          format: detail.guide_format || "",
+          steps: (detail.steps || []).length,
+          hasTranscript: (detail.timed_segments || []).length > 0 || !!(detail.transcript_corrected || detail.transcript_original || detail.full_transcript),
+          contentRevision: detail.content_revision,
+        }}
         onChanged={() => void load()} />}
       {tab === "visuals" && <VisualsEditor detail={detail} token={item.access_token} notify={notify} />}
     </div>
@@ -732,18 +735,68 @@ function VisualsEditor({ detail, token, notify }: {
   useEffect(() => { void load(); }, [load]);
 
   const imgUrl = (name?: string) => (name ? `${API}/api/tutorial/${detail.id}/illustrations/${name}?token=${encodeURIComponent(token)}` : "");
-  const sources = (detail.objects || []).flatMap((o) => [
-    ...(o.overlay ? [{ id: `illustration:${o.overlay}`, label: `${o.label} — SAM overlay`, imageUrl: imgUrl(o.overlay), kind: "overlay", source: { kind: "illustration", name: o.overlay }, quality: o.quality }] : []),
-    ...(o.illustration ? [{ id: `illustration:${o.illustration}`, label: `${o.label} — isolated cutout`, imageUrl: imgUrl(o.illustration), kind: "cutout", source: { kind: "illustration", name: o.illustration }, quality: o.quality }] : []),
-    ...(!o.overlay && !o.illustration && o.diagnostic_frame ? [{ id: `diagnostic:${o.obj_id}`, label: `${o.label} — diagnostic frame`, imageUrl: `${API}/api/tutorial/${detail.id}/diagnostics/frame/${o.obj_id}?token=${encodeURIComponent(token)}`, kind: "diagnostic", source: { kind: "diagnostic", obj_id: o.obj_id }, quality: o.quality }] : []),
-  ]);
+  const keyframeUrl = (name: string) => `${API}/api/tutorial/${detail.id}/keyframes/${name}?token=${encodeURIComponent(token)}`;
+  const sources = [
+    ...((detail.keyframes || []).map((k) => ({
+      id: `keyframe:${k.name}`, label: `Keyframe ${Math.floor(k.t / 60)}:${String(Math.floor(k.t % 60)).padStart(2, "0")} — source frame`,
+      imageUrl: keyframeUrl(k.name), kind: "keyframe",
+      source: { kind: "keyframe", name: k.name }, quality: null,
+    }))),
+    ...(detail.objects || []).flatMap((o) => [
+      ...(o.overlay ? [{ id: `illustration:${o.overlay}`, label: `${o.label} — SAM overlay`, imageUrl: imgUrl(o.overlay), kind: "overlay", source: { kind: "illustration", name: o.overlay }, quality: o.quality }] : []),
+      ...(o.illustration ? [{ id: `illustration:${o.illustration}`, label: `${o.label} — isolated cutout`, imageUrl: imgUrl(o.illustration), kind: "cutout", source: { kind: "illustration", name: o.illustration }, quality: o.quality }] : []),
+      ...(!o.overlay && !o.illustration && o.diagnostic_frame ? [{ id: `diagnostic:${o.obj_id}`, label: `${o.label} — diagnostic frame`, imageUrl: `${API}/api/tutorial/${detail.id}/diagnostics/frame/${o.obj_id}?token=${encodeURIComponent(token)}`, kind: "diagnostic", source: { kind: "diagnostic", obj_id: o.obj_id }, quality: o.quality }] : []),
+    ]),
+    ...visuals.filter((v) => v.status === "accepted" && v.image_url).map((v) => ({
+      id: `accepted:${v.id}`, label: `Accepted: ${(v.instruction || v.kind).slice(0, 60)}`,
+      imageUrl: visualFileUrl(v, token), kind: v.kind,
+      source: { kind: "asset", id: v.id }, quality: null,
+    })),
+  ];
 
-  async function decide(a: VisualAsset, accept: boolean) {
+  const [attachFor, setAttachFor] = useState<string | null>(null);
+  const [draftVid, setDraftVid] = useState<string | null>(null);
+  const [draftSteps, setDraftSteps] = useState<{ id: string; title: string }[]>([]);
+  const [attachStep, setAttachStep] = useState("");
+  const [attachBusy, setAttachBusy] = useState(false);
+
+  async function ensureDraft(): Promise<string | null> {
+    setAttachBusy(true);
+    try {
+      const r = await api.post<{ version_id: string; created: boolean }>(
+        `/api/tutorial/${detail.id}/draft`, {}, { "X-Tutorial-Token": token });
+      const v = await api.get<Version>(`/api/procedure-versions/${r.version_id}`);
+      setDraftVid(v.id);
+      setDraftSteps((v.steps || []).map((s) => ({ id: s.id, title: s.title })));
+      setAttachStep((v.steps || [])[0]?.id || "");
+      if (r.created) notify("Review draft created — attach the visual to one of its steps.", "ok");
+      return v.id;
+    } catch (e) {
+      notify(e instanceof Error ? e.message : "Could not load the editable draft", "error");
+      return null;
+    } finally {
+      setAttachBusy(false);
+    }
+  }
+
+  async function decide(a: VisualAsset, accept: boolean, stepId?: string) {
     setBusy(true);
     try {
-      if (accept) await acceptVisual(a.id);
-      else await rejectVisual(a.id);
-      notify(accept ? "Accepted. Attach it to a guide step from Review to use it in the guide." : "Rejected. Sources and prior versions are untouched.", accept ? "ok" : "info");
+      if (accept) {
+        const r = await acceptVisual(a.id, stepId && draftVid ? { step_id: stepId, version_id: draftVid } : {});
+        if (r.evidence_id && stepId) {
+          const step = draftSteps.find((s) => s.id === stepId);
+          notify(`Accepted and attached to “${step?.title || stepId}”. The guide now shows it; the next video uses it.`, "ok");
+        } else if ((r as { snapshot_id?: string }).snapshot_id) {
+          notify("Accepted. The guide was refreshed with the new visual.", "ok");
+        } else {
+          notify("Accepted but not linked to any step — attach it from here to use it in the guide and video.", "info");
+        }
+        setAttachFor(null);
+      } else {
+        await rejectVisual(a.id);
+        notify("Rejected. Sources and prior versions are untouched.", "info");
+      }
       await load();
     } catch (e) { notify(e instanceof Error ? e.message : "Decision failed", "error"); }
     finally { setBusy(false); }
@@ -758,7 +811,7 @@ function VisualsEditor({ detail, token, notify }: {
       </p>
       <div className="card">
         <h4 style={{ marginTop: 0 }}>Source images ({sources.length})</h4>
-        {sources.length === 0 && <p className="muted small-text">No source images yet — they appear once segmentation produces illustrations.</p>}
+        {sources.length === 0 && <p className="muted small-text">No source images yet — keyframes appear once visual analysis runs; illustrations appear once segmentation finds objects.</p>}
         <div className="row">
           {sources.map((s) => (
             <button key={s.id} className={`btn small ${source?.id === s.id ? "" : "secondary"}`} aria-pressed={source?.id === s.id} onClick={() => setSource(s)}>
@@ -790,13 +843,42 @@ function VisualsEditor({ detail, token, notify }: {
                 <a className="btn small secondary" href={visualFileUrl(v, token)} target="_blank" rel="noreferrer">Open</a>
                 {v.status === "review" && (
                   <>
-                    <button className="btn small" disabled={busy} onClick={() => void decide(v, true)}>Accept</button>
+                    <button className="btn small secondary" disabled={busy} onClick={() => setAttachFor(attachFor === v.id ? null : v.id)}>
+                      {attachFor === v.id ? "Close attach" : "Attach to step…"}
+                    </button>
                     <button className="btn small secondary" disabled={busy} onClick={() => void decide(v, false)}>Reject</button>
                   </>
                 )}
               </span>
               </div>
             </div>
+            {v.status === "review" && attachFor === v.id && (
+              <div className="panel" style={{ marginTop: 8 }}>
+                <span className="eyebrow">Accept & attach to a guide step</span>
+                {!draftVid ? (
+                  <div className="row" style={{ marginTop: 6 }}>
+                    <button className="btn small" disabled={attachBusy} onClick={() => void ensureDraft()}>
+                      {attachBusy ? "Loading…" : "Load editable draft steps"}
+                    </button>
+                    <button className="btn small secondary" disabled={busy} onClick={() => void decide(v, true)}>Accept without a step</button>
+                  </div>
+                ) : (
+                  <div className="row" style={{ marginTop: 6 }}>
+                    <label style={{ flex: "1 1 200px" }}>Target step
+                      <select value={attachStep} onChange={(e) => setAttachStep(e.target.value)} aria-label="Target procedure step">
+                        {draftSteps.map((s) => <option key={s.id} value={s.id}>{s.title}</option>)}
+                      </select>
+                    </label>
+                    <button className="btn small" disabled={busy || attachBusy || !attachStep} onClick={() => void decide(v, true, attachStep)}>Accept & attach</button>
+                    <button className="btn small secondary" disabled={busy} onClick={() => void decide(v, true)}>Accept without a step</button>
+                  </div>
+                )}
+                <p className="muted small-text" style={{ marginBottom: 0 }}>
+                  Attaching links the visual to an editable draft step (locked versions are refused — create a new revision first).
+                  The guide refreshes with the visual and the next video uses it. Unlinked accepts stay “accepted but unassigned”.
+                </p>
+              </div>
+            )}
             {typeof (v.provenance as { warning?: unknown }).warning === "string" && (
               <p className="muted small-text" style={{ marginBottom: 0 }}>{String((v.provenance as { warning?: unknown }).warning)}</p>
             )}

@@ -30,6 +30,21 @@ def _fake_illustrations(job_dir, source, obj, best):
     return {"illustration": "obj-1.png", "overlay": "obj-1-overlay.png"}
 
 
+def _tiny_mp4(path, duration=1.0):
+    """A real, ffprobe-valid minimal MP4 for render-pipeline tests.
+
+    Must be a genuine container (not magic bytes): the worker validates
+    every render with stream + duration checks before marking it ready.
+    """
+    import subprocess
+    r = subprocess.run(
+        [tutorial._ffmpeg(), "-y", "-f", "lavfi", "-i",
+         f"testsrc=duration={duration}:size=320x240:rate=30",
+         "-pix_fmt", "yuv420p", "-c:v", "mpeg4", str(path)],
+        capture_output=True, timeout=120)
+    assert r.returncode == 0, r.stderr.decode("utf-8", "replace")[-300:]
+
+
 def _patch_pipeline(monkeypatch):
     monkeypatch.setattr(ai, "live_enabled", lambda: True)
     monkeypatch.setattr(tutorial, "probe_video", lambda p: {"duration": 30.0, "width": 320, "height": 240})
@@ -228,14 +243,15 @@ def test_video_scene_plan_validation_versioning_and_files(monkeypatch, tmp_path)
         assert r.status_code == 422, bad
 
     # Fake the render pipeline: real ffmpeg cut of silence + stub Remotion.
-    def fake_cut(job_rec, scenes):
+    def fake_cut(job_rec, scenes, db=None, actor=""):
         out = vgmod._video_paths(job_rec.id)["voiceover"]
         out.write_bytes(b"RIFF....WAVEfake")
         return out, 2.0
 
     def fake_render(props_path, paths):
+        from app import videoguide as _vg
         out = paths["dir"] / "guide-video-render.mp4"
-        out.write_bytes(b"\x00\x00\x00\x18ftypmp42" + b"\x00" * 64)
+        _tiny_mp4(out)
         return out
 
     monkeypatch.setattr(vgmod, "cut_voiceover", fake_cut)
