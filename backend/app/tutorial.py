@@ -961,6 +961,7 @@ def snapshot_guide(db, job: M.TutorialJob, trigger: str, md: str, objects: list 
         guide_format=guide_format or getattr(job, "guide_format", "") or "",
         format_source=format_source or getattr(job, "format_source", "") or "",
         format_rationale=format_rationale or getattr(job, "format_rationale", ""),
+        content_revision=int(getattr(job, "content_revision", 1) or 1),
         object_statuses=[{"obj_id": o.get("obj_id"), "label": o.get("label"),
                           "status": o.get("status"), "confidence": o.get("confidence")}
                          for o in (objects or [])])

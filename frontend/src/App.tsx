@@ -1,46 +1,16 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, setIdentity, authStatus, checkSession, login as apiLogin, clearToken, AUTH_REQUIRED_EVENT } from "./api";
 import { idb, uuid } from "./db";
-import { listCameras, setPreferredCameraId, getPreferredCameraId, cameraConstraints, type CameraDevice } from "./camera";
 import { Icon, type IconName } from "./icons";
-import LiveMode from "./LiveMode";
 import TutorialMode from "./TutorialMode";
-import LiveTranscribe from "./LiveTranscribe";
-import { extractObjectPhrase, promptVariants } from "./speechPrompt";
+import TutorialLibrary, { type LibraryItem } from "./TutorialLibrary";
+import TutorialStudio from "./TutorialStudio";
 import type { JobEventRec, LocalJob, ProcSummary, Role, Step, Version, View } from "./types";
 import { checkAssetLinks, usePwaInstall, type AssetLinksStatus } from "./pwaInstall";
 import { clearMediaCache } from "./mediaCache";
 
 const ISSUE_TYPES = ["Component not found", "Instructions unclear", "Expected result not observed", "Tool unavailable", "Manual mismatch", "Unexpected condition", "Other"];
 
-function mediaErrorMessage(e: unknown, kind: "microphone" | "camera"): string {
-  const name = e instanceof DOMException ? e.name : e instanceof Error ? e.name : "";
-  const label = kind === "microphone" ? "Microphone" : "Camera";
-  if (!window.isSecureContext) return `${label} unavailable: browser media requires HTTPS or http://localhost (not a LAN IP). Open the app via localhost or an HTTPS URL.`;
-  if (name === "NotAllowedError" || name === "SecurityError") return `${label} blocked (${name}). Click the lock/site-settings icon in the address bar, allow ${kind} access for this site, then try again. Paste/type the transcript below still works.`;
-  if (name === "NotFoundError" || name === "DevicesNotFoundError") return `No ${kind} found (${name}). Connect/enable a ${kind} in Windows Settings > Privacy, then try again.`;
-  if (name === "NotReadableError" || name === "TrackStartError") return `${label} is busy (${name}). Close other apps using it (Teams/Zoom/Camera) and try again.`;
-  if (name === "OverconstrainedError") return `${label} does not support the requested settings (${name}). Try again — a basic device will be requested.`;
-  if (name === "NotSupportedError" || name === "TypeError") return `${label} unsupported in this browser (${name || "no mediaDevices"}). Use current Chrome/Edge on http://localhost or HTTPS.`;
-  return `${label} unavailable (${name || "unknown error"}). Check browser permission and device, then try again.`;
-}
-
-function mediaDevicesOrFail(kind: "microphone" | "camera"): MediaDevices {
-  if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
-    throw new DOMException("mediaDevices unavailable", "NotSupportedError");
-  }
-  return navigator.mediaDevices;
-}
-
-async function countDevices(kind: "audioinput" | "videoinput"): Promise<number | null> {
-  try {
-    if (!navigator.mediaDevices?.enumerateDevices) return null;
-    const devices = await navigator.mediaDevices.enumerateDevices();
-    return devices.filter((d) => d.kind === kind).length;
-  } catch { return null; }
-}
-
-interface Capture { id: string; title: string; status: string; task_description: string; transcript_corrected: string }
 interface JobRow { id: string; procedure_title: string; status: string; outcome: string | null; started_at: string; events: number }
 interface ManualRow { id: string; title: string; model: string | null; chunks: number }
 
@@ -81,6 +51,8 @@ export default function App() {
   const [activeJob, setActiveJob] = useState<LocalJob | null>(null);
   const [updateReady, setUpdateReady] = useState(false);
   const [reviewVersion, setReviewVersion] = useState<Version | null>(null);
+  const [studioItem, setStudioItem] = useState<LibraryItem | null>(null);
+  const [tutRefresh, setTutRefresh] = useState(0);
   const [detailVersion, setDetailVersion] = useState<Version | null>(null);
   const [storageNote, setStorageNote] = useState<string | null>(null);
   const pwa = usePwaInstall();
@@ -332,20 +304,28 @@ export default function App() {
   }
 
   const pendingReview = procs.filter((p) => p.has_pending_review).length;
+  // Four primary destinations. Review stays available as a secondary
+  // destination (badge shows the queue); Guided job is contextual, reached
+  // from an approved procedure or Continue Working — never a nav item.
   const deskNav: { view: View; label: string; icon: IconName }[] = [
-    { view: "home", label: "Workbench", icon: "home" }, { view: "library", label: "Procedures", icon: "book" }, { view: "capture", label: "Capture", icon: "addBox" },
-    { view: "review", label: `Review${pendingReview ? ` (${pendingReview})` : ""}`, icon: "edit" }, { view: "job", label: "Guided job", icon: "play" }, { view: "activity", label: "Activity", icon: "schedule" },
-    { view: "history", label: "History", icon: "timer" }, { view: "manuals", label: "Manuals", icon: "library" }, { view: "settings", label: "Settings", icon: "cog" },
+    { view: "home", label: "Workbench", icon: "home" }, { view: "library", label: "Procedures", icon: "book" },
+    { view: "tutorials", label: "Tutorials", icon: "videocam" }, { view: "activity", label: "Activity", icon: "schedule" },
+  ];
+  const deskSecondary: { view: View; label: string; icon: IconName }[] = [
+    { view: "review", label: `Review${pendingReview ? ` (${pendingReview})` : ""}`, icon: "edit" },
+    { view: "manuals", label: "Manuals", icon: "library" }, { view: "settings", label: "Settings", icon: "cog" },
   ];
   const mobileNav: { view: View; label: string; icon: IconName }[] = [
-    { view: "home", label: "Home", icon: "home" }, { view: "library", label: "Procedures", icon: "book" }, { view: "capture", label: "Capture", icon: "addBox" },
+    { view: "home", label: "Home", icon: "home" }, { view: "library", label: "Procedures", icon: "book" },
+    { view: "tutorials", label: "Tutorials", icon: "videocam" },
     { view: "activity", label: pending ? `Activity (${pending})` : "Activity", icon: "schedule" },
-    { view: "settings", label: "Settings", icon: "cog" },
   ];
-  const mobileCurrent: View = view === "home" || view === "library" || view === "capture" || view === "settings" ? view : view === "detail" ? "library" : "activity";
+  const mobileCurrent: View = view === "home" || view === "library" || view === "tutorials" || view === "settings" ? view
+    : view === "detail" || view === "manuals" ? "library"
+    : view === "studio" || view === "capture" ? "tutorials" : "activity";
   const screenLabel: Record<View, string> = {
-    home: "Home", library: "Procedures", detail: "Procedure", capture: "Capture", review: "Review",
-    job: "Guided job", history: "History", manuals: "Manuals", settings: "Settings", activity: "Activity",
+    home: "Workbench", library: "Procedures", detail: "Procedure", capture: "Tutorials", tutorials: "Tutorials", studio: "Tutorial Studio",
+    review: "Review", job: "Guided job", history: "Activity", manuals: "Manuals", settings: "Settings", activity: "Activity",
   };
 
   async function handleSetJob(j: LocalJob | null) {
@@ -415,7 +395,9 @@ export default function App() {
               <span className="sync-dot" aria-hidden="true" />{online ? (syncState === "syncing" ? "Syncing…" : `Online · ${pending} pending`) : "Offline · local"}
             </span>
             {syncState === "failed" && <span className="pill error">Sync needs attention</span>}
-            <span className="avatar" title={`Demo identity: ${role}`} aria-label={`Demo identity: ${role}`}>{role[0].toUpperCase()}</span>
+            <button className="avatar-btn" onClick={() => setView("settings")} title={`Profile & settings (demo identity: ${role})`} aria-label={`Profile and settings. Demo identity: ${role}`}>
+              <span className="avatar" aria-hidden="true">{role[0].toUpperCase()}</span>
+            </button>
           </div>
         </div>
       </header>
@@ -423,6 +405,10 @@ export default function App() {
         <nav className="nav" aria-label="Primary">
           {deskNav.map((n) => (
             <button key={n.view} aria-current={view === n.view ? "page" : undefined} onClick={() => setView(n.view)}><Icon name={n.icon} size={18} /> {n.label}</button>
+          ))}
+          <span className="nav-sep" aria-hidden="true">Review & setup</span>
+          {deskSecondary.map((n) => (
+            <button key={n.view} className="nav-secondary" aria-current={view === n.view ? "page" : undefined} onClick={() => setView(n.view)}><Icon name={n.icon} size={18} /> {n.label}</button>
           ))}
         </nav>
         <main id="main">
@@ -440,11 +426,21 @@ export default function App() {
           {view === "home" && <Home procs={procs} jobs={jobs} activeJob={activeJob} activeVersion={activeVersion} pending={pending} online={online} storageNote={storageNote} role={role} go={setView} pwa={pwa} openReview={async (vid) => { const v = await openVersion(vid); if (v) { setReviewVersion(v); setView("review"); } else notify("That version is not available offline yet.", "error"); }} continueJob={() => { if (activeJob) { openVersion(activeJob.procedure_version_id).then((v) => { if (v) { setActiveVersion(v); setView("job"); } else notify("Downloaded procedure not found on this device. Reconnect and open it from Procedures.", "error"); }); } }} />}
           {view === "library" && <Library procs={procs} cachedIds={cachedIds} reload={loadLists} startJob={startJob} openVersion={openDetail} cache={async (vid) => { const v = await openVersion(vid); notify(v ? "Saved for offline use — verified in local storage on this device." : "Download failed — check connection.", v ? "ok" : "error"); }} />}
           {view === "detail" && <ProcedureDetail title={(detailVersion && procs.find((x) => x.id === detailVersion.procedure_id)?.title) || ""} version={detailVersion} cached={detailVersion ? cachedIds.has(detailVersion.id) : false} startJob={() => { const p = detailVersion ? procs.find((x) => x.id === detailVersion.procedure_id) : undefined; if (p) startJob(p); else if (detailVersion) notify("Procedure record unavailable — reload the library.", "error"); }} cache={async () => { if (detailVersion) { const v = await openVersion(detailVersion.id); notify(v ? "Saved for offline use — verified in local storage on this device." : "Download failed — check connection.", v ? "ok" : "error"); } }} openReview={() => { if (detailVersion) { setReviewVersion(detailVersion); setView("review"); } }} go={setView} />}
-          {view === "capture" && <CaptureView done={(v) => { setReviewVersion(v); setView("review"); loadLists(); }} openReview={async (vid) => { const v = await openVersion(vid); if (v) { setReviewVersion(v); setView("review"); } else notify("That version is not available offline yet.", "error"); }} />}
+          {view === "capture" && <TutorialsView
+            onOpenStudio={(t) => { setStudioItem(t); setView("studio"); }}
+            refreshKey={tutRefresh} />}
+          {view === "tutorials" && <TutorialsView
+            onOpenStudio={(t) => { setStudioItem(t); setView("studio"); }}
+            refreshKey={tutRefresh} />}
+          {view === "studio" && (studioItem
+            ? <TutorialStudio item={studioItem} onBack={() => { setView("tutorials"); setTutRefresh((n) => n + 1); }}
+              onOpenReview={async (vid: string) => { const v = await openVersion(vid); if (v) { setReviewVersion(v); setView("review"); } else notify("That version is not available offline yet.", "error"); }}
+              notify={notify} />
+            : <div className="card"><div className="empty"><h3>No tutorial selected</h3><p>Pick a tutorial from the library to edit it in the Studio.</p><button className="btn" onClick={() => setView("tutorials")}>Open Tutorials</button></div></div>)}
           {view === "review" && <ReviewView version={reviewVersion} setVersion={setReviewVersion} procs={procs} openVersion={openVersion} role={role} reload={loadLists} notify={notify} />}
           {view === "job" && <JobView job={activeJob} version={activeVersion} queueEvent={queueEvent} setJob={handleSetJob} notify={notify} reload={loadLists} go={setView} pending={pending} online={online} offlineReady={activeVersion ? cachedIds.has(activeVersion.id) : false} />}
           {view === "activity" && <Activity jobs={jobs} pending={pending} pendingReview={pendingReview} reload={loadLists} go={setView} syncNow={() => void syncNow()} syncing={syncState === "syncing"} role={role} onProposeRevision={async (vid) => { const v = await openVersion(vid); if (v) { setReviewVersion(v); setView("review"); notify("Opened the job's exact revision. Use “Propose new revision” there — it goes through normal review."); } else notify("That revision is not available offline yet.", "error"); }} />}
-          {view === "history" && <History jobs={jobs} reload={loadLists} role={role} onProposeRevision={async (vid) => { const v = await openVersion(vid); if (v) { setReviewVersion(v); setView("review"); } }} />}
+          {view === "history" && <Activity jobs={jobs} pending={pending} pendingReview={pendingReview} reload={loadLists} go={setView} syncNow={() => void syncNow()} syncing={syncState === "syncing"} role={role} onProposeRevision={async (vid) => { const v = await openVersion(vid); if (v) { setReviewVersion(v); setView("review"); notify("Opened the job's exact revision. Use “Propose new revision” there — it goes through normal review."); } else notify("That revision is not available offline yet.", "error"); }} />}
           {view === "manuals" && <Manuals notify={notify} />}
           {view === "settings" && <Settings pending={pending} role={role} setRole={setRole} onSignOut={doLogout} pwa={pwa} clearCache={async () => { await idb.clear("versions"); await refreshCached(); notify("Offline procedure cache cleared. Downloaded jobs and queued events were kept."); }} />}
         </main>
@@ -521,15 +517,15 @@ function Home({ procs, jobs, activeJob, activeVersion, pending, online, storageN
       ) : (
         <div className="card primary-action">
           <h2>What needs doing?</h2>
-          <p className="muted">Start from an approved procedure, or capture new expert knowledge. Approved work keeps running without a connection.</p>
-          <div className="row"><button className="btn" onClick={() => go("library")}>Find an approved procedure</button><button className="btn secondary" onClick={() => go("capture")}>Capture knowledge</button></div>
+          <p className="muted">Start from an approved procedure, or record new expert knowledge as a tutorial. Approved work keeps running without a connection.</p>
+          <div className="row"><button className="btn" onClick={() => go("library")}>Find an approved procedure</button><button className="btn secondary" onClick={() => go("tutorials")}>Record a tutorial</button></div>
         </div>
       )}
       <div className="grid" style={{ marginBottom: 14 }}>
-        <button className="card" style={{ textAlign: "left", margin: 0 }} onClick={() => go("capture")}>
-          <span className="tool-pill" style={{ background: "var(--primary-container)", color: "#fff" }}><Icon name="mic" size={20} /></span>
-          <span className="panel-title" style={{ display: "block", marginTop: 8 }}>Capture Knowledge</span>
-          <span className="muted small-text">Voice dictate or photo sequence</span>
+        <button className="card" style={{ textAlign: "left", margin: 0 }} onClick={() => go("tutorials")}>
+          <span className="tool-pill" style={{ background: "var(--primary-container)", color: "#fff" }}><Icon name="videocam" size={20} /></span>
+          <span className="panel-title" style={{ display: "block", marginTop: 8 }}>Tutorials</span>
+          <span className="muted small-text">Record and refine expert knowledge</span>
         </button>
         <button className="card" style={{ textAlign: "left", margin: 0 }} onClick={() => go("library")}>
           <span className="tool-pill"><Icon name="book" size={20} /></span>
@@ -861,421 +857,30 @@ interface SegMask { svg_path: string; width: number; height: number }
 interface SegObject { object_id: number; bbox_norm: number[]; confidence?: number | null; mask?: SegMask | null }
 interface SegGeometry { bbox_norm: number[]; label: string; mask?: SegMask | null; objects?: SegObject[]; image_size?: number[] }
 
-const CAPTURE_DRAFT_KEY = "fg-capture-draft-v1";
-function loadCaptureDraft(): Record<string, string> {
-  try { return JSON.parse(localStorage.getItem(CAPTURE_DRAFT_KEY) || "{}") as Record<string, string>; } catch { return {}; }
-}
-
-function CaptureView({ done, openReview }: { done: (v: Version) => void; openReview: (vid: string) => void }) {
-  const [mode, setMode] = useState<"photo" | "live" | "tutorial">("photo");
-  const saved = useRef(loadCaptureDraft()).current;
-  const [title, setTitle] = useState(saved.title || "Reseat the trainer cable harness");
-  const [assetName, setAssetName] = useState(saved.assetName || "Benchtop Cable Trainer v1");
-  const [desc, setDesc] = useState(saved.desc || "Expert walkthrough of the harness reseat on the harmless training assembly.");
-  const [capId, setCapId] = useState<string | null>(saved.capId || null);
-  const [transcript, setTranscript] = useState(saved.transcript || "First power off the trainer and remove the two enclosure screws. Then check the blue adjustment knob turns smoothly. Next press each harness connector until the latch clicks. Finally route cables through the guide clips, close the cover, and verify the indicator sequence.");
-  const [status, setStatus] = useState("");
-  const [statusKind, setStatusKind] = useState<"warn" | "error" | "ok">("warn");
-  const [busy, setBusy] = useState(false);
-  const [camState, setCamState] = useState<"unknown" | "ready" | "blocked">("unknown");
-  const [cameraOpen, setCameraOpen] = useState(false);
-  const [cameras, setCameras] = useState<CameraDevice[]>([]);
-  const [cameraId, setCameraId] = useState<string | null>(() => getPreferredCameraId());
-  const [photoUrl, setPhotoUrl] = useState<string | null>(null);
-  const [segPrompt, setSegPrompt] = useState(saved.segPrompt || "blue adjustment knob");
-  const [photoEvId, setPhotoEvId] = useState<string | null>(saved.photoEvId || null);
-  const [seg, setSeg] = useState<{ id: string; geometry: SegGeometry; simulated: boolean; note?: string; status?: string } | null>(null);
-  const [segAttempts, setSegAttempts] = useState<string[]>([]);
-  const [suggestions, setSuggestions] = useState<string[]>([]);
-  const [detectedPhrase, setDetectedPhrase] = useState<string | null>(null);
-  const [recoveryTap, setRecoveryTap] = useState<{ nx: number; ny: number } | null>(null);
-  const dismissedPhraseRef = useRef("");
-  const [capStep, setCapStep] = useState(0);
-  const [assets, setAssets] = useState<{ id: string; name: string }[]>([]);
-  const [photoCount, setPhotoCount] = useState(0);
-  // Steps unlock once the session exists; evidence/transcript completeness
-  // is shown per step but never blocks (drafts work without photos).
-  const maxCapStep = capId ? 3 : 0;
-  const goStep = (n: number) => setCapStep(Math.max(0, Math.min(maxCapStep, 3, n)));
-  const videoRef = useRef<HTMLVideoElement | null>(null);
-  const camStreamRef = useRef<MediaStream | null>(null);
-  const photoUrlRef = useRef<string | null>(null);
-
-  function say(text: string, kind: "warn" | "error" | "ok" = "warn") { setStatus(text); setStatusKind(kind); }
-  useEffect(() => {
-    try { localStorage.setItem(CAPTURE_DRAFT_KEY, JSON.stringify({ title, assetName, desc, transcript, segPrompt, capId: capId || "", photoEvId: photoEvId || "" })); } catch { /* storage full/blocked: session still works */ }
-  }, [title, assetName, desc, transcript, segPrompt, capId, photoEvId]);
-
-  function showPhoto(blob: Blob) {
-    if (photoUrlRef.current) URL.revokeObjectURL(photoUrlRef.current);
-    const url = URL.createObjectURL(blob);
-    photoUrlRef.current = url; setPhotoUrl(url); setSeg(null); setSegAttempts([]); setSuggestions([]); setRecoveryTap(null);
-  }
-  function stopCamera() {
-    camStreamRef.current?.getTracks().forEach((t) => t.stop());
-    camStreamRef.current = null; setCameraOpen(false);
-  }
-  useEffect(() => {
-    api.get<{ id: string; name: string }[]>("/api/assets").then((rows) => {
-      const seen = new Set<string>();
-      setAssets(rows.filter((r) => (r.name || "").trim() && !seen.has(r.name.trim()) && (seen.add(r.name.trim()), true)));
-    }).catch(() => { /* offline: free-text asset still works */ });
-  }, []);
-  useEffect(() => {
-    if (!capId) { setPhotoCount(0); return; }
-    let alive = true;
-    api.get<{ evidence: { evidence_type: string }[] }>(`/api/capture-sessions/${capId}`)
-      .then((r) => { if (alive) setPhotoCount((r.evidence || []).filter((e) => e.evidence_type === "image").length); })
-      .catch(() => { /* offline: count stays */ });
-    return () => { alive = false; };
-  }, [capId, photoEvId]);
-  useEffect(() => {
-    if (cameraOpen && videoRef.current && camStreamRef.current) {
-      videoRef.current.srcObject = camStreamRef.current;
-      videoRef.current.play().catch(() => { /* autoplay may need user gesture; user just clicked */ });
-    }
-  }, [cameraOpen]);
-  useEffect(() => () => {
-    camStreamRef.current?.getTracks().forEach((t) => t.stop());
-    if (photoUrlRef.current) URL.revokeObjectURL(photoUrlRef.current);
-  }, []);
-
-  async function create(): Promise<string | null> {
-    if (!title.trim()) { say("Give the session a title first.", "error"); return null; }
-    setBusy(true); say("Creating capture session…");
-    try {
-      const c = await api.post<Capture>("/api/capture-sessions", { title, task_description: desc, asset_name: assetName, category: "assembly" });
-      setCapId(c.id); say("Session saved on the server. Add evidence, then generate the draft.", "ok");
-      return c.id;
-    } catch (e) { say(e instanceof Error ? e.message : "Failed to create session", "error"); return null; } finally { setBusy(false); }
-  }
-
-  async function saveTranscript(): Promise<boolean> {
-    if (!capId) return false;
-    try {
-      await api.put(`/api/capture-sessions/${capId}/transcript`, { transcript_original: transcript, transcript_corrected: transcript });
-      await api.post<{ id: string }>(`/api/capture-sessions/${capId}/evidence`, { evidence_type: "transcript", text_content: transcript, description: "Expert narration (corrected)", source_reference: "capture-transcript" });
-      say("Corrected transcript saved as evidence. The original AI output is preserved separately on the backend.", "ok");
-      return true;
-    } catch (e) { say(e instanceof Error ? e.message : "Transcript save failed — your text is kept in this form.", "error"); return false; }
-  }
-
-  async function openCamera() {
-    if (!capId) { setStatus("Create the session first (step 1), then open the camera to attach photo evidence."); return; }
-    if (cameraOpen) { stopCamera(); return; }
-    try {
-      const md = mediaDevicesOrFail("camera");
-      void listCameras().then(setCameras).catch(() => undefined);
-      const cams = await countDevices("videoinput");
-      if (cams === 0) { setCamState("blocked"); setStatus("No camera found. Connect/enable a camera in Windows Settings > Privacy > Camera, then try again — or use Attach photo."); return; }
-      let stream: MediaStream;
-      try {
-        stream = await md.getUserMedia(cameraConstraints(cameraId, "environment"));
-      } catch (e) {
-        if (e instanceof DOMException && (e.name === "OverconstrainedError" || e.name === "NotFoundError")) {
-          if (cameraId) {
-            // Saved device gone (e.g. unplugged dock camera): forget it and retry with any camera.
-            setCameraId(null); setPreferredCameraId(null);
-            stream = await md.getUserMedia(cameraConstraints(null, "environment"));
-          } else {
-            stream = await md.getUserMedia({ video: true, audio: false });
-          }
-        } else throw e;
-      }
-      camStreamRef.current = stream; setCamState("ready"); setCameraOpen(true);
-      setStatus("Camera open — frame the component, then Capture photo for SAM segmentation.");
-    } catch (e) { setCamState("blocked"); setStatus(mediaErrorMessage(e, "camera")); }
-  }
-
-  async function capturePhoto(): Promise<string | null> {
-    const video = videoRef.current;
-    if (!video || !capId) { setStatus("Open the camera first."); return null; }
-    const w = video.videoWidth, h = video.videoHeight;
-    if (!w || !h) { setStatus("Camera is still starting — wait a moment and capture again."); return null; }
-    const canvas = document.createElement("canvas"); canvas.width = w; canvas.height = h;
-    const ctx = canvas.getContext("2d"); if (!ctx) { setStatus("Could not capture a frame from the camera."); return null; }
-    ctx.drawImage(video, 0, 0, w, h);
-    const blob = await new Promise<Blob | null>((res) => canvas.toBlob(res, "image/jpeg", 0.92));
-    if (!blob) { setStatus("Could not encode the captured photo."); return null; }
-    showPhoto(blob); stopCamera();
-    const fd = new FormData(); fd.append("file", new File([blob], "camera-capture.jpg", { type: "image/jpeg" })); fd.append("description", "Camera photo evidence");
-    try {
-      const r = await api.upload<{ id: string }>(`/api/capture-sessions/${capId}/image`, fd);
-      setPhotoEvId(r.id); say("Photo captured and attached as evidence. Run SAM segmentation below.", "ok");
-      return r.id;
-    } catch (e) { setStatus(e instanceof Error ? e.message : "Photo upload failed"); return null; }
-  }
-
-  async function onPhoto(f: File | undefined) {
-    if (!f || !capId) { setStatus("Create the session before attaching photos."); return; }
-    showPhoto(f);
-    const fd = new FormData(); fd.append("file", f); fd.append("description", "Expert photo evidence");
-    try { const r = await api.upload<{ id: string }>(`/api/capture-sessions/${capId}/image`, fd); setPhotoEvId(r.id); say("Photo attached as evidence. Run SAM segmentation on it below.", "ok"); }
-    catch (e) { setStatus(e instanceof Error ? e.message : "Photo upload failed"); }
-  }
-
-  type SegResp = { id: string; geometry: SegGeometry; simulated: boolean; note?: string; status?: string };
-
-  async function runSegment(overridePrompt?: string, point?: { nx: number; ny: number }, evIdOverride?: string): Promise<SegResp | null> {
-    const evId = evIdOverride || photoEvId;
-    if (!evId) { say("Attach or capture photo evidence first, then segment it.", "error"); return null; }
-    const base = (overridePrompt ?? segPrompt).trim() || "blue adjustment knob";
-    try {
-      if (point) {
-        const r = await api.post<SegResp>(`/api/evidence/${evId}/segment`, { prompt_text: base, prompt_nx: point.nx, prompt_ny: point.ny });
-        setSeg(r);
-        say(r.status === "no_match" ? "SAM still found nothing at that tap. Try tapping the center of the object, or a clearer photo." : "Tap segmentation returned — confirm the highlighted component on your photo.", r.status === "no_match" ? "warn" : "ok");
-        return r;
-      }
-      // No-match recovery ladder: try progressively simpler prompts automatically.
-      const candidates = overridePrompt ? [base] : promptVariants(base);
-      const tried: string[] = [];
-      let last: SegResp | null = null;
-      for (const cand of candidates) {
-        tried.push(cand);
-        last = await api.post<SegResp>(`/api/evidence/${evId}/segment`, { prompt_text: cand });
-        setSeg(last);
-        if (last.status !== "no_match" || last.simulated) break;
-      }
-      setSegAttempts(tried);
-      if (last && last.status === "no_match") {
-        say(`SAM 3.1 found no match (tried ${tried.map((t) => `“${t}”`).join(", ")}). Use the recovery options below — suggest objects, simplify, or tap the object.`, "warn");
-      } else if (last?.simulated) {
-        say(last.note || "Segmentation returned in simulated mode.", "warn");
-      } else if (last) {
-        say(tried.length > 1 ? `Matched with simpler prompt “${tried[tried.length - 1]}” — confirm the highlight.` : "SAM 3.1 segmentation returned — confirm the highlighted component on your photo.", "ok");
-      }
-      return last;
-    } catch (e) { say(e instanceof Error ? e.message : "Segmentation failed", "error"); return null; }
-  }
-
-  async function suggestObjects() {
-    if (!photoEvId) return;
-    say("Asking Muse Spark to name visible objects…");
-    try {
-      const r = await api.post<{ suggestions: string[]; simulated: boolean; note?: string }>(`/api/evidence/${photoEvId}/suggest-prompts`, {});
-      setSuggestions(r.suggestions || []);
-      say(r.suggestions?.length ? "Spark suggested these visible objects — tap one to segment it." : (r.note || "No suggestions returned. Type a prompt or tap the object on the photo."), r.suggestions?.length ? "ok" : "warn");
-    } catch (e) { say(e instanceof Error ? e.message : "Suggestions failed", "error"); }
-  }
-
-  async function segmentPhrase(phrase: string) {
-    setDetectedPhrase(phrase); setSegPrompt(phrase);
-    if (photoEvId) { say(`Heard “${phrase}” — segmenting it now.`); void runSegment(phrase); }
-    else if (cameraOpen) {
-      say(`Heard “${phrase}” — capturing this frame and segmenting it.`);
-      const id = await capturePhoto();
-      if (id) void runSegment(phrase, undefined, id);
-      else say(`Heard “${phrase}”, but the frame could not be captured. Keep the camera open and say it again.`, "error");
-    }
-    else say(`Heard “${phrase}”. Attach or capture a photo and it will be segmented.`, "warn");
-  }
-
-  // Typed/pasted transcripts also surface a detected object phrase.
-  useEffect(() => {
-    const p = extractObjectPhrase(transcript);
-    if (p && p !== dismissedPhraseRef.current) setDetectedPhrase(p);
-  }, [transcript]);
-
-  async function confirmSegment(confirmed: boolean) {
-    if (!seg) return;
-    await api.post(`/api/segmentation/${seg.id}/confirm`, { confirmed });
-  }
-
-  async function generate() {
-    if (!capId) return;
-    setBusy(true); say("Saving transcript, then generating schema-validated draft with Muse Spark…");
-    try {
-      const savedOk = await saveTranscript();
-      if (!savedOk) { say("Transcript could not be saved, so draft generation was not started. Your text is kept in this form.", "error"); return; }
-      const v = await api.post<Version>("/api/procedures/draft", { capture_session_id: capId, manual_excerpt: "" });
-      try { localStorage.removeItem(CAPTURE_DRAFT_KEY); } catch { /* ignore */ }
-      done(v);
-    } catch (e) { say(e instanceof Error ? e.message : "Draft generation failed — your transcript stays saved.", "error"); } finally { setBusy(false); }
-  }
-
-  function discardDraft() {
-    try { localStorage.removeItem(CAPTURE_DRAFT_KEY); } catch { /* ignore */ }
-    stopCamera();
-    if (photoUrlRef.current) { URL.revokeObjectURL(photoUrlRef.current); photoUrlRef.current = null; }
-    setCapId(null); setPhotoEvId(null); setPhotoUrl(null); setSeg(null); setSegAttempts([]); setSuggestions([]); setDetectedPhrase(null); setRecoveryTap(null);
-    setTranscript(""); setCapStep(0);
-    say("Local draft cleared. Any session already created on the server is untouched — start a new session when ready.", "ok");
-  }
-
+function TutorialsView({ onOpenStudio, refreshKey }: { onOpenStudio: (t: LibraryItem) => void; refreshKey?: number }) {
+  // Single workflow: Record a tutorial. Quick capture and Live are gone
+  // from the UI; the server keeps its capture APIs for existing records.
+  const [showRecord, setShowRecord] = useState(true);
   return (
     <div>
-      <span className="eyebrow"><Icon name="bot" size={14} /> Knowledge ingestion</span>
-      <h2>Capture Knowledge</h2>
-      <p className="muted" style={{ marginTop: -8 }}>Turn hands-on expertise into evidence-backed field procedures</p>
-      <div className="row" role="group" aria-label="Capture mode" style={{ marginBottom: 12 }}>
-        <button className={`btn small ${mode === "photo" ? "" : "secondary"}`} aria-pressed={mode === "photo"} onClick={() => setMode("photo")}><Icon name="mic" size={17} /> Quick capture</button>
-        <button className={`btn small ${mode === "live" ? "" : "secondary"}`} aria-pressed={mode === "live"} onClick={() => setMode("live")}><Icon name="videocam" size={17} /> Live</button>
-        <button className={`btn small ${mode === "tutorial" ? "" : "secondary"}`} aria-pressed={mode === "tutorial"} onClick={() => setMode("tutorial")}><Icon name="play" size={17} /> Record a tutorial</button>
-      </div>
-      {mode === "tutorial" ? (
-        <div className="card">
-          <h3>Record video tutorial</h3>
-          <p className="muted small-text">Record continuous work video. AI extracts key frames, step boundaries, and component highlights for human review.</p>
-          <div className="stat-tiles" style={{ marginBottom: 10 }}>
-            <div className="stat-tile"><span className="t"><Icon name="check" size={14} /> Auto key-frames</span></div>
-            <div className="stat-tile"><span className="t"><Icon name="check" size={14} /> Audio demixing</span></div>
-            <div className="stat-tile"><span className="t"><Icon name="check" size={14} /> Step segmentation</span></div>
-          </div>
-          <TutorialMode onUseTranscript={(t) => { setTranscript(t); setMode("photo"); }} onOpenReview={openReview} />
-        </div>
-      ) : mode === "live" ? <LiveMode captureId={capId} onTranscript={(t) => setTranscript(t)} onEvidenceSaved={(id) => { setPhotoEvId(id); setMode("photo"); say("Live frame saved as photo evidence — run SAM or generate the draft in Quick capture.", "ok"); }} /> : (<>
-      <section className="card" aria-label="Local capture draft">
+      <span className="eyebrow">Knowledge capture</span>
+      <h2>Tutorials</h2>
+      <p className="muted" style={{ marginTop: -8 }}>Turn a hands-on recording into a reviewed, field-ready procedure.</p>
+      <div className="card">
         <div className="row" style={{ justifyContent: "space-between" }}>
-          <span className="eyebrow"><Icon name="edit" size={14} /> {capId ? "Saved locally · ready for synthesis" : "New capture session"}</span>
-          <span className="badge neutral num">{photoCount} photo{photoCount === 1 ? "" : "s"} · {transcript.trim() ? transcript.trim().split(/\s+/).length : 0} words</span>
-        </div>
-        <p style={{ margin: "8px 0 2px" }}><strong>{title || "Untitled session"}</strong></p>
-        <p className="muted small-text" style={{ margin: 0 }}>Asset: {assetName || "—"}</p>
-        <div className="row" style={{ marginTop: 10 }}>
-          <button className="btn" style={{ flex: 1 }} onClick={generate} disabled={!capId || busy}><Icon name="forward" size={18} /> {busy ? "Working…" : "Generate procedure draft"}</button>
-        </div>
-        <div className="row" style={{ justifyContent: "space-between", marginTop: 8 }}>
-          <button className="btn small secondary" onClick={discardDraft} disabled={busy}><Icon name="trash" size={16} /> Discard draft</button>
-          <span className="muted small-text">Stored on device storage</span>
-        </div>
-      </section>
-      <ol className="steps-indicator" aria-label="Capture progress">
-        {(["Session", "Evidence", "Transcript", "Review & draft"] as const).map((label, i) => {
-          const done = i === 0 ? !!capId : i === 1 ? !!photoEvId : i === 2 ? transcript.trim().length > 0 : false;
-          const unlocked = i <= maxCapStep;
-          return (
-            <li key={label} className={i === capStep ? "now" : done ? "done" : ""} aria-current={i === capStep ? "step" : undefined}>
-              {unlocked && i !== capStep
-                ? <button className="btn small secondary" style={{ border: 0, background: "transparent", padding: 0, minHeight: "44px", font: "inherit" }} onClick={() => goStep(i)}>{i + 1} · {label}{done ? " ✓" : ""}</button>
-                : <span>{i + 1} · {label}{done ? " ✓" : ""}</span>}
-            </li>
-          );
-        })}
-      </ol>
-      <p className="muted">Your form is saved on this device as you type. Sessions save on the server before any AI request, so a dropped connection loses nothing.</p>
-      {capStep === 0 && (<>
-      <h3>1 · Session details</h3>
-      <label htmlFor="cap-title">Session title</label><input id="cap-title" value={title} onChange={(e) => setTitle(e.target.value)} />
-      <label htmlFor="cap-asset">Target equipment</label>
-      <input id="cap-asset" value={assetName} onChange={(e) => setAssetName(e.target.value)} list="asset-list" placeholder="e.g. Pump P-104 (Centrifugal Feed)" />
-      <datalist id="asset-list">{assets.map((a) => <option key={a.id} value={a.name} />)}</datalist>
-      <label htmlFor="cap-desc">Task description</label><textarea id="cap-desc" rows={2} value={desc} onChange={(e) => setDesc(e.target.value)} />
-      <div className="row" style={{ marginTop: 12 }}>
-        <button className="btn" onClick={async () => { const id = await create(); if (id) setCapStep(1); }} disabled={!!capId || busy}>{capId ? "Session created" : busy ? "Creating..." : "Create capture session"}</button>
-        {capId && <button className="btn secondary" onClick={() => goStep(1)}>Continue to evidence</button>}
-      </div>
-      </>)}
-      {capStep === 1 && (<>
-      <h3>2 · Photo evidence</h3>
-      <p className="muted small-text">Attach at least one photo. Highlighting it with SAM 3.1 below is optional but helps reviewers verify the procedure.</p>
-      <div className="row" style={{ marginTop: 12 }}>
-        <button className="btn secondary" onClick={openCamera}>{cameraOpen ? "Close camera" : camState === "blocked" ? "Retry camera" : "Use camera"}</button>
-        <label className="btn secondary" style={{ margin: 0 }} aria-label="Choose camera">Camera
-          <select value={cameraId || ""} aria-label="Choose camera" disabled={cameraOpen} onChange={(e) => { const id = e.target.value || null; setCameraId(id); setPreferredCameraId(id); }} style={{ width: "auto", minHeight: 0, border: 0, background: "transparent", marginLeft: 6, font: "inherit", color: "inherit" }}>
-            <option value="">Auto</option>
-            {cameras.map((c) => <option key={c.id} value={c.id}>{c.label}</option>)}
-          </select>
-        </label>
-        <label className="btn secondary">Attach photo<input className="visually-hidden" type="file" accept="image/jpeg,image/png,image/webp" aria-label="Attach photo" onChange={(e) => onPhoto(e.target.files?.[0])} /></label>
-      </div>
-      <p className="muted">Camera: {camState === "ready" ? "available" : camState === "blocked" ? "blocked/unavailable — details below" : "not tested yet (click Use camera)"}. Media needs http://localhost or HTTPS and browser permission.</p>
-      {cameraOpen && (
-        <div style={{ marginTop: 12 }}>
-          <video ref={videoRef} className="camera-preview" autoPlay playsInline muted aria-label="Camera preview" />
-          <div className="row" style={{ marginTop: 10 }}>
-            <button className="btn" onClick={capturePhoto}>Capture photo</button>
-            <button className="btn secondary" onClick={stopCamera}>Cancel</button>
+          <div>
+            <h3 style={{ margin: 0 }}>Record a tutorial</h3>
+            <p className="muted small-text" style={{ margin: "2px 0 0" }}>2–10 minute video with narration. Processing runs on the server after upload.</p>
           </div>
+          <button className="btn small secondary" aria-expanded={showRecord} onClick={() => setShowRecord((v) => !v)}>{showRecord ? "Hide recorder" : "Record a tutorial"}</button>
         </div>
-      )}
-      {photoUrl && !seg && (
-        <div style={{ marginTop: 12 }}>
-          <p className="muted">Photo evidence preview — run SAM segmentation to overlay a highlight on this photo.</p>
-          <img className="thumb" src={photoUrl} alt="Captured evidence" />
-        </div>
-      )}
-      <div className="row" style={{ marginTop: 10 }}>
-        <button className="btn secondary" onClick={() => goStep(0)}>← Back</button>
-        <button className="btn" onClick={() => goStep(2)}>Continue to transcript →</button>
-      </div>
-      </>)}
-      {capStep === 2 && (<>
-      <h3>3 · Transcript</h3>
-      <p className="muted small-text">Record narration or type it. Say <strong>“this is my flag”</strong> while recording and the flag is segmented automatically. Saving stores the corrected transcript as evidence.</p>
-      <LiveTranscribe captureId={capId} disabled={!capId}
-        onFinal={(text) => setTranscript(text)}
-        onObjectPhrase={(phrase) => segmentPhrase(phrase)} />
-      {!capId && <p className="muted small-text">Create the session first to enable recording. Typing the transcript works at any time and is saved on this device.</p>}
-      <label htmlFor="cap-transcript">Transcript — correct any errors (original AI output is kept separately)</label>
-      <textarea id="cap-transcript" rows={5} value={transcript} onChange={(e) => setTranscript(e.target.value)} />
-      {detectedPhrase && (
-        <div className="notice info" role="status">
-          Heard in narration: <strong>“{detectedPhrase}”</strong>
-          <div className="row" style={{ marginTop: 8 }}>
-            <button className="btn small" onClick={() => segmentPhrase(detectedPhrase)} disabled={!photoEvId}>Segment “{detectedPhrase}”</button>
-            <button className="btn small secondary" onClick={() => setSegPrompt(detectedPhrase)}>Use as prompt only</button>
-            <button className="btn small secondary" onClick={() => { dismissedPhraseRef.current = detectedPhrase; setDetectedPhrase(null); }}>Dismiss</button>
+        {showRecord && (
+          <div style={{ marginTop: 10 }}>
+            <TutorialMode hideLibrary onOpenStudio={(t) => onOpenStudio({ id: t.id, access_token: t.access_token, title: t.title } as LibraryItem)} />
           </div>
-          {!photoEvId && <p className="muted small-text" style={{ marginTop: 6 }}>Attach or capture a photo first, then segment it.</p>}
-        </div>
-      )}
-      <div className="row" style={{ marginTop: 10 }}>
-        <button className="btn secondary" onClick={() => void saveTranscript()} disabled={!capId || busy}>Save corrected transcript</button>
+        )}
       </div>
-      <div className="row" style={{ marginTop: 10 }}>
-        <button className="btn secondary" onClick={() => goStep(1)}>← Back</button>
-        <button className="btn" onClick={() => goStep(3)}>Continue to review →</button>
-      </div>
-      </>)}
-      {capStep === 3 && (<>
-      <h3>4 · Review &amp; draft</h3>
-      <p className="muted small-text">{transcript.trim() ? `Transcript ready (${transcript.trim().split(/\s+/).length} words).` : "No transcript yet — one improves the draft, but you can generate without it."} {photoEvId ? "Photo evidence attached." : "No photo attached yet."} {seg ? "Segmentation highlight ready for review." : ""}</p>
-      <label htmlFor="seg-prompt">SAM segmentation prompt (optional)</label>
-      <input id="seg-prompt" value={segPrompt} onChange={(e) => setSegPrompt(e.target.value)} placeholder="e.g. blue adjustment knob" />
-      <div className="row" style={{ marginTop: 10 }}>
-        <button className="btn secondary" onClick={() => void runSegment()} disabled={!photoEvId || busy}>Highlight with SAM 3.1</button>
-        <button className="btn" onClick={generate} disabled={!capId || busy}>{busy ? "Working…" : "Generate procedure draft"}</button>
-      </div>
-      <div className="row" style={{ marginTop: 10 }}>
-        <button className="btn secondary" onClick={() => goStep(2)}>← Back to transcript</button>
-      </div>
-      {seg && <SegmentOverlay geometry={seg.geometry} simulated={seg.simulated} imageUrl={photoUrl} onConfirm={confirmSegment} />}
-      {seg?.status === "no_match" && (
-        <div className="notice warn" role="status">
-          <strong>SAM 3.1 found no match.</strong>{segAttempts.length > 0 && <> Tried: {segAttempts.map((t) => `“${t}”`).join(", ")}.</>} The object may be small, blurry, partly hidden, or named differently than SAM expects. Try, in order:
-          <ol style={{ margin: "8px 0" }}>
-            <li>Ask Spark to name what's actually visible, then tap a suggestion.</li>
-            <li>Tap the object directly on the photo — a point prompt usually succeeds where words fail.</li>
-            <li>Retake the photo closer, in better light, with the object centered.</li>
-          </ol>
-          <div className="row">
-            <button className="btn small" onClick={() => void suggestObjects()}>Suggest objects with Muse Spark</button>
-            {suggestions.map((s) => <button key={s} className="btn small secondary" onClick={() => { setSegPrompt(s); void runSegment(s); }}>{s}</button>)}
-          </div>
-          {photoUrl && (
-            <div style={{ marginTop: 10 }}>
-              <p className="muted small-text">Tap the object on the photo:</p>
-              <div className="overlay-wrap" role="button" aria-label="Photo. Tap the object to segment it."
-                onClick={(e) => { const r = e.currentTarget.getBoundingClientRect(); setRecoveryTap({ nx: (e.clientX - r.left) / r.width, ny: (e.clientY - r.top) / r.height }); }}>
-                <img src={photoUrl} alt="Evidence for tap segmentation" />
-                {recoveryTap && <div className="tap-dot" style={{ left: `${recoveryTap.nx * 100}%`, top: `${recoveryTap.ny * 100}%` }} aria-hidden="true" />}
-              </div>
-              <div className="row" style={{ marginTop: 8 }}>
-                <button className="btn small" disabled={!recoveryTap} onClick={() => recoveryTap && void runSegment(segPrompt, recoveryTap)}>Segment tapped point</button>
-                {recoveryTap && <span className="muted small-text">Tap at ({Math.round(recoveryTap.nx * 100)}%, {Math.round(recoveryTap.ny * 100)}%)</span>}
-              </div>
-            </div>
-          )}
-        </div>
-      )}
-      </>)}
-      {status && <div className={`notice ${statusKind === "error" ? "error" : statusKind === "ok" ? "ok" : "warn"}`} role={statusKind === "error" ? "alert" : "status"}>{status}</div>}
-      <section className="card" aria-label="Privacy and safety" style={{ marginTop: 12 }}>
-        <p style={{ margin: "0 0 6px" }}><strong><Icon name="shield" size={17} /> TraceLoop privacy &amp; operational safety</strong></p>
-        <p className="muted small-text" style={{ margin: 0 }}>AI synthesizes draft procedures strictly for authorized reviewer sign-off. AI drafts cannot be executed without human approval. The Meta API key lives only on the server — recordings are sent for transcription only when connected and only after you press Record.</p>
-      </section>
-      </>)}
+      <TutorialLibrary onOpen={onOpenStudio} refreshKey={refreshKey} />
     </div>
   );
 }

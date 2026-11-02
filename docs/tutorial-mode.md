@@ -1,8 +1,10 @@
-# TutorialMode
+# TutorialMode + Tutorial Studio
 
-Capture → **Tutorial**: record a 2–10 minute tutorial (camera + mic,
-720p, in-browser `MediaRecorder`), upload it, and get back a shareable
-guide. Photo and Live modes are untouched.
+Record a 2–10 minute tutorial (camera + mic, in-browser
+`MediaRecorder`), upload it, and get back a shareable guide — then
+refine everything in **Tutorial Studio** (Overview / Content / Guide /
+Video / Visuals). Tutorials live in a persistent library under the
+Tutorials destination, independent of the recording phase.
 
 ## Pipeline (all server-side, async with progress polling)
 
@@ -44,7 +46,18 @@ thumbnails and click-to-seek timestamps, transcript highlighting with
 click-to-seek, and Copy Markdown / Download .md /
   Download .zip (guide + illustrations) / Print-PDF export, per-object
   attempt history, and a refresh-guide action after tap corrections.
-The transcript can be sent into the Photo capture flow.
+- **Tutorial Studio** (opened from the library or the result view) is the
+  editing workspace: Overview (title, equipment, task, notes — the
+  original video is immutable), Content (corrected transcript +
+  timed segments + canonical structured steps with reorder/tools/object
+  links, saved as `tutorial_content_revisions`), Guide (format change,
+  regenerate, immutable snapshot history with compare, Review draft
+  link), Video (scene plan editing + versioned MP4 renders, original-voice
+  cuts only), Visuals (VisualStudio integration with accept/reject and
+  provenance). Content saves bump `content_revision` (optimistic
+  concurrency via `expected_revision`); guides/drafts update only on
+  explicit regeneration, and locked drafts fork new revisions instead of
+  mutating — approved versions are never touched.
 
 ## Config & cost
 

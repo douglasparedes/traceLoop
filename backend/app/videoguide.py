@@ -130,12 +130,66 @@ def build_video_props(job: M.TutorialJob, scenes: list[dict], voiceover: Path | 
             "scenes": out_scenes, "totalFrames": total_frames}
 
 
-def start_video_guide(job_id: str, actor: str = "", force: bool = False) -> tuple[M.VideoGuide, bool]:
+def validate_scene_plan(scenes: object, duration_sec: float) -> list[dict]:
+    """Validate an edited scene plan. Raises ValueError on any problem.
+
+    Rules: non-empty list; each scene needs a title; audio ranges must be
+    finite, non-negative, end > start, and within the source duration;
+    include defaults to True. Never fabricates timing — invalid ranges are
+    rejected, not clamped into plausibility.
+    """
+    import math as _math
+    if not isinstance(scenes, list) or not scenes:
+        raise ValueError("Provide at least one scene")
+    if len(scenes) > 60:
+        raise ValueError("Too many scenes (max 60)")
+    clean: list[dict] = []
+    dur = float(duration_sec or 0)
+    for i, s in enumerate(scenes):
+        if not isinstance(s, dict):
+            raise ValueError(f"Scene {i + 1} must be an object")
+        title = str(s.get("title", "") or "").strip()[:200]
+        if not title:
+            raise ValueError(f"Scene {i + 1} needs a title")
+        caption = str(s.get("caption", "") or s.get("narration", "") or "")[:2000]
+        try:
+            astart = float(s.get("audio_start", s.get("start", 0)))
+            aend = float(s.get("audio_end", s.get("end", 0)))
+        except (TypeError, ValueError):
+            raise ValueError(f"Scene {i + 1}: audio_start/audio_end must be numbers")
+        if not (_math.isfinite(astart) and _math.isfinite(aend)):
+            raise ValueError(f"Scene {i + 1}: time range must be finite numbers")
+        if astart < 0 or aend < 0:
+            raise ValueError(f"Scene {i + 1}: time range cannot be negative")
+        if not (aend > astart):
+            raise ValueError(f"Scene {i + 1}: audio_end must be after audio_start")
+        if dur > 0 and (astart > dur or aend > dur + 0.01):
+            raise ValueError(f"Scene {i + 1}: range exceeds the {dur:.0f}s source recording")
+        vis = s.get("visual") or {}
+        vis_name = str(vis.get("name", "") or "")[:200] if isinstance(vis, dict) else ""
+        clean.append({
+            "step": int(s.get("step", s.get("step_number", i + 1)) or (i + 1)),
+            "title": title,
+            "caption": caption,
+            "audio_start": round(astart, 2),
+            "audio_end": round(aend, 2),
+            "visual": {"name": vis_name} if vis_name else {},
+            "include": bool(s.get("include", True)),
+        })
+    included = [c for c in clean if c["include"]]
+    if not included:
+        raise ValueError("At least one scene must be included")
+    return clean
+
+
+def start_video_guide(job_id: str, actor: str = "", force: bool = False, scenes: list[dict] | None = None) -> tuple[M.VideoGuide, bool]:
     """Queue (or reuse) a video-guide render. Returns (row, duplicate).
 
     In-flight renders are reused; a finished render is reused when the
     canonical procedure hasn't changed since (compare canonical hash).
     Pass force=True (the UI Regenerate button) to render afresh.
+    Pass scenes=[...] (an edited scene plan from Tutorial Studio) to render
+    exactly that plan as a NEW version — never overwriting a prior MP4.
     """
     from . import processing as proc
     db = SessionLocal()
@@ -169,11 +223,27 @@ def start_video_guide(job_id: str, actor: str = "", force: bool = False) -> tupl
         else:
             from .tutorial import _canonical_hash
             canon = _canonical_hash(job.steps or [])
+        if scenes is not None:
+            clean = validate_scene_plan(scenes, job.duration_sec or 0)
+            canon = _canonical_hash(job.steps or [])
         total = sum(max(0.0, float(s.get("end", 0)) - float(s.get("start", 0))) for s in (job.steps or []))
         if total > VIDEO_MAX_SEC:
             raise ValueError(f"This tutorial is {total:.0f}s — video guides are capped at {VIDEO_MAX_SEC}s. Record a shorter tutorial for video output.")
+        max_ver = 0
+        for r in rows:
+            try:
+                max_ver = max(max_ver, int(r.version_number or 0))
+            except (TypeError, ValueError):
+                pass
         vg = M.VideoGuide(tutorial_id=job_id, status="queued", progress=2, created_by=actor or job.actor,
-                          provenance={"trigger": "user_request", "canonical_hash": canon, "forced": bool(force)})
+                          version_number=max_ver + 1,
+                          provenance={"trigger": "studio_scene_plan" if scenes is not None else "user_request",
+                                      "canonical_hash": canon, "forced": bool(force)})
+        if scenes is not None:
+            vg.scenes = [{"step": c["step"], "title": c["title"], "caption": c["caption"],
+                          "audio_start": c["audio_start"], "audio_end": c["audio_end"],
+                          "visual": c.get("visual") or {}, "include": c.get("include", True)}
+                         for c in clean]
         db.add(vg)
         db.commit()
         db.refresh(vg)
@@ -207,12 +277,28 @@ def run_video_guide_job(vg_id: str) -> dict:
         actor = vg.created_by or job.actor
         vg.status, vg.progress = "rendering", 5
         db.commit()
-        with proc.timed() as t:
-            plan = ai.plan_video_scenes(job.title, job.steps or [], job.objects or [],
-                                        job.timed_segments or [])
-        scenes = plan.get("scenes", [])
-        if not scenes:
-            raise RuntimeError("Could not plan video scenes from this tutorial.")
+        # Studio-edited scene plan (stored on the row by the scenes endpoint)
+        # wins over AI planning: the render reproduces exactly the saved plan.
+        stored = [s for s in (vg.scenes or []) if isinstance(s, dict) and s.get("title")]
+        stored = [s for s in stored if s.get("include", True)]
+        if stored:
+            scenes = [{"step": int(s.get("step", i + 1)), "title": str(s.get("title", "")),
+                       "caption": str(s.get("caption", "") or ""),
+                       "audio_start": float(s.get("audio_start", s.get("start", 0)) or 0),
+                       "audio_end": float(s.get("audio_end", s.get("end", 0)) or 0),
+                       "visual": s.get("visual") or {}} for i, s in enumerate(stored)]
+            plan = {"scenes": scenes, "model": "studio-scene-plan", "simulated": False,
+                    "note": "Edited scene plan from Tutorial Studio; voiceover cut from the original recording."}
+        else:
+            with proc.timed() as t:
+                plan = ai.plan_video_scenes(job.title, job.steps or [], job.objects or [],
+                                            job.timed_segments or [])
+            plan_ms = t.ms
+            scenes = plan.get("scenes", [])
+            if not scenes:
+                raise RuntimeError("Could not plan video scenes from this tutorial.")
+        if stored:
+            plan_ms = 0
         vg.progress = 25
         db.commit()
         voiceover, voice_sec = cut_voiceover(job, scenes)
@@ -244,7 +330,12 @@ def run_video_guide_job(vg_id: str) -> dict:
         db.flush()
         vg.status, vg.progress, vg.asset_id = "ready", 100, a.id
         vg.storage_key = storage_key
-        vg.scenes = [{"step": s["step"], "title": s["title"], "caption": s["caption"]} for s in props["scenes"]]
+        vg.scenes = [{"step": int(s.get("step", s.get("step_number", i + 1)) or (i + 1)),
+                      "title": str(s.get("title", "")),
+                      "caption": str(s.get("caption", "") or ""),
+                      "audio_start": float(s.get("audio_start", 0) or 0),
+                      "audio_end": float(s.get("audio_end", 0) or 0),
+                      "visual": s.get("visual") or {}, "include": True} for i, s in enumerate(scenes)]
         vg.simulated = bool(plan.get("simulated", True))
         vg.provenance = {"model": plan.get("model", ""), "note": plan.get("note", ""),
                          "voiceover_sec": round(voice_sec, 1),
@@ -252,7 +343,7 @@ def run_video_guide_job(vg_id: str) -> dict:
         db.commit()
         db.refresh(vg)
         proc.safe_record(db, "tutorial", job.id, "video_guide", "succeeded", operation="render_video_guide",
-                         provider="meta", model=plan.get("model", ""), duration_ms=t.ms, actor=actor,
+                         provider="meta", model=plan.get("model", ""), duration_ms=plan_ms, actor=actor,
                          summary={"video_guide_id": vg.id, "asset_id": a.id, "scenes": len(scenes),
                                   "simulated": bool(plan.get("simulated", True))})
         return {"ok": True, "video_guide_id": vg.id, "asset_id": a.id}
