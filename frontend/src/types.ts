@@ -1,3 +1,10 @@
+export interface TranscriptSegment {
+  index: number;
+  text: string;
+  start: number;
+  end: number;
+}
+
 export interface Step {
   id: string;
   step_order: number;
@@ -8,6 +15,9 @@ export interface Step {
   evidence_refs: string[];
   visual_refs: string[];
   verification_notes?: string | null;
+  start_sec?: number | null;
+  end_sec?: number | null;
+  transcript_segments?: TranscriptSegment[];
 }
 
 export interface Version {

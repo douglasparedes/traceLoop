@@ -2,7 +2,7 @@
 
 TraceLoop turns a short recording of someone performing a real task into an interactive, verifiable procedure that another person can follow.
 
-**Product loop:** Capture (video + narration) → Meta AI understanding (Muse Voice, Muse Spark, SAM 3.1, Muse Image) → **canonical structured procedure** → three guide formats (work instruction, reference manual, interactive) + optional **video guide** (MP4 cut from the user's own recorded narration, scenes planned by Muse Spark, rendered with Remotion) → expert Review & approval → **immutable approved revision** → offline field execution → new evidence and revisions.
+**Product loop:** Capture (video + narration) → Meta AI understanding (Muse Voice, Muse Spark, SAM 3.1, Muse Image) → **canonical structured procedure** → three guide formats (work instruction, reference manual, interactive) + optional **video guide** (MP4 cut from the user's own recorded narration, scenes planned by Muse Spark, rendered with Remotion) → expert Review & approval → **immutable approved revision** → offline field execution → structured field feedback → AI-assisted improvement proposal → new draft revision → approval.
 
 The core guarantee: the visible guide, the structured review draft, and the approved procedure always represent the same revision. Corrections propagate; approvals never mutate.
 
@@ -58,8 +58,8 @@ Visuals (VisualStudio improve/highlight/alternative/annotate with
 accept/reject and provenance).
 
 ```powershell
-cd backend; .\.venv\Scripts\python.exe -m pytest tests -q   # 65 passed, 1 skipped
-cd frontend; npm run test                                    # 58 passed
+cd backend; .\.venv\Scripts\python.exe -m pytest tests -q   # 71 passed, 1 skipped
+cd frontend; npm run test                                    # 62 passed
 ```
 
 Key suites: `test_canonical.py` (simulated end-to-end without network, correction propagation, regen/approval/pinning, fallback distinctness, intent shaping), `test_guides.py` (formats, versions, visuals), `test_observability.py`, `test_auth.py` (incl. media-gate exemptions), `test_tutorial.py`, `test_api.py`. CI (`.github/workflows/ci.yml`) runs backend tests, typecheck, frontend tests, and the production build.

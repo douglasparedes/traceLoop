@@ -14,6 +14,7 @@ interface TutObject {
   best_bbox_norm?: number[] | null; distinct_count?: number | null; margin?: number | null;
   frames_seen?: number; frames_with_match?: number; coverage?: number;
   diagnostic_frame?: string | null;
+  quality?: { crop_px?: number[]; issues?: string[]; needs_review?: boolean } | null;
   track?: { frame: number; objects: { object_id: number; bbox_norm: number[]; confidence?: number | null }[] }[];
 }
 interface TutStep { step_number: number; title: string; start: number; end: number; summary: string; objects_used: number[] }
@@ -818,6 +819,11 @@ export default function TutorialMode({ onOpenReview, onOpenStudio, hideLibrary }
                         <button className="btn small secondary" onClick={() => seek(o.first_mentioned_at)}>First shown {fmt(o.first_mentioned_at)}</button>
                       </p>
                       {o.note && <p className="muted">{o.note}</p>}
+                      {(o.quality?.issues?.length || 0) > 0 && (
+                        <p className="notice warn small-text" role="status" style={{ margin: "6px 0" }}>
+                          <strong>Visual quality check:</strong> {(o.quality?.issues || []).join(" ")} The crop is kept for inspection but flagged — correct the selection or tap to re-track before accepting.
+                        </p>
+                      )}
                       {(o.best_frame != null || o.distinct_count != null || o.coverage != null) && (
                         <p className="muted small-text">
                           {o.best_frame != null && <>Best frame {o.best_frame}{o.best_time != null ? ` (${fmt(o.best_time)})` : ""} · </>}

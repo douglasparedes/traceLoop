@@ -37,7 +37,11 @@ Open in Review (from the tutorial or Review queue). Edit nothing or fix a summar
 
 ## 6. Execute offline (2 min)
 
-Library → approved procedure → Save for offline use → Start procedure. Complete a step, report an issue, attach a photo. Go offline (DevTools → Offline) — execution keeps working; events queue. Reconnect — Activity → Sync now delivers them without duplicates. Sign out wipes cached private media; queued work survives.
+Library → approved procedure → Save for offline use → Start procedure. Complete a step, report an issue, attach a photo. Go offline (DevTools → Offline) - execution keeps working; events queue. Reconnect - Activity → Sync now delivers them without duplicates. Sign out wipes cached private media; queued work survives.
+
+## 7. Close the loop: feedback becomes a revision (2 min)
+
+Finish the job → open it in Activity → **How did each step go?** Mark step 2 *confusing* ("Which screw do you mean?"), note anything missing, answer whether the visuals identified the right component → Submit feedback. As Reviewer: **Create improvement proposal** — Muse Spark (or the labelled deterministic fallback offline) drafts minimal text changes quoting your words. You land in Review on the new draft with a **Field-feedback proposal** banner showing before/after per step plus the technician's original feedback. Edit, Submit, Approve: the new revision goes live for future jobs while the finished job stays pinned to the version it ran. The approved v1 is never modified.
 
 ## What to point out to judges
 
@@ -45,3 +49,5 @@ Library → approved procedure → Save for offline use → Start procedure. Com
 - The guide, draft, and approved version are the same canonical revision — regenerate after approval forks a new draft instead of mutating.
 - Corrections propagate: tap → guide → draft → snapshot, with originals preserved.
 - Optional video guides cut from the user's own voice; Spark plans scenes, never the narration audio.
+- Studio Overview shows a per-stage **AI processing** summary (live vs simulated per stage, never blended); technical details hide behind an expander.
+- Review steps cite their supporting transcript segments; automated crop-quality flags mark illustrations that need inspection.

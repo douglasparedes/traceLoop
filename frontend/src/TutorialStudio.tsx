@@ -5,6 +5,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { API, api, authHeaders, getIdentity } from "./api";
 import { Icon } from "./icons";
 import GuideFormatSelector from "./GuideFormatSelector";
+import ProcessingSummary from "./ProcessingSummary";
 import VisualStudio from "./VisualStudio";
 import VideoStudio from "./VideoStudio";
 import type { GuideSnapshotItem, VisualAsset } from "./guideFormats";
@@ -23,6 +24,7 @@ interface TutObject {
   overlay?: string;
   diagnostic_frame?: string | null;
   first_mentioned_at?: number;
+  quality?: { crop_px?: number[]; issues?: string[]; needs_review?: boolean } | null;
 }
 
 interface TutDetail extends LibraryItem {
@@ -239,12 +241,32 @@ function OverviewEditor({ detail, onSaved, onDirty, notify, onOpenReview }: {
             <p className="muted small-text" style={{ marginBottom: 0 }}>No Review draft linked yet — generate one from the Guide tab.</p>
           )}
         </div>
+        <ProcessingSummary tutorialId={detail.id} token={detail.access_token} />
       </div>
     </div>
   );
 }
 
 /* ---------------- Content ---------------- */
+
+function StepNarration({ segments, start, end }: { segments: StudioSegment[]; start: number; end: number }) {
+  const hits = (segments || []).filter((s) => s.end >= start && (!end || s.start <= end));
+  return (
+    <div className="panel" style={{ marginTop: 10 }}>
+      <span className="eyebrow">Supporting narration ({hits.length})</span>
+      {hits.length === 0 ? (
+        <p className="muted small-text" style={{ marginBottom: 0 }}>No transcript segments overlap this step's time range — the instruction is visual-only or needs a timestamp correction.</p>
+      ) : (
+        <ul className="small-text" style={{ margin: "6px 0 0", paddingLeft: 18 }}>
+          {hits.slice(0, 4).map((s, i) => (
+            <li key={i}><span className="muted num">{Math.floor(s.start / 60)}:{String(Math.floor(s.start % 60)).padStart(2, "0")}</span> — {s.text}</li>
+          ))}
+          {hits.length > 4 && <li className="muted">…and {hits.length - 4} more</li>}
+        </ul>
+      )}
+    </div>
+  );
+}
 
 const blankStep = (n: number): StudioStep => ({
   step_number: n, title: "", summary: "", start: 0, end: 0,
@@ -460,6 +482,7 @@ function ContentEditor({ detail, onSaved, onDirty, notify }: {
                 <label>Source end (sec)<input type="number" min={0} step={0.5} value={active.end || 0} onChange={(e) => patchStep(sel, { end: Number(e.target.value) })} /></label>
               </div>
               <label>Tools / materials (comma-separated)<input value={(active.required_tools || []).join(", ")} onChange={(e) => patchStep(sel, { required_tools: e.target.value.split(",").map((t) => t.trim()).filter(Boolean) })} placeholder="e.g. Torque driver, Lint-free cloth" /></label>
+              <StepNarration segments={segments} start={active.start || 0} end={active.end || 0} />
               {objects.length > 0 && (
                 <fieldset style={{ border: "1px solid var(--line)", borderRadius: 8, padding: 10, marginTop: 10 }}>
                   <legend className="small-text"><strong>Detected objects used</strong></legend>
@@ -657,7 +680,7 @@ function VisualsEditor({ detail, token, notify }: {
   notify: (s: string, kind?: "ok" | "error" | "info") => void;
 }) {
   const [visuals, setVisuals] = useState<VisualAsset[]>([]);
-  const [source, setSource] = useState<{ id: string; label: string; imageUrl: string; kind: string; source: Record<string, unknown> } | null>(null);
+  const [source, setSource] = useState<{ id: string; label: string; imageUrl: string; kind: string; source: Record<string, unknown>; quality?: { crop_px?: number[]; issues?: string[]; needs_review?: boolean } | null } | null>(null);
   const [busy, setBusy] = useState(false);
 
   const load = useCallback(async () => {
@@ -668,9 +691,9 @@ function VisualsEditor({ detail, token, notify }: {
 
   const imgUrl = (name?: string) => (name ? `${API}/api/tutorial/${detail.id}/illustrations/${name}?token=${encodeURIComponent(token)}` : "");
   const sources = (detail.objects || []).flatMap((o) => [
-    ...(o.overlay ? [{ id: `illustration:${o.overlay}`, label: `${o.label} — SAM overlay`, imageUrl: imgUrl(o.overlay), kind: "overlay", source: { kind: "illustration", name: o.overlay } }] : []),
-    ...(o.illustration ? [{ id: `illustration:${o.illustration}`, label: `${o.label} — isolated cutout`, imageUrl: imgUrl(o.illustration), kind: "cutout", source: { kind: "illustration", name: o.illustration } }] : []),
-    ...(!o.overlay && !o.illustration && o.diagnostic_frame ? [{ id: `diagnostic:${o.obj_id}`, label: `${o.label} — diagnostic frame`, imageUrl: `${API}/api/tutorial/${detail.id}/diagnostics/frame/${o.obj_id}?token=${encodeURIComponent(token)}`, kind: "diagnostic", source: { kind: "diagnostic", obj_id: o.obj_id } }] : []),
+    ...(o.overlay ? [{ id: `illustration:${o.overlay}`, label: `${o.label} — SAM overlay`, imageUrl: imgUrl(o.overlay), kind: "overlay", source: { kind: "illustration", name: o.overlay }, quality: o.quality }] : []),
+    ...(o.illustration ? [{ id: `illustration:${o.illustration}`, label: `${o.label} — isolated cutout`, imageUrl: imgUrl(o.illustration), kind: "cutout", source: { kind: "illustration", name: o.illustration }, quality: o.quality }] : []),
+    ...(!o.overlay && !o.illustration && o.diagnostic_frame ? [{ id: `diagnostic:${o.obj_id}`, label: `${o.label} — diagnostic frame`, imageUrl: `${API}/api/tutorial/${detail.id}/diagnostics/frame/${o.obj_id}?token=${encodeURIComponent(token)}`, kind: "diagnostic", source: { kind: "diagnostic", obj_id: o.obj_id }, quality: o.quality }] : []),
   ]);
 
   async function decide(a: VisualAsset, accept: boolean) {
@@ -702,6 +725,11 @@ function VisualsEditor({ detail, token, notify }: {
           ))}
         </div>
         {source && <p className="muted small-text" style={{ marginBottom: 0 }}>Selected: {source.label} <span className="tag">original preserved</span></p>}
+        {source && (source.quality?.issues?.length || 0) > 0 && (
+          <p className="notice warn small-text" role="status" style={{ marginBottom: 0 }}>
+            <strong>Automated quality check:</strong> {(source.quality?.issues || []).join(" ")}
+          </p>
+        )}
       </div>
       <VisualStudio tutorialId={detail.id} token={token} sourceAsset={source}
         references={visuals.map((v) => ({ id: v.id, label: `${v.kind} — ${v.instruction.slice(0, 40) || v.id.slice(0, 8)}` }))}

@@ -134,6 +134,48 @@ def _svg_points(svg_path: str, mw: int, mh: int) -> list[tuple[float, float]]:
     return pts
 
 
+def _illustration_quality(frame_w: int, frame_h: int, bx1: int, by1: int, bx2: int, by2: int,
+                            cx1: int, cy1: int, cx2: int, cy2: int, mask_points: int) -> dict:
+    """Automated quality checks for one generated crop.
+
+    Flags (never silently fixes): empty/invalid masks, tiny crops below a
+    useful resolution, boxes cut off by the crop edge, extreme aspect
+    ratios, and crops with almost no surrounding context. A failing crop is
+    still saved but marked needs_review with a recovery note.
+    """
+    bw, bh = max(0, bx2 - bx1), max(0, by2 - by1)
+    cw, ch = max(0, cx2 - cx1), max(0, cy2 - cy1)
+    issues: list[str] = []
+    if not mask_points:
+        issues.append("no mask polygon — bbox outline only")
+    if min(cw, ch) < 48:
+        issues.append(f"crop very small ({cw}x{ch}px) — may be illegible")
+    # Box touches the crop edge on a side where the crop also touches the
+    # frame edge: the component itself is likely cut off in the source frame.
+    cut_sides = []
+    if bx1 <= cx1 and cx1 <= 0:
+        cut_sides.append("left")
+    if by1 <= cy1 and cy1 <= 0:
+        cut_sides.append("top")
+    if bx2 >= cx2 and cx2 >= frame_w:
+        cut_sides.append("right")
+    if by2 >= cy2 and cy2 >= frame_h:
+        cut_sides.append("bottom")
+    if cut_sides:
+        issues.append(f"component possibly cut off at frame edge ({', '.join(cut_sides)})")
+    if cw and ch:
+        ratio = max(cw, ch) / max(1, min(cw, ch))
+        if ratio > 6:
+            issues.append(f"extreme aspect ratio ({ratio:.1f}:1) — verify the crop")
+    if bw and bh and cw and ch:
+        context = (cw * ch) / max(1, bw * bh)
+        if context < 1.2:
+            issues.append("almost no surrounding context — hard to locate the component")
+    return {"crop_px": [cw, ch], "frame_px": [frame_w, frame_h],
+            "mask_points": mask_points, "cut_sides": cut_sides,
+            "issues": issues, "needs_review": bool(issues)}
+
+
 def make_illustrations(job_dir: Path, source: Path, obj: dict, best: dict) -> dict:
     """Crop + transparent cutout + mask overlay PNGs for one tracked object."""
     frame_img = extract_frame_image(source, best["time"])
@@ -173,7 +215,8 @@ def make_illustrations(job_dir: Path, source: Path, obj: dict, best: dict) -> di
     isolated.putalpha(alpha)
     iso_path = job_dir / f"{name}.png"
     isolated.save(iso_path)
-    return {"illustration": iso_path.name, "overlay": overlay_path.name}
+    quality = _illustration_quality(W, H, bx1, by1, bx2, by2, cx1, cy1, cx2, cy2, len(pts_frame))
+    return {"illustration": iso_path.name, "overlay": overlay_path.name, "quality": quality}
 
 
 def _best_track(frames: list[dict]) -> tuple[dict | None, int, float]:
@@ -560,9 +603,15 @@ def accepted_visuals_by_step(db, version_id: str) -> dict[int, list[tuple[str, s
 
 
 def _canon_list(steps: list) -> list[dict]:
-    """JSON-stable canonical step identity (order, title, instruction)."""
+    """JSON-stable canonical step identity (order, title, instruction, plus
+    reviewer-visible fields so expert edits to expected results, tools, or
+    verification notes participate in 3-way sync instead of being silently
+    overwritten)."""
     return [{"n": int(s.get("step_number", 0)), "t": str(s.get("title", "")),
-             "i": str(s.get("summary", ""))} for s in (steps or [])]
+             "i": str(s.get("summary", "")),
+             "e": str(s.get("expected_result", "") or ""),
+             "v": str(s.get("verification_notes", "") or ""),
+             "r": [str(t) for t in (s.get("required_tools", []) or [])]} for s in (steps or [])]
 
 
 def _canonical_hash(steps: list) -> str:
@@ -650,10 +699,11 @@ def _build_draft_steps(db, ver: M.ProcedureVersion, steps: list, objects: list,
             procedure_version_id=ver.id, step_order=order,
             title=str(s.get("title", "")) or f"Step {s.get('step_number', 1)}",
             instruction=str(s.get("summary", "")),
-            expected_result="", required_tools=[],
+            expected_result=str(s.get("expected_result", "") or "") or None,
+            required_tools=[str(t)[:120] for t in (s.get("required_tools", []) or []) if str(t).strip()][:20],
             evidence_refs=refs, visual_refs=visuals,
             start_sec=start_sec, end_sec=end_sec,
-            verification_notes="From tutorial narration; verify against source video.")
+            verification_notes=str(s.get("verification_notes", "") or "") or "From tutorial narration; verify against source video.")
         db.add(row)
         created.append(row)
     db.flush()
@@ -702,9 +752,18 @@ def sync_review_draft(db, job: M.TutorialJob, steps: list, objects: list, md: st
     new_canon = _canon_list(steps)
     new_hash = _canonical_hash(steps)
     stored_canon: list[dict] = list((ver.source_evidence or {}).get("canonical_steps", []))
+    # Backward compatibility: canonical snapshots written before expected
+    # results/tools/verification joined the identity get empty defaults, so
+    # the first post-upgrade sync compares like-for-like.
+    for _c in stored_canon:
+        _c.setdefault("e", "")
+        _c.setdefault("v", "")
+        _c.setdefault("r", [])
     stored_by_n = {c["n"]: c for c in stored_canon}
     new_by_n = {c["n"]: c for c in new_canon}
-    draft_by_n = {s.step_order: {"n": s.step_order, "t": s.title or "", "i": s.instruction or ""}
+    draft_by_n = {s.step_order: {"n": s.step_order, "t": s.title or "", "i": s.instruction or "",
+                                 "e": s.expected_result or "", "v": s.verification_notes or "",
+                                 "r": list(s.required_tools or [])}
                   for s in ver.steps}
     # Preserve manually linked visuals (accepted derivatives) across rebuilds.
     preserved: dict[int, list[str]] = {}
@@ -746,14 +805,18 @@ def sync_review_draft(db, job: M.TutorialJob, steps: list, objects: list, md: st
         for st in created:
             if st.step_order in kept:
                 st.title, st.instruction = kept[st.step_order]["t"], kept[st.step_order]["i"]
+                st.expected_result = kept[st.step_order].get("e") or None
+                st.verification_notes = kept[st.step_order].get("v") or st.verification_notes
+                st.required_tools = list(kept[st.step_order].get("r") or [])
         for ex in expert_only:
             order = ex["n"] if ex["n"] not in used_orders else max(used_orders | {0}) + 1
             used_orders.add(order)
             db.add(M.ProcedureStep(procedure_version_id=ver.id, step_order=order,
                                    title=ex["t"], instruction=ex["i"],
-                                   expected_result="", required_tools=[],
+                                   expected_result=ex.get("e") or None,
+                                   required_tools=list(ex.get("r") or []),
                                    evidence_refs=[], visual_refs=[],
-                                   verification_notes="Added by expert review; not from tutorial narration."))
+                                   verification_notes=ex.get("v") or "Added by expert review; not from tutorial narration."))
         db.flush()
         action = "conflict" if conflict_orders else "updated"
     se = dict(ver.source_evidence or {})
@@ -1124,6 +1187,7 @@ def run_job(job_id: str) -> None:
                                      "best_confidence": seg.get("best_confidence"),
                                      "best_bbox_norm": seg.get("best_bbox_norm"),
                                      "has_illustration": bool(seg.get("illustration")),
+                                     "quality": (seg.get("quality") or {}).get("issues", []),
                                      "note": seg.get("note", "")})
                         done_objects.append(seg)
                         _set(db, job, objects=done_objects + objects[i + 1:], progress=50 + int(30 * (i + 1) / len(objects)))
