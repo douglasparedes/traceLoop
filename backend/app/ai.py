@@ -944,6 +944,137 @@ def fallback_guide_markdown(title: str, steps: list[dict], objects: list[dict],
     return "\n".join(lines).strip() + "\n"
 
 
+# ---------------------------------------------------------------- Field feedback → improvement proposal
+
+_PROPOSAL_SCHEMA = {
+    "name": "ImprovementProposal",
+    "schema": {
+        "type": "object",
+        "properties": {
+            "changes": {"type": "array", "items": {"type": "object",
+                "properties": {
+                    "step_order": {"type": "integer"},
+                    "field": {"type": "string"},
+                    "after": {"type": "string"},
+                    "reason": {"type": "string"},
+                    "confidence": {"type": "string"},
+                },
+                "required": ["step_order", "field", "after", "reason", "confidence"],
+                "additionalProperties": False}},
+            "summary": {"type": "string"},
+        },
+        "required": ["changes", "summary"],
+        "additionalProperties": False,
+    },
+}
+
+_PROPOSAL_FIELDS = {"title", "instruction", "expected_result", "verification_notes"}
+
+
+def propose_improvement(procedure_title: str, steps: list[dict], events: list[dict],
+                        feedback: dict) -> dict:
+    """Muse Spark: turn field execution evidence into a reviewable proposal.
+
+    Inputs are the approved steps, the job's recorded events, and the
+    technician's structured feedback. Outputs per-step text changes with
+    reasons and confidence — never applied directly; the caller creates a
+    draft revision for human review. Offline (or on failure): deterministic
+    rules quoting the technician's own words, labelled simulated.
+    """
+    simple_steps = [{"id": s.get("id"), "step_order": s.get("step_order"), "title": s.get("title", ""),
+                     "instruction": s.get("instruction", ""),
+                     "expected_result": s.get("expected_result") or "",
+                     "verification_notes": s.get("verification_notes") or ""} for s in (steps or [])]
+    if not live_enabled():
+        return _simulated_proposal(procedure_title, simple_steps, events, feedback)
+    system = (
+        "You review field execution of an approved maintenance procedure. Given the approved steps, "
+        "the job's recorded events (step completions, blocks, skips, issues, notes), and the technician's "
+        "structured feedback, propose minimal text improvements to existing steps only. "
+        "Rules: only reword or extend using words from the feedback/events; never invent tools, values, "
+        "warnings, or new steps; never change step order; set confidence to low/medium/high honestly. "
+        "Respond with changes (step_order, field in title|instruction|expected_result|verification_notes, "
+        "after = full replacement text, reason, confidence) plus a one-paragraph summary."
+    )
+    user = (f"Procedure: {procedure_title}\nSteps: {json.dumps(simple_steps)}\n"
+            f"Events: {json.dumps(events[:120])}\nFeedback: {json.dumps(feedback)}")
+    try:
+        parsed = json.loads(_chat(system, user, json_schema=_PROPOSAL_SCHEMA))
+        changes = _clean_proposal_changes(simple_steps, parsed.get("changes") or [])
+        return {"changes": changes, "summary": str(parsed.get("summary") or ""),
+                "simulated": False, "model": SPARK_MODEL}
+    except Exception as e:
+        fb = _simulated_proposal(procedure_title, simple_steps, events, feedback)
+        fb["note"] = f"Live proposal failed ({type(e).__name__}); deterministic fallback, not live AI."
+        return fb
+
+
+def _clean_proposal_changes(simple_steps: list[dict], raw: list) -> list[dict]:
+    by_order = {s.get("step_order"): s for s in simple_steps}
+    out = []
+    for c in (raw or [])[:20]:
+        if not isinstance(c, dict):
+            continue
+        try:
+            order = int(c.get("step_order", 0))
+        except (TypeError, ValueError):
+            continue
+        base = by_order.get(order)
+        field = str(c.get("field", "") or "")
+        after = str(c.get("after", "") or "").strip()[:4000]
+        if base is None or field not in _PROPOSAL_FIELDS or not after:
+            continue
+        conf = str(c.get("confidence", "low") or "low").lower()
+        out.append({"step_order": order, "field": field,
+                    "before": str(base.get(field) or ""),
+                    "after": after, "reason": str(c.get("reason", "") or "")[:1000],
+                    "confidence": conf if conf in ("low", "medium", "high") else "low"})
+    return out
+
+
+def _safe_order(value: object) -> int | None:
+    try:
+        return int(value or 0) or None
+    except (TypeError, ValueError):
+        return None
+
+
+def _simulated_proposal(procedure_title: str, simple_steps: list[dict], events: list[dict],
+                        feedback: dict) -> dict:
+    """Deterministic offline proposal: quotes the technician, changes nothing
+    beyond appending their words to the flagged steps. Clearly labelled."""
+    by_order = {s.get("step_order"): s for s in simple_steps}
+    by_id = {str(s.get("id") or ""): s for s in simple_steps}
+    tech = str((feedback or {}).get("technician_id", "") or "technician")
+    changes = []
+    for fo in ((feedback or {}).get("step_outcomes") or []):
+        if not isinstance(fo, dict):
+            continue
+        target = by_order.get(_safe_order(fo.get("step_order", 0)))
+        sid = str(fo.get("step_id", "") or "")
+        if target is None and sid and sid in by_id:
+            target = by_id[sid]
+        if target is None:
+            continue
+        order = target.get("step_order")
+        status = str(fo.get("status", "") or "")
+        note = str(fo.get("note", "") or "").strip()[:1000]
+        if status not in ("confusing", "blocked", "incorrect"):
+            continue
+        base = target
+        quote = f" Field report ({tech}): {note}" if note else f" Field report ({tech}): marked {status} during execution."
+        before = str(base.get("verification_notes") or "")
+        changes.append({"step_order": order, "field": "verification_notes",
+                        "before": before, "after": (before + quote).strip()[:4000],
+                        "reason": f"Technician marked step {order} as {status}.",
+                        "confidence": "low"})
+    summary = (f"Simulated proposal for “{procedure_title}”: {len(changes)} step(s) flagged "
+               f"from field feedback. Deterministic fallback (no META_API_KEY) — a reviewer must verify "
+               f"every change before approval.")
+    return {"changes": changes, "summary": summary, "simulated": True, "model": SPARK_MODEL,
+            "note": "Deterministic fallback proposal (no META_API_KEY). Configure the key for live Muse Spark analysis."}
+
+
 # ---------------------------------------------------------------- Video guide (Spark scene plan + original-voice cut)
 
 _VIDEO_SCENES_SCHEMA = {
