@@ -100,8 +100,8 @@ def test_regeneration_approval_pinning_and_conflict(monkeypatch, tmp_path):
     monkeypatch.setattr(tutorial, "extract_audio_wav", lambda s, o: o.write_bytes(b"wav"))
     monkeypatch.setattr(tutorial, "make_tracking_copy", lambda s, o, max_width=512: (o.write_bytes(b"mp4"), {"width": 320, "height": 240})[1])
     monkeypatch.setattr(ai, "transcribe_timed", lambda fn, data, duration_sec=0: {
-        "text": "Show the flag.", "simulated": False,
-        "segments": [{"text": "Show the flag.", "start": 0.0, "end": 8.0}]})
+        "text": "Show the flag. I hold it up high so you can see the whole component clearly while I demonstrate the task.", "simulated": False,
+        "segments": [{"text": "Show the flag. I hold it up high so you can see the whole component clearly.", "start": 0.0, "end": 4.0}, {"text": "Now I demonstrate the task step by step.", "start": 4.0, "end": 8.0}]})
     monkeypatch.setattr(ai, "understand_tutorial", lambda segs, dur: {
         "objects": [{"label": "flag", "first_mentioned_at": 1.0, "obj_id": 1, "status": "pending"}],
         "steps": [{"step_number": 1, "title": "Show the flag", "start": 0.0, "end": 8.0,
@@ -194,8 +194,8 @@ def test_correction_propagates_to_guide_and_draft(monkeypatch, tmp_path):
     monkeypatch.setattr(tutorial, "extract_audio_wav", lambda s, o: o.write_bytes(b"wav"))
     monkeypatch.setattr(tutorial, "make_tracking_copy", lambda s, o, max_width=512: (o.write_bytes(b"mp4"), {"width": 320, "height": 240})[1])
     monkeypatch.setattr(ai, "transcribe_timed", lambda fn, data, duration_sec=0: {
-        "text": "Show the flag.", "simulated": False,
-        "segments": [{"text": "Show the flag.", "start": 0.0, "end": 8.0}]})
+        "text": "Show the flag. I hold it up high so you can see the whole component clearly while I demonstrate the task.", "simulated": False,
+        "segments": [{"text": "Show the flag. I hold it up high so you can see the whole component clearly.", "start": 0.0, "end": 4.0}, {"text": "Now I demonstrate the task step by step.", "start": 4.0, "end": 8.0}]})
     monkeypatch.setattr(ai, "understand_tutorial", lambda segs, dur: {
         "objects": [{"label": "flag", "first_mentioned_at": 1.0, "obj_id": 1, "status": "pending"}],
         "steps": [{"step_number": 1, "title": "Show the flag", "start": 0.0, "end": 8.0,
@@ -323,7 +323,8 @@ def test_intent_shapes_generation_and_comparison(monkeypatch, tmp_path):
     monkeypatch.setattr(tutorial, "extract_audio_wav", lambda s, o: o.write_bytes(b"wav"))
     monkeypatch.setattr(tutorial, "make_tracking_copy", lambda s, o, max_width=512: (o.write_bytes(b"mp4"), {"width": 320, "height": 240})[1])
     monkeypatch.setattr(ai, "transcribe_timed", lambda fn, data, duration_sec=0: {
-        "text": "x", "simulated": False, "segments": [{"text": "x", "start": 0.0, "end": 1.0}]})
+        "text": "Highlight the tip of this screw so it is easier to see against the panel behind it.", "simulated": False,
+        "segments": [{"text": "Highlight the tip of this screw so it is easier to see.", "start": 0.0, "end": 1.0}, {"text": "Check it against the panel behind it.", "start": 1.0, "end": 2.0}]})
     monkeypatch.setattr(ai, "understand_tutorial", lambda segs, dur: {
         "objects": [{"label": "flag", "first_mentioned_at": 1.0, "obj_id": 1, "status": "pending"}],
         "steps": [{"step_number": 1, "title": "S", "start": 0.0, "end": 1.0, "summary": "s", "objects_used": [1]}],

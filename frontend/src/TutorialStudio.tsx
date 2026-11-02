@@ -48,6 +48,11 @@ interface TutDetail extends LibraryItem {
   video_url: string;
   created_at: string;
   updated_at: string;
+  input_mode?: string;
+  analysis_strategy?: string;
+  strategy_reason?: string;
+  origin?: string;
+  keyframes?: { t: number; name: string }[];
 }
 
 const TABS = [
@@ -232,6 +237,12 @@ function OverviewEditor({ detail, onSaved, onDirty, notify, onOpenReview }: {
           <p className="muted small-text" style={{ marginBottom: 0 }}>
             Guide: {detail.guide_format ? detail.guide_format.replace(/_/g, " ") : "not generated yet"}
             {detail.format_rationale ? ` — ${detail.format_rationale}` : ""}
+          </p>
+          <p className="muted small-text" style={{ marginBottom: 0 }}>
+            Analysis: {(detail.analysis_strategy || "pending").replace(/_/g, " ")}
+            {detail.input_mode && detail.input_mode !== "auto" ? ` · mode: ${detail.input_mode.replace(/_/g, " ")}` : ""}
+            {detail.origin && detail.origin !== "recorded" ? ` · uploaded file` : ""}
+            {detail.strategy_reason ? ` — ${detail.strategy_reason}` : ""}
           </p>
           {detail.draft_version_id ? (
             <div className="row" style={{ marginTop: 8 }}>
@@ -482,6 +493,37 @@ function ContentEditor({ detail, onSaved, onDirty, notify }: {
                 <label>Source end (sec)<input type="number" min={0} step={0.5} value={active.end || 0} onChange={(e) => patchStep(sel, { end: Number(e.target.value) })} /></label>
               </div>
               <label>Tools / materials (comma-separated)<input value={(active.required_tools || []).join(", ")} onChange={(e) => patchStep(sel, { required_tools: e.target.value.split(",").map((t) => t.trim()).filter(Boolean) })} placeholder="e.g. Torque driver, Lint-free cloth" /></label>
+              {active.derivation === "visual" && (
+                <div className="panel" style={{ marginTop: 10 }}>
+                  <span className="eyebrow">Visually derived step</span>{" "}
+                  {active.confidence && <span className="tag warn">{active.confidence} confidence</span>}
+                  {(active.evidence_frames || []).length > 0 ? (
+                    <div>
+                      <p className="muted small-text" style={{ margin: "6px 0" }}>
+                        Supported by these source frames — open one to verify the action before approving.
+                      </p>
+                      <div className="row">
+                        {(active.evidence_frames || []).map((t) => {
+                          const kf = (detail.keyframes || []).reduce<{ t: number; name: string } | null>((best, k) =>
+                            !best || Math.abs(k.t - t) < Math.abs(best.t - t) ? k : best, null);
+                          const label = `${Math.floor(t / 60)}:${String(Math.floor(t % 60)).padStart(2, "0")}`;
+                          return kf ? (
+                            <a key={t} className="btn small secondary" target="_blank" rel="noreferrer"
+                              href={`${API}/api/tutorial/${detail.id}/keyframes/${kf.name}?token=${encodeURIComponent(token)}`}
+                              title={`Nearest sampled frame (${kf.name}) to ${label}`}>
+                              <span className="num">{label}</span>
+                            </a>
+                          ) : (
+                            <span key={t} className="tag"><span className="num">{label}</span></span>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  ) : (
+                    <p className="muted small-text" style={{ marginBottom: 0 }}>No frame references recorded for this step — verify against the source video.</p>
+                  )}
+                </div>
+              )}
               <StepNarration segments={segments} start={active.start || 0} end={active.end || 0} />
               {objects.length > 0 && (
                 <fieldset style={{ border: "1px solid var(--line)", borderRadius: 8, padding: 10, marginTop: 10 }}>

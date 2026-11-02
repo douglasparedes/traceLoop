@@ -15,12 +15,19 @@ const detail = {
   materials: [], guide_markdown: "# Seal check", guide_format: "work_instruction",
   format_source: "recommended", format_rationale: "Clear steps.", has_guide: true,
   draft_version_id: null, created_at: "2026-10-20T10:00:00", updated_at: "2026-10-20T10:00:00",
+  input_mode: "auto", analysis_strategy: "visual_first",
+  strategy_reason: "no narration detected — analyzing visible actions",
+  origin: "uploaded",
+  keyframes: [{ t: 1.5, name: "keyframe-00.jpg" }, { t: 16.5, name: "keyframe-01.jpg" }],
 };
 
 const content = {
   tutorial_id: "t1", content_revision: 1,
   transcript_original: detail.transcript_original, transcript_corrected: "",
-  timed_segments: detail.timed_segments, steps: detail.steps, materials: [],
+  timed_segments: detail.timed_segments,
+  steps: [{ step_number: 1, title: "Power off", summary: "Switch it off.", start: 0, end: 3, objects_used: [],
+            evidence_frames: [1.5], confidence: "low", derivation: "visual" }],
+  materials: [],
   updated_at: detail.updated_at,
 };
 
@@ -93,5 +100,19 @@ describe("TutorialStudio", () => {
     expect(onBack).not.toHaveBeenCalled();
     // Still on Overview: transcript editor not shown.
     expect(screen.queryByRole("heading", { name: "Transcript" })).not.toBeInTheDocument();
+  });
+
+  it("shows the analysis strategy and visual derivation with frame links", async () => {
+    mockStudio([]);
+    const user = userEvent.setup();
+    render(<TutorialStudio item={item} onBack={() => undefined} onOpenReview={() => undefined} notify={() => undefined} />);
+    await screen.findByRole("heading", { name: "Seal check" });
+    expect(screen.getByText(/Analysis: visual first/)).toBeInTheDocument();
+    expect(screen.getByText(/no narration detected/)).toBeInTheDocument();
+    await user.click(screen.getByRole("tab", { name: "Content" }));
+    expect(await screen.findByText(/Visually derived step/)).toBeInTheDocument();
+    expect(screen.getByText("low confidence")).toBeInTheDocument();
+    const link = screen.getByRole("link", { name: /0:01/ });
+    expect(link.getAttribute("href")).toContain("keyframes/keyframe-00.jpg");
   });
 });

@@ -22,10 +22,39 @@ worker and `/api` calls share one scope. No CORS or separate frontend service.
    | `SECRET_KEY` | long random string | Signs auth tokens. If unset, derived from the password — set it explicitly in production. |
    | `PORT` | _(leave to Coolify)_ | Coolify injects this (e.g. `3000`); the image's CMD and healthcheck both follow `$PORT`. Do **not** set it manually unless you also change the port mapping. |
 5. **Persistent volumes** (both required, or data dies on redeploy):
-   - `/data` — SQLite database.
-   - `/app/backend/data` — uploaded evidence, tutorial videos, live chunks.
+   - `/data` — SQLite database (`DATABASE_URL=sqlite:////data/fieldguard.db`).
+   - `/app/backend/data` — all server-side bytes: tutorial source videos
+     (`tutorials/{id}/source.*`), video-guide MP4s (`tutorials/{id}/video/`),
+     visual derivatives (`tutorials/{id}/visuals/`), keyframes and diagnostic
+     frames (`tutorials/{id}/`), job evidence photos (`evidence/`), live
+     chunks (`live/`), tutorial processing intermediates (`audio.wav`,
+     `tracking*.mp4`).
+   - Override with `MEDIA_ROOT` only if you also move the volume there; the
+     default keeps existing storage keys working with no migration.
+   - `GET /api/admin/storage` (reviewer/admin) reports volume existence,
+     writability, disk usage, DB reachability, and any records pointing at
+     missing files (ids only). If the volume is missing, uploads fail
+     loudly (HTTP 500, nothing marked persisted) instead of pretending success.
 6. Deploy. First boot: `POST https://app.knowloop.online/api/seed` once
    (idempotent) to load the demo procedure.
+
+### Media backup, restore, and restart verification
+
+- **Back up together**: `/data/fieldguard.db` (metadata + storage keys) and
+  `/app/backend/data` (bytes). A DB backup without its media volume leaves
+  `source_evidence.storage_key` rows pointing at missing files — run
+  `GET /api/admin/storage` after any restore and re-upload anything listed
+  under `missing`.
+- **Verify media survives redeploy**: upload a tutorial, generate a video
+  guide, then `docker restart` (or redeploy in Coolify) and confirm
+  `GET /api/tutorial/{id}/video` and the pinned `video-guides/{vgid}/file`
+  still stream. Without the two volumes mounted, both the database and all
+  media reset to empty on every redeploy.
+- **If the media volume is unavailable**: health stays reachable, uploads
+  return 500 with cleanup of partial temp files (`data/.tmp/*.part`),
+  and `admin/storage` reports `media_root_ok: false, writable: false`.
+- The service worker (`public/sw.js`, v6) runtime-caches media for offline
+  playback only — it is a client optimization, never the authoritative copy.
 
 ### Access control (demo-grade)
 

@@ -16,6 +16,10 @@
 | Proposals create drafts, never mutate approvals | `POST /api/jobs/{jid}/propose-improvement` (reviewer+ only, finished jobs only); before/after in `source_evidence.proposal`; simulated path quotes technician verbatim, labelled low-confidence | Implemented; full-loop test (feedback → proposal → approve → supersede → pinning) |
 | Per-stage live/simulated visibility | `GET /api/tutorial/{jid}/stages` rollup; Studio Overview summary + technical expander | Implemented; `ProcessingSummary.test.tsx`, `StudioStages.test.tsx` |
 | Review shows transcript evidence per step | `transcript_segments` in `ver_out` computed from linked tutorial timing | Implemented; `test_feedback.py::test_version_carries_transcript_segments` |
+| Offline jobs survive superseded revisions | HMAC offline grants (`fg-grant.*`, procedure + version + actor + expiry); new jobs still pin latest approved | Implemented; `test_grants.py` (valid/invalid/expired/wrong-actor/wrong-binding + full pinning flow) |
+| Sync failures are diagnosable per item | Persistent `sync-report` in IndexedDB; dependency-ordered retries; Activity diagnostics with retry + confirmed discard | Implemented; `sync.test.ts` (12 tests: ordering, waiting, unknown-session, orphans, concurrency, discard) |
+| Tutorial uploads stream safely to disk | Chunked receive, incremental sha256, enforced cap, atomic rename, temp cleanup; `GET /admin/storage` health | Implemented; `test_storage.py` (persistence, dedup, 413 + cleanup, traversal, health, keyframes, versions) |
+| Silent/weak narration takes the visual path | Speech-sufficiency gate; `analyze_tutorial_frames` (Spark multimodal + labelled deterministic fallback); evidence-frame step links | Implemented; `test_visualfirst.py` (7 tests); narrated mode keeps the old hard failure |
 
 Known limitations: manual page numbers are chunk-level (extraction keeps order, not exact pages); offline job start needs one prior online server start in this build (UI states this); no video tracking (deferred per spec §7.4); frontend has no automated test suite yet.
 

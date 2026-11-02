@@ -833,12 +833,14 @@ def _simulated_understanding(segments: list[dict], duration_sec: float) -> dict:
 
 
 def generate_guide(title: str, steps: list[dict], objects: list[dict], segments: list[dict],
-                   guide_format: str = "work_instruction") -> dict:
+                   guide_format: str = "work_instruction", source_note: str = "") -> dict:
     """Muse Spark: final guide markdown + materials from validated steps/objects.
 
     guide_format selects the presentation structure (work_instruction |
     reference_manual | interactive). Content always comes from the validated
-    inputs; unsupported sections are omitted, never invented.
+    inputs; unsupported sections are omitted, never invented. source_note
+    (e.g. visual-first derivation) is surfaced to the model and the fallback
+    so the guide distinguishes observed, narrated, and uncertain content.
     """
     structure = {
         "work_instruction": (
@@ -863,13 +865,17 @@ def generate_guide(title: str, steps: list[dict], objects: list[dict], segments:
         ),
     }.get(guide_format, "")
     if not live_enabled():
-        return {"guide_markdown": fallback_guide_markdown(title, steps, objects, guide_format),
+        return {"guide_markdown": fallback_guide_markdown(title, steps, objects, guide_format, source_note),
                 "materials": [o.get("label", "") for o in objects], "simulated": True, "model": SPARK_MODEL,
                 "format": guide_format,
                 "note": "Deterministic fallback guide (no META_API_KEY). Configure the key for live Muse Spark generation."}
     system = (
         "Write a clear tutorial guide in Markdown from the validated steps, objects, and transcript excerpts. "
         + structure + " "
+        + (f"Provenance context: {source_note} " if source_note else "")
+        + "When steps derive from visual observation rather than narration, say which steps are visually "
+        + "observed, keep their uncertainties visible, never fabricate a transcript or speech evidence, "
+        + "and omit unsupported details. "
         + "A Table of contents is allowed only for the reference_manual format. "
         + "Never invent tools, values, warnings, steps, or specifications."
     )
@@ -887,7 +893,7 @@ def generate_guide(title: str, steps: list[dict], objects: list[dict], segments:
 
 
 def fallback_guide_markdown(title: str, steps: list[dict], objects: list[dict],
-                              guide_format: str = "work_instruction") -> str:
+                              guide_format: str = "work_instruction", source_note: str = "") -> str:
     """Deterministic offline renderer: same canonical steps, three structures.
 
     Used when live generation is unavailable (or fails). Never invents tools,
@@ -895,6 +901,8 @@ def fallback_guide_markdown(title: str, steps: list[dict], objects: list[dict],
     marked unknown, never fabricated.
     """
     lines = [f"# {title}", ""]
+    if source_note:
+        lines += [f"_{source_note}_", ""]
     tools = sorted({t for s in steps for t in (s.get("tools") or []) if isinstance(t, str) and t.strip()})
     if guide_format == "reference_manual":
         lines += ["_Reference manual (offline fallback — generated without live AI)._", "",
@@ -1073,6 +1081,224 @@ def _simulated_proposal(procedure_title: str, simple_steps: list[dict], events: 
                f"every change before approval.")
     return {"changes": changes, "summary": summary, "simulated": True, "model": SPARK_MODEL,
             "note": "Deterministic fallback proposal (no META_API_KEY). Configure the key for live Muse Spark analysis."}
+
+
+def _chat_content(content_system: str, blocks: list) -> str:
+    """Muse Spark chat completion with multimodal content blocks.
+
+    Blocks follow the OpenAI-compatible convention already used for SAM
+    image inputs in this module ({"type": "image_url",
+    "image_url": {"url": data_url}}). Raises on failure.
+    """
+    import httpx
+
+    body: dict = {
+        "model": SPARK_MODEL,
+        "messages": [
+            {"role": "system", "content": content_system},
+            {"role": "user", "content": blocks},
+        ],
+    }
+    r = httpx.post(f"{META_BASE_URL}/chat/completions", headers=_headers(), json=body, timeout=180)
+    r.raise_for_status()
+    return r.json()["choices"][0]["message"]["content"] or ""
+
+
+def assess_speech_sufficiency(text: str, segments: list[dict], duration_sec: float) -> tuple[bool, str]:
+    """Decide whether the narration can support transcript-led understanding.
+
+    A single introductory sentence, background noise, or music is not
+    meaningful narration. Thresholds are deliberately conservative: when in
+    doubt the pipeline prefers the visual-first path and keeps any partial
+    transcript as supplementary context.
+    """
+    cleaned = (text or "").strip()
+    n_seg = len(segments or [])
+    if len(cleaned) < 50:
+        return False, f"transcript too short ({len(cleaned)} chars) to support procedural extraction"
+    if n_seg < 2:
+        return False, "only one speech segment — narration is insufficient for step extraction"
+    dur = max(float(duration_sec or 0), 1.0)
+    density = len(cleaned) / dur
+    if density < 1.5:
+        return False, f"speech too sparse ({density:.1f} chars/sec) to support procedural extraction"
+    return True, f"sufficient narration ({len(cleaned)} chars, {n_seg} segments)"
+
+
+_VIDEO_UNDERSTAND_SCHEMA = {
+    "name": "VideoUnderstanding",
+    "schema": {
+        "type": "object",
+        "properties": {
+            "observations": {"type": "array", "items": {"type": "object",
+                "properties": {
+                    "timestamp": {"type": "number"},
+                    "description": {"type": "string"},
+                    "objects": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["timestamp", "description", "objects"],
+                "additionalProperties": False}},
+            "candidate_steps": {"type": "array", "items": {"type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "instruction": {"type": "string"},
+                    "start_sec": {"type": "number"},
+                    "end_sec": {"type": "number"},
+                    "evidence_frames": {"type": "array", "items": {"type": "number"}},
+                    "objects": {"type": "array", "items": {"type": "string"}},
+                    "confidence": {"type": "string"},
+                    "uncertainties": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["title", "instruction", "start_sec", "end_sec", "evidence_frames",
+                             "objects", "confidence", "uncertainties"],
+                "additionalProperties": False}},
+            "missing_information": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["observations", "candidate_steps", "missing_information"],
+        "additionalProperties": False,
+    },
+}
+
+MAX_ANALYSIS_FRAMES = 8
+
+
+def _clean_visual_steps(raw_steps: list, duration_sec: float) -> tuple[list[dict], list[str]]:
+    """Validate model-proposed visual steps. Clamps timestamps, drops empty
+    or out-of-range steps, never fabricates. Returns (steps, dropped_notes)."""
+    dur = max(float(duration_sec or 0), 0.0)
+    clean: list[dict] = []
+    dropped: list[str] = []
+    for i, s in enumerate((raw_steps or [])[:20]):
+        if not isinstance(s, dict):
+            dropped.append(f"entry {i} ignored: not an object")
+            continue
+        title = str(s.get("title", "") or "").strip()[:200]
+        instruction = str(s.get("instruction", "") or "").strip()[:2000]
+        if not title or not instruction:
+            dropped.append(f"entry {i} ignored: missing title or instruction")
+            continue
+        try:
+            start = max(0.0, float(s.get("start_sec", 0) or 0))
+            end = float(s.get("end_sec", 0) or 0)
+        except (TypeError, ValueError):
+            dropped.append(f"entry {i} ignored: invalid time range")
+            continue
+        if dur > 0:
+            start = min(start, dur)
+            end = min(max(end, start), dur)
+        if end <= start:
+            dropped.append(f"“{title}” ignored: empty time range after clamping")
+            continue
+        try:
+            ev = sorted({round(max(0.0, min(float(t), dur if dur else float(t))), 1) for t in (s.get("evidence_frames") or [])})
+        except (TypeError, ValueError):
+            ev = []
+        ev = [t for t in ev if (not dur or t <= dur)][:8] or [round(start, 1)]
+        conf = str(s.get("confidence", "low") or "low").lower()
+        clean.append({
+            "title": title, "instruction": instruction,
+            "start_sec": round(start, 1), "end_sec": round(end, 1),
+            "evidence_frames": ev,
+            "objects": [str(o)[:80] for o in (s.get("objects") or []) if str(o).strip()][:8],
+            "confidence": conf if conf in ("low", "medium", "high") else "low",
+            "uncertainties": [str(u)[:500] for u in (s.get("uncertainties") or []) if str(u).strip()][:5],
+        })
+    return clean, dropped
+
+
+def analyze_tutorial_frames(frames: list[dict], transcript_hint: str, duration_sec: float) -> dict:
+    """Muse Spark: understand visible actions from sampled video frames.
+
+    frames: [{t: seconds, image: JPEG bytes}]. Chronological order is
+    preserved and every frame carries its source timestamp so candidate
+    steps stay time-aligned with the recording. Without a key (or on live
+    failure) returns a deterministic labelled fallback — never fake live
+    analysis, never fabricated technical detail.
+    """
+    if not live_enabled():
+        return _simulated_visual_analysis(frames, duration_sec)
+    blocks: list = [{"type": "text", "text":
+        "These are chronological frames from a maintenance tutorial video. "
+        "Compare consecutive frames and identify observable actions: what components are visible, "
+        "what changes between frames (removed, inserted, rotated, opened, closed, pressed, connected, "
+        "disconnected, repositioned), and the order of visible actions. "
+        "Use ONLY what the frames show plus the transcript hint (if any); never invent tools, values, "
+        "safety procedures, torque, measurements, or model identities. Mark anything uncertain."}]
+    if transcript_hint:
+        blocks.append({"type": "text", "text": f"Transcript hint (supplementary, may be sparse): {transcript_hint[:2000]}"})
+    for f in frames[:MAX_ANALYSIS_FRAMES]:
+        import base64 as _b64
+        data_url = f"data:image/jpeg;base64,{_b64.b64encode(f['image']).decode()}"
+        blocks.append({"type": "text", "text": f"Frame at t={f['t']:.1f}s:"})
+        blocks.append({"type": "image_url", "image_url": {"url": data_url}})
+    system = (
+        "You analyze maintenance tutorial frames. Respond with JSON matching the schema: "
+        "observations (timestamped visible changes with objects), candidate_steps (title, instruction "
+        "describing only observed action, start/end seconds inside the video, evidence_frames listing "
+        "the frame timestamps that support the step, objects as short noun phrases, confidence "
+        "low/medium/high, uncertainties), and missing_information (what the frames cannot establish, "
+        "especially any safety-critical state like isolation, PPE, or torque). "
+        "If evidence is insufficient for a step, omit the step and say so in missing_information."
+    )
+    try:
+        import json as _json
+        parsed = _json.loads(_chat_content(system, blocks))
+        # Schema-light validation first (the gateway may not honor
+        # response_format for multimodal calls).
+        steps, dropped = _clean_visual_steps(parsed.get("candidate_steps") or [], duration_sec)
+        obs = []
+        for o in (parsed.get("observations") or [])[:40]:
+            if not isinstance(o, dict):
+                continue
+            try:
+                t = float(o.get("timestamp", 0) or 0)
+            except (TypeError, ValueError):
+                continue
+            if duration_sec > 0:
+                t = max(0.0, min(t, duration_sec))
+            desc = str(o.get("description", "") or "").strip()[:500]
+            if desc:
+                obs.append({"timestamp": round(t, 1), "description": desc,
+                            "objects": [str(x)[:80] for x in (o.get("objects") or []) if str(x).strip()][:8]})
+        missing = [str(m)[:500] for m in (parsed.get("missing_information") or []) if str(m).strip()][:10]
+        return {"analysis_mode": "visual_first", "observations": obs, "candidate_steps": steps,
+                "missing_information": missing, "dropped": dropped,
+                "simulated": False, "model": SPARK_MODEL}
+    except Exception as e:
+        fb = _simulated_visual_analysis(frames, duration_sec)
+        fb["note"] = f"Live visual analysis failed ({type(e).__name__}); deterministic fallback, not live AI."
+        return fb
+
+
+def _simulated_visual_analysis(frames: list[dict], duration_sec: float) -> dict:
+    """Deterministic offline visual analysis: uniform time slices, generic
+    wording, low confidence. Clearly labelled — a placeholder the reviewer
+    must verify, never a real observation."""
+    dur = max(float(duration_sec or 0), 10.0)
+    n = max(2, min(4, int(dur // 20) + 1))
+    step = dur / n
+    steps = []
+    for j in range(n):
+        s, e = round(j * step, 1), round(min((j + 1) * step, dur), 1)
+        steps.append({
+            "title": f"Observed activity segment {j + 1} (simulated analysis)",
+            "instruction": "Simulated visual analysis placeholder — watch the recording and describe the actual action before approving.",
+            "start_sec": s, "end_sec": e, "evidence_frames": [s],
+            "objects": [], "confidence": "low",
+            "uncertainties": ["No live visual analysis ran (no META_API_KEY); objects and actions are unverified."],
+        })
+    return {"analysis_mode": "visual_first",
+            "observations": [{"timestamp": round(j * step, 1),
+                              "description": "Simulated observation placeholder — no live frame analysis ran.",
+                              "objects": []} for j in range(n)],
+            "candidate_steps": steps,
+            "missing_information": [
+                "Simulated analysis cannot establish tools, components, safety state, or exact actions.",
+                "Verify every step against the source video; nothing here is verified evidence.",
+            ],
+            "dropped": [],
+            "simulated": True, "model": SPARK_MODEL,
+            "note": "Deterministic simulated visual analysis (no META_API_KEY). Configure the key for live Muse Spark frame understanding."}
 
 
 # ---------------------------------------------------------------- Video guide (Spark scene plan + original-voice cut)

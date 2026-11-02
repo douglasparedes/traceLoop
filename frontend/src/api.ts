@@ -44,6 +44,16 @@ export function wsUrl(path: string): string {
   return `${proto}//${window.location.host}${path}${t ? `${sep}token=${encodeURIComponent(t)}` : ""}`;
 }
 
+/** HTTP errors carry the status code so sync diagnostics can classify failures. */
+export class HttpError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.name = "HttpError";
+    this.status = status;
+  }
+}
+
 async function req<T>(path: string, init: RequestInit = {}): Promise<T> {
   const res = await fetch(`${API}${path}`, {
     ...init,
@@ -53,7 +63,7 @@ async function req<T>(path: string, init: RequestInit = {}): Promise<T> {
   if (!res.ok) {
     let msg = `Request failed (${res.status})`;
     try { const b = await res.json(); msg = (b as { detail?: string }).detail || msg; } catch { /* keep default */ }
-    throw new Error(msg);
+    throw new HttpError(msg, res.status);
   }
   return res.json() as Promise<T>;
 }
@@ -68,7 +78,7 @@ export async function authPost<T>(path: string, body: unknown, extraHeaders: Rec
   if (!res.ok) {
     let msg = `Request failed (${res.status})`;
     try { const b = await res.json(); msg = (b as { detail?: string }).detail || msg; } catch { /* keep default */ }
-    throw new Error(msg);
+    throw new HttpError(msg, res.status);
   }
   return res.json() as Promise<T>;
 }
@@ -82,7 +92,7 @@ export async function authDelete<T>(path: string, extraHeaders: Record<string, s
   if (!res.ok) {
     let msg = `Request failed (${res.status})`;
     try { const b = await res.json(); msg = (b as { detail?: string }).detail || msg; } catch { /* keep default */ }
-    throw new Error(msg);
+    throw new HttpError(msg, res.status);
   }
   return res.json() as Promise<T>;
 }
@@ -121,7 +131,7 @@ export const api = {
   upload: async <T,>(p: string, form: FormData, extraHeaders: Record<string, string> = {}): Promise<T> => {
     const res = await fetch(`${API}${p}`, { method: "POST", headers: baseHeaders(extraHeaders), body: form });
     if (res.status === 401) { emitAuthRequired(); }
-    if (!res.ok) { let m = `Upload failed (${res.status})`; try { m = ((await res.json()) as { detail?: string }).detail || m; } catch { /* noop */ } throw new Error(m); }
+    if (!res.ok) { let m = `Upload failed (${res.status})`; try { m = ((await res.json()) as { detail?: string }).detail || m; } catch { /* noop */ } throw new HttpError(m, res.status); }
     return res.json() as Promise<T>;
   },
 };

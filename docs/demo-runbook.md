@@ -15,6 +15,12 @@ Sign in with the team passphrase (or leave empty for open local mode).
 
 Capture → Record a tutorial: allow camera + mic (watch the mic-level meter move while you speak), record ~20 s narrating each object ("this is my red screwdriver"), stop, Upload & generate guide. [live] Real transcription/segmentation; without a key you get the labelled simulated pipeline with timestamped segments and `needs_tap` objects.
 
+**Or upload instead**: Tutorials → Upload an existing video → pick an MP4/WebM/MOV/MKV (≤300 MB), add a title, keep Automatic mode → Upload & generate guide. The file is queued on-device first (survives reload), uploads with progress, and lands in the same library and Studio. Try the **mode selector**: Automatic (default), Narrated (fails clearly on silence), Visual-First.
+
+## 1b. Silent / weakly-narrated tutorial → visual-first (1 min)
+
+Upload or record a video with no narration (or one short sentence) in Automatic mode. The pipeline detects insufficient speech and switches to **visual-first**: keyframes are sampled, Muse Spark describes observable actions [live] (or the labelled deterministic fallback offline), and candidate steps carry evidence-frame links plus low confidence — never fabricated transcripts. Studio → Overview shows the analysis strategy; Content shows visually-derived steps with frame links; Review shows transcript evidence where narration exists and frame evidence where it doesn't.
+
 ## 2. Three formats (1 min)
 
 Open the finished tutorial → Guide tab. The AI recommendation appears with its rationale and scores. Generate **Illustrated Work Instruction**, then change format → **Reference Manual** → **Interactive Guided Execution**. Version history keeps every generation; Compare shows old vs current.
@@ -37,7 +43,9 @@ Open in Review (from the tutorial or Review queue). Edit nothing or fix a summar
 
 ## 6. Execute offline (2 min)
 
-Library → approved procedure → Save for offline use → Start procedure. Complete a step, report an issue, attach a photo. Go offline (DevTools → Offline) - execution keeps working; events queue. Reconnect - Activity → Sync now delivers them without duplicates. Sign out wipes cached private media; queued work survives.
+Library → approved procedure → Save for offline use → Start procedure. Complete a step, report an issue, attach a photo. Go offline (DevTools → Offline) - execution keeps working; events queue. Reconnect → Activity → Sync now delivers them without duplicates. Sign out wipes cached private media; queued work survives.
+
+**Sync diagnostics**: Activity now shows per-item status — what synced, what is waiting on a job registration, and what failed with the server's reason, attempt counts, and a recommended next action. Unrecoverable entries can be discarded only after an explicit confirmation; recoverable ones retry with one button. Last successful sync time is shown.
 
 ## 7. Close the loop: feedback becomes a revision (2 min)
 

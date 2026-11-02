@@ -47,8 +47,8 @@ def _video_pipeline(monkeypatch, tmp_path, salt=77):
     monkeypatch.setattr(tutorial, "extract_audio_wav", lambda s, o: o.write_bytes(b"wav"))
     monkeypatch.setattr(tutorial, "make_tracking_copy", lambda s, o, max_width=512: (o.write_bytes(b"mp4"), {"width": 320, "height": 240})[1])
     monkeypatch.setattr(ai, "transcribe_timed", lambda fn, data, duration_sec=0: {
-        "text": "Do it now.", "simulated": False,
-        "segments": [{"text": "Do it now.", "start": 0.0, "end": 2.0}]})
+        "text": "Turn the knob clockwise now, holding it steady so you can see the full rotation of the dial.", "simulated": False,
+        "segments": [{"text": "Turn the knob clockwise now, holding it steady.", "start": 0.0, "end": 1.0}, {"text": "Watch the full rotation of the dial.", "start": 1.0, "end": 2.0}]})
     monkeypatch.setattr(ai, "understand_tutorial", lambda segs, dur: {
         "objects": [{"label": "knob", "first_mentioned_at": 0.0, "obj_id": 1, "status": "pending"}],
         "steps": [{"step_number": 1, "title": "Turn the knob", "start": 0.0, "end": 2.0,

@@ -874,6 +874,14 @@ def fork_locked_revision(db, base: M.ProcedureVersion, job: M.TutorialJob, actor
     return nv
 
 
+def _guide_source_note(job: M.TutorialJob) -> str:
+    """Provenance note distinguishing visually-observed from narrated content."""
+    if getattr(job, "analysis_strategy", "") == "visual_first":
+        return ("Steps derive from visual observation of the recording (visual-first analysis); "
+                "narration was absent or insufficient. Treat uncertainties as unresolved until reviewed.")
+    return ""
+
+
 def regenerate_guide_for_job(db, job: M.TutorialJob, trigger: str, fmt: str | None = None,
                              actor: str = "") -> dict:
     """Regenerate the guide markdown from current canonical content and sync the draft.
@@ -893,8 +901,8 @@ def regenerate_guide_for_job(db, job: M.TutorialJob, trigger: str, fmt: str | No
         job.guide_format = fmt
     steps, objects = job.steps or [], job.objects or []
     with proc.timed() as t:
-        guide = ai.generate_guide(job.title, steps, objects, job.timed_segments or [], guide_format=fmt)
-    md = guide.get("guide_markdown") or ai.fallback_guide_markdown(job.title, steps, objects, fmt)
+        guide = ai.generate_guide(job.title, steps, objects, job.timed_segments or [], guide_format=fmt, source_note=_guide_source_note(job))
+    md = guide.get("guide_markdown") or ai.fallback_guide_markdown(job.title, steps, objects, fmt, _guide_source_note(job))
     md = inject_illustrations(md, steps, objects)
     # Accepted review visuals ride along as labelled presentation assets
     # (human-approved derivatives, never source evidence).
@@ -1033,6 +1041,105 @@ def snapshot_guide(db, job: M.TutorialJob, trigger: str, md: str, objects: list 
     return snap
 
 
+def decide_analysis_strategy(input_mode: str, has_audio: bool, text: str,
+                               segments: list, duration_sec: float) -> tuple[str, str]:
+    """Choose narrated vs visual-first understanding. Returns (strategy, reason).
+
+    Never fabricates: weak narration routes to visual analysis with the
+    partial transcript kept as supplementary context.
+    """
+    if input_mode == "visual_first":
+        return "visual_first", "visual-first mode requested by the user"
+    if not has_audio:
+        return "visual_first", "no audio track in the recording — analyzing visible actions instead"
+    ok, detail = ai.assess_speech_sufficiency(text, segments or [], duration_sec)
+    if ok:
+        return "narrated", detail
+    if input_mode == "narrated":
+        return "narrated", "narrated mode requested; transcription is sparse (" + detail + ")"
+    return "visual_first", detail
+
+
+def sample_keyframes(job_dir: Path, source: Path, duration_sec: float,
+                     max_frames: int = 8) -> list[dict]:
+    """Sample up to max_frames JPEGs uniformly across the recording.
+
+    Bounded and timestamped: each frame carries its source time so candidate
+    steps stay aligned with the video. Uses local ffmpeg + Pillow only.
+    """
+    from PIL import Image as _Image
+    import io as _io
+    dur = max(float(duration_sec or 0), 1.0)
+    n = max(2, min(int(max_frames), int(dur // 20) + 1, 8))
+    out: list[dict] = []
+    for i in range(n):
+        t = round(min((i + 0.5) * dur / n, max(0.0, dur - 0.1)), 1)
+        try:
+            frame = extract_frame_image(source, t)
+            frame.thumbnail((640, 640))
+            name = f"keyframe-{i:02d}.jpg"
+            frame.convert("RGB").save(job_dir / name, "JPEG", quality=70)
+            with open(job_dir / name, "rb") as fh:
+                raw = fh.read()
+            out.append({"t": t, "name": name, "image": raw})
+        except Exception:
+            continue
+    return out
+
+
+def _visual_objects_and_steps(analysis: dict, duration_sec: float) -> tuple[list[dict], list[dict]]:
+    """Map visual analysis output onto the canonical step/object schema.
+
+    Labels become tracked objects (first appearance = earliest evidence
+    frame or step start); candidate steps become canonical steps carrying
+    evidence_frames + confidence + derivation so reviewers can tell visual
+    observation apart from narration and human edits.
+    """
+    raw_steps = analysis.get("candidate_steps") or []
+    label_first: dict[str, float] = {}
+    for s in raw_steps:
+        if not isinstance(s, dict):
+            continue
+        ev = s.get("evidence_frames") or []
+        try:
+            t0 = min([float(x) for x in ev])
+        except (TypeError, ValueError):
+            try:
+                t0 = float(s.get("start_sec", 0) or 0)
+            except (TypeError, ValueError):
+                t0 = 0.0
+        for lab in (s.get("objects") or []):
+            lab = str(lab).strip()[:80]
+            if lab and (lab not in label_first or t0 < label_first[lab]):
+                label_first[lab] = round(t0, 1)
+    labels = sorted(label_first, key=lambda l: label_first[l])
+    obj_ids = {lab: i + 1 for i, lab in enumerate(labels)}
+    objects = [{"label": lab, "first_mentioned_at": label_first[lab], "obj_id": obj_ids[lab],
+                "status": "pending", "confidence": None, "illustration": "", "overlay": "", "track": []}
+               for lab in labels]
+    steps = []
+    for j, s in enumerate(raw_steps):
+        if not isinstance(s, dict):
+            continue
+        used = sorted({obj_ids[str(lab).strip()[:80]] for lab in (s.get("objects") or [])
+                       if str(lab).strip()[:80] in obj_ids})
+        steps.append({
+            "step_number": j + 1,
+            "title": str(s.get("title", "") or f"Step {j + 1}"),
+            "summary": str(s.get("instruction", "") or ""),
+            "start": float(s.get("start_sec", 0) or 0),
+            "end": float(s.get("end_sec", 0) or 0),
+            "objects_used": used,
+            "expected_result": "",
+            "verification_notes": "; ".join(str(u) for u in (s.get("uncertainties") or []) if str(u).strip())[:2000],
+            "required_tools": [],
+            "evidence_frames": [float(x) for x in (s.get("evidence_frames") or [])][:8],
+            "confidence": s.get("confidence", "low"),
+            "derivation": "visual",
+        })
+    return objects, steps
+
+
 def run_job(job_id: str) -> None:
     from . import processing as proc
     db = SessionLocal()
@@ -1055,65 +1162,159 @@ def run_job(job_id: str) -> None:
                 raise RuntimeError("Could not read the uploaded video (unsupported format?)")
             if info["duration"] > MAX_VIDEO_SEC + 5:
                 raise RuntimeError(f"Video is {info['duration']:.0f}s — tutorials are limited to {MAX_VIDEO_SEC}s (10 minutes)")
-            if not info.get("has_audio", True):
-                # Fail fast with an actionable message: retrying a silent video
-                # can never succeed, and transcribing silence is not an option.
-                proc.safe_record(db, "tutorial", job_id, "extract_audio", "failed",
-                                 operation="extract_audio_wav", duration_ms=0, actor=actor,
-                                 summary={"has_audio": False,
-                                          "note": "probe found no audio stream; failing before transcription"})
-                raise NoAudioTrackError(
-                    "This video has no audio track, so there is nothing to transcribe. "
-                    "Record again with the microphone on and narrate each step as you show it.")
+            # NOTE: no-audio is handled below per input_mode (narrated fails
+            # fast; auto/visual_first continue with visual analysis).
             _set(db, job, duration_sec=info["duration"], width=info["width"], height=info["height"], progress=8)
+            input_mode = getattr(job, "input_mode", "auto") or "auto"
+            if input_mode not in ("auto", "narrated", "visual_first"):
+                input_mode = "auto"
+            has_audio = bool(info.get("has_audio", True))
 
-            _set(db, job, status="transcribing", progress=12)
-            wav = job_dir / "audio.wav"
-            try:
-                extract_audio_wav(source, wav)
-            except NoAudioTrackError:
-                proc.safe_record(db, "tutorial", job_id, "extract_audio", "failed",
-                                 operation="extract_audio_wav", duration_ms=0, actor=actor,
-                                 summary={"has_audio": False})
-                raise
-            except RuntimeError as ee:
-                proc.safe_record(db, "tutorial", job_id, "extract_audio", "failed",
-                                 operation="extract_audio_wav", duration_ms=0, actor=actor,
-                                 summary={"error_type": "RuntimeError", "ffmpeg": str(ee)[-300:]})
-                raise
-            with proc.timed() as t:
-                tr = ai.transcribe_timed("audio.wav", wav.read_bytes(), duration_sec=info["duration"])
-            proc.safe_record(
-                db, "tutorial", job_id, "transcribe", "failed" if tr.get("error") else ("simulated" if tr.get("simulated") else "succeeded"),
-                operation="transcribe_timed", provider="meta", model=tr.get("model", ""), duration_ms=t.ms, actor=actor,
-                summary={"audio_sec": info["duration"], "text_chars": len(tr.get("text") or ""),
-                         "segments": len(tr.get("segments") or []), "error": tr.get("error", ""),
-                         "note": tr.get("note", "")})
-            if tr.get("error"):
-                raise RuntimeError(tr["error"])
-            if not (tr.get("text") or "").strip():
-                raise RuntimeError("No speech was transcribed. Check the microphone track and try again.")
-            _set(db, job, full_transcript=tr["text"], timed_segments=tr["segments"], progress=30)
+            def _best_effort_transcript() -> dict:
+                """Transcribe without failing: partial speech stays available
+                as supplementary context for visual-first analysis."""
+                try:
+                    _wav = job_dir / "audio.wav"
+                    extract_audio_wav(source, _wav)
+                    out = ai.transcribe_timed("audio.wav", _wav.read_bytes(), duration_sec=info["duration"])
+                    out.pop("error", None)
+                    return out
+                except Exception as ee:
+                    return {"text": "", "segments": [], "simulated": False,
+                            "note": f"Transcription unavailable ({type(ee).__name__}); continuing visually."}
 
+            tr: dict = {"text": "", "segments": [], "simulated": False, "model": ""}
+            strategy, reason = "narrated", ""
+            if input_mode == "visual_first":
+                strategy, reason = "visual_first", "visual-first mode requested by the user"
+                if has_audio:
+                    _set(db, job, status="transcribing", progress=12)
+                    tr = _best_effort_transcript()
+                    proc.safe_record(
+                        db, "tutorial", job_id, "transcribe",
+                        "simulated" if tr.get("simulated") else ("succeeded" if (tr.get("text") or "").strip() else "skipped"),
+                        operation="transcribe_timed", provider="meta", model=tr.get("model", ""), duration_ms=0, actor=actor,
+                        summary={"audio_sec": info["duration"], "text_chars": len(tr.get("text") or ""),
+                                 "segments": len(tr.get("segments") or []), "note": tr.get("note", "")})
+                    _set(db, job, full_transcript=tr["text"], timed_segments=tr["segments"])
+                else:
+                    proc.safe_record(db, "tutorial", job_id, "extract_audio", "skipped",
+                                     operation="extract_audio_wav", duration_ms=0, actor=actor,
+                                     summary={"has_audio": False,
+                                              "note": "visual-first mode: narration optional, skipping audio extraction"})
+                    _set(db, job, full_transcript="", timed_segments=[])
+            elif not has_audio:
+                if input_mode == "narrated":
+                    # Fail fast with an actionable message: retrying a silent video
+                    # can never succeed, and transcribing silence is not an option.
+                    proc.safe_record(db, "tutorial", job_id, "extract_audio", "failed",
+                                     operation="extract_audio_wav", duration_ms=0, actor=actor,
+                                     summary={"has_audio": False,
+                                              "note": "probe found no audio stream; failing before transcription"})
+                    raise NoAudioTrackError(
+                        "This video has no audio track, so there is nothing to transcribe. "
+                        "Record again with the microphone on and narrate each step as you show it, "
+                        "or switch to Visual-First mode to analyze the actions shown.")
+                strategy, reason = "visual_first", "no audio track in the recording — analyzing visible actions instead"
+                proc.safe_record(db, "tutorial", job_id, "extract_audio", "skipped",
+                                 operation="extract_audio_wav", duration_ms=0, actor=actor,
+                                 summary={"has_audio": False, "fallback": "visual_first",
+                                          "note": "probe found no audio stream; continuing visually"})
+                _set(db, job, full_transcript="", timed_segments=[])
+            else:
+                _set(db, job, status="transcribing", progress=12)
+                wav = job_dir / "audio.wav"
+                try:
+                    extract_audio_wav(source, wav)
+                except NoAudioTrackError:
+                    if input_mode == "auto":
+                        strategy, reason = "visual_first", "audio track unreadable — analyzing visible actions instead"
+                        tr = {"text": "", "segments": [], "simulated": False, "model": "",
+                              "note": "extract_audio_wav found no audio; visual-first fallback"}
+                        proc.safe_record(db, "tutorial", job_id, "extract_audio", "failed",
+                                         operation="extract_audio_wav", duration_ms=0, actor=actor,
+                                         summary={"has_audio": False, "fallback": "visual_first"})
+                        _set(db, job, full_transcript="", timed_segments=[])
+                    else:
+                        proc.safe_record(db, "tutorial", job_id, "extract_audio", "failed",
+                                         operation="extract_audio_wav", duration_ms=0, actor=actor,
+                                         summary={"has_audio": False})
+                        raise
+                except RuntimeError as ee:
+                    proc.safe_record(db, "tutorial", job_id, "extract_audio", "failed",
+                                     operation="extract_audio_wav", duration_ms=0, actor=actor,
+                                     summary={"error_type": "RuntimeError", "ffmpeg": str(ee)[-300:]})
+                    raise
+                if not strategy or strategy == "narrated":
+                    with proc.timed() as t:
+                        tr = ai.transcribe_timed("audio.wav", wav.read_bytes(), duration_sec=info["duration"])
+                    proc.safe_record(
+                        db, "tutorial", job_id, "transcribe", "failed" if tr.get("error") else ("simulated" if tr.get("simulated") else "succeeded"),
+                        operation="transcribe_timed", provider="meta", model=tr.get("model", ""), duration_ms=t.ms, actor=actor,
+                        summary={"audio_sec": info["duration"], "text_chars": len(tr.get("text") or ""),
+                                 "segments": len(tr.get("segments") or []), "error": tr.get("error", ""),
+                                 "note": tr.get("note", "")})
+                    if tr.get("error"):
+                        raise RuntimeError(tr["error"])
+                    sufficient, detail = ai.assess_speech_sufficiency(
+                        tr.get("text") or "", tr.get("segments") or [], info["duration"])
+                    if sufficient:
+                        strategy, reason = "narrated", detail
+                        _set(db, job, full_transcript=tr["text"], timed_segments=tr["segments"], progress=30)
+                    elif input_mode == "auto":
+                        strategy, reason = "visual_first", detail + " — analyzing visible actions instead; transcript kept as supplementary context"
+                        _set(db, job, full_transcript=tr["text"], timed_segments=tr["segments"], progress=30)
+                    else:
+                        raise RuntimeError("No speech was transcribed. Check the microphone track and try again, or switch to Visual-First mode.")
+
+            _set(db, job, analysis_strategy=strategy, strategy_reason=reason)
             _set(db, job, status="understanding", progress=38)
-            with proc.timed() as t:
-                und = ai.understand_tutorial(tr["segments"], info["duration"])
-            objects, steps = und.get("objects", []), und.get("steps", [])
-            proc.safe_record(
-                db, "tutorial", job_id, "understand", "simulated" if und.get("simulated") else "succeeded",
-                operation="understand_tutorial", provider="meta", model=und.get("model", ""), duration_ms=t.ms, actor=actor,
-                summary={"objects": len(objects), "steps": len(steps),
-                         "labels": [o.get("label") for o in objects],
-                         "first_mentioned_at": [o.get("first_mentioned_at") for o in objects],
-                         "note": und.get("note", "")})
-            _set(db, job, objects=objects, steps=steps, progress=45)
+            objects: list = []
+            steps: list = []
+            if strategy == "visual_first":
+                frames = sample_keyframes(job_dir, source, info["duration"])
+                _set(db, job, keyframes=[{"t": f["t"], "name": f["name"]} for f in frames])
+                proc.safe_record(db, "tutorial", job_id, "understand", "succeeded",
+                                 operation="sample_keyframes", provider="", model="",
+                                 duration_ms=0, actor=actor,
+                                 summary={"frames": len(frames),
+                                          "timestamps": [f["t"] for f in frames]})
+                with proc.timed() as t:
+                    analysis = ai.analyze_tutorial_frames(
+                        [{"t": f["t"], "image": f["image"]} for f in frames],
+                        (tr.get("text") or "")[:2000], info["duration"])
+                objects, steps = _visual_objects_and_steps(analysis, duration_sec=info["duration"])
+                proc.safe_record(
+                    db, "tutorial", job_id, "understand",
+                    "simulated" if analysis.get("simulated") else "succeeded",
+                    operation="analyze_frames", provider="meta", model=analysis.get("model", ""),
+                    duration_ms=t.ms, actor=actor,
+                    summary={"analysis_mode": analysis.get("analysis_mode", "visual_first"),
+                             "frames": len(frames), "observations": len(analysis.get("observations") or []),
+                             "steps": len(steps), "objects": len(objects),
+                             "missing_information": analysis.get("missing_information") or [],
+                             "dropped": analysis.get("dropped") or [],
+                             "note": analysis.get("note", "")})
+                _set(db, job, objects=objects, steps=steps, progress=45)
+            else:
+                with proc.timed() as t:
+                    und = ai.understand_tutorial(tr["segments"], info["duration"])
+                objects, steps = und.get("objects", []), und.get("steps", [])
+                proc.safe_record(
+                    db, "tutorial", job_id, "understand", "simulated" if und.get("simulated") else "succeeded",
+                    operation="understand_tutorial", provider="meta", model=und.get("model", ""), duration_ms=t.ms, actor=actor,
+                    summary={"objects": len(objects), "steps": len(steps),
+                             "labels": [o.get("label") for o in objects],
+                             "first_mentioned_at": [o.get("first_mentioned_at") for o in objects],
+                             "note": und.get("note", "")})
+                _set(db, job, objects=objects, steps=steps, progress=45)
             if not objects:
                 _set(db, job, status="generating", progress=90)
                 fmt, fsrc, why = _format_for_job(job)
                 _set(db, job, guide_format=fmt, format_source=fsrc, format_rationale=why)
                 with proc.timed() as t:
-                    guide = ai.generate_guide(job.title, steps, objects, tr["segments"], guide_format=fmt)
-                md = guide.get("guide_markdown") or ai.fallback_guide_markdown(job.title, steps, objects, fmt)
+                    guide = ai.generate_guide(job.title, steps, objects, tr["segments"], guide_format=fmt, source_note=_guide_source_note(job))
+                md = guide.get("guide_markdown") or ai.fallback_guide_markdown(job.title, steps, objects, fmt, _guide_source_note(job))
                 md = inject_illustrations(md, steps, objects)
                 proc.safe_record(db, "tutorial", job_id, "guide", "simulated" if guide.get("simulated") else "succeeded",
                                  operation="generate_guide", provider="meta", model=guide.get("model", ""),
@@ -1199,8 +1400,8 @@ def run_job(job_id: str) -> None:
             fmt, fsrc, why = _format_for_job(job)
             _set(db, job, guide_format=fmt, format_source=fsrc, format_rationale=why)
             with proc.timed() as t:
-                guide = ai.generate_guide(job.title, steps, done_objects, tr["segments"], guide_format=fmt)
-            md = guide.get("guide_markdown") or ai.fallback_guide_markdown(job.title, steps, done_objects, fmt)
+                guide = ai.generate_guide(job.title, steps, done_objects, tr["segments"], guide_format=fmt, source_note=_guide_source_note(job))
+            md = guide.get("guide_markdown") or ai.fallback_guide_markdown(job.title, steps, done_objects, fmt, _guide_source_note(job))
             md = inject_illustrations(md, steps, done_objects)
             proc.safe_record(db, "tutorial", job_id, "guide", "simulated" if guide.get("simulated") else "succeeded",
                              operation="generate_guide", provider="meta", model=guide.get("model", ""),
