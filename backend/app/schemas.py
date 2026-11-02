@@ -60,6 +60,11 @@ class JobCreate(BaseModel):
     # supplied, job creation is idempotent on this id so queued events
     # referencing it can sync after reconnect.
     id: str | None = None
+    # Optional offline execution grant (see POST
+    # /api/procedure-versions/{vid}/offline-grant). Allows an offline job
+    # started against an approved revision to register after that revision
+    # was superseded. Ignored when the version is still approved.
+    offline_grant: str | None = None
 
 
 class JobEventIn(BaseModel):

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { authHeaders, authPost, getIdentity, getToken } from "./api";
+import { authHeaders, authPost, getIdentity } from "./api";
+import { checkStorageFor, queueTutorialUpload, runQueuedUpload, type AnalysisMode } from "./uploadQueue";
 import { listCameras, setPreferredCameraId, getPreferredCameraId, type CameraDevice } from "./camera";
 import { STATUS_LABELS, TUTORIAL } from "./museTutorialConfig";
 
@@ -17,7 +18,7 @@ interface TutObject {
   quality?: { crop_px?: number[]; issues?: string[]; needs_review?: boolean } | null;
   track?: { frame: number; objects: { object_id: number; bbox_norm: number[]; confidence?: number | null }[] }[];
 }
-interface TutStep { step_number: number; title: string; start: number; end: number; summary: string; objects_used: number[] }
+interface TutStep { step_number: number; title: string; start: number; end: number; summary: string; objects_used: number[]; evidence_frames?: number[]; confidence?: string; derivation?: string }
 interface TutSegment { text: string; start: number; end: number }
 interface ProcEvent { id: string; correlation_id: string; stage: string; operation: string; provider: string; model: string; status: string; duration_ms?: number | null; summary: Record<string, unknown>; created_at: string }
 
@@ -177,10 +178,11 @@ function Markdown({ text, resolveImage }: { text: string; resolveImage?: (src: s
   return <div>{blocks}</div>;
 }
 
-export default function TutorialMode({ onOpenReview, onOpenStudio, hideLibrary }: {
+export default function TutorialMode({ onOpenReview, onOpenStudio, hideLibrary, analysisMode }: {
   onOpenReview?: (versionId: string) => void;
   onOpenStudio?: (t: { id: string; access_token: string; title: string }) => void;
   hideLibrary?: boolean;
+  analysisMode?: AnalysisMode;
 }) {
   const [phase, setPhase] = useState<"record" | "review" | "processing" | "guide">("record");
   const [uploadFailed, setUploadFailed] = useState(false);
@@ -224,10 +226,13 @@ export default function TutorialMode({ onOpenReview, onOpenStudio, hideLibrary }
   const [micLevel, setMicLevel] = useState(0);
   const [audioInfo, setAudioInfo] = useState<{ tracks: number; muted: boolean; silent: boolean; mime: string } | null>(null);
   const startedRef = useRef(0);
-  const xhrRef = useRef<XMLHttpRequest | null>(null);
   const uploadingRef = useRef(false);
   const titleRef = useRef(title);
   titleRef.current = title;
+  const modeRef = useRef<AnalysisMode>(analysisMode || "auto");
+  modeRef.current = analysisMode || "auto";
+  const cancelRef = useRef({ cancelled: false });
+  const queuedKeyRef = useRef<string | null>(null);
   const uploadRef = useRef<((blob: Blob) => void) | null>(null);
 
   const loadPast = useCallback(async () => {
@@ -377,49 +382,48 @@ export default function TutorialMode({ onOpenReview, onOpenStudio, hideLibrary }
     setRecording(false);
   }
 
-  function upload(source?: Blob) {
+  async function upload(source?: Blob) {
     const blob = source || recorded?.blob;
     if (!blob || uploadingRef.current) return;
     uploadingRef.current = true;
     setUploadFailed(false);
     setUploadPct(0);
     setStatus("Uploading tutorial video…");
-    const idn = getIdentity();
+    cancelRef.current = { cancelled: false };
     // Normalize to the base media type: browsers report codec-qualified
     // strings (e.g. "video/webm;codecs=vp8,opus") that servers may reject.
     const mime = (blob.type || "video/webm").split(";")[0].trim().toLowerCase();
     const isMp4 = mime === "video/mp4";
-    const fd = new FormData();
-    fd.append("file", new File([blob], isMp4 ? "tutorial.mp4" : "tutorial.webm", { type: isMp4 ? "video/mp4" : "video/webm" }));
-    fd.append("title", titleRef.current);
-    const xhr = new XMLHttpRequest();
-    xhrRef.current = xhr;
-    xhr.open("POST", `${API}/api/tutorial/start`);
-    xhr.setRequestHeader("X-User", idn.user);
-    xhr.setRequestHeader("X-Role", idn.role);
-    const _tok = getToken();
-    if (_tok) xhr.setRequestHeader("X-Auth-Token", _tok);
-    xhr.upload.onprogress = (e) => { if (e.lengthComputable) setUploadPct(Math.round((e.loaded / e.total) * 100)); };
-    xhr.onload = () => {
-      xhrRef.current = null; uploadingRef.current = false;
+    try {
+      const store = await checkStorageFor(blob.size);
+      if (!store.ok) throw new Error(store.message);
+      // Queue first: the blob survives reloads until the server confirms.
+      const queued = await queueTutorialUpload({
+        blob,
+        filename: isMp4 ? "tutorial.mp4" : "tutorial.webm",
+        title: titleRef.current, mode: modeRef.current, origin: "recorded",
+      });
+      queuedKeyRef.current = queued.key;
+      const body = await runQueuedUpload(queued, setUploadPct, cancelRef.current);
+      uploadingRef.current = false;
       setUploadPct(null);
-      try {
-        const body = JSON.parse(xhr.responseText) as TutJob & { detail?: string };
-        if (xhr.status >= 400) throw new Error(body.detail || `Upload failed (${xhr.status})`);
-        setJob(body);
-        setPhase(body.status === "done" ? "guide" : "processing");
-        setStatus(body.cached ? "This exact video was already processed — opening the existing guide." : "");
-        void loadPast();
-      } catch (e) { setUploadFailed(true); setPhase("review"); setStatus(e instanceof Error ? e.message : "Upload failed"); }
-    };
-    xhr.onerror = () => { xhrRef.current = null; uploadingRef.current = false; setUploadPct(null); setUploadFailed(true); setPhase("review"); setStatus("Upload failed — check the connection and retry. Your recording is still here."); };
-    xhr.onabort = () => { xhrRef.current = null; uploadingRef.current = false; setUploadPct(null); setPhase("review"); setStatus("Upload cancelled. Your recording is still here — retry when you're ready."); };
-    xhr.send(fd);
+      queuedKeyRef.current = null;
+      setJob(body as unknown as TutJob);
+      setPhase(body.status === "done" ? "guide" : "processing");
+      setStatus(body.cached ? "This exact video was already processed — opening the existing guide." : "");
+      void loadPast();
+    } catch (e) {
+      uploadingRef.current = false;
+      setUploadPct(null);
+      setUploadFailed(true);
+      setPhase("review");
+      setStatus(e instanceof Error ? e.message : "Upload failed — your recording is queued on this device.");
+    }
   }
   uploadRef.current = upload;
 
   function cancelUpload() {
-    xhrRef.current?.abort();
+    cancelRef.current.cancelled = true;
   }
 
   async function openPast(p: { id: string; access_token: string }) {
@@ -768,6 +772,15 @@ export default function TutorialMode({ onOpenReview, onOpenStudio, hideLibrary }
                         <h4 style={{ margin: "0 0 6px" }}>{s.step_number}. {s.title}</h4>
                         <p>{s.summary}</p>
                         <button className="btn small secondary" onClick={() => seek(s.start)}>▶ {fmt(s.start)}–{fmt(s.end)}</button>
+                        {(s.evidence_frames || []).length > 0 && (
+                          <span style={{ marginLeft: 6 }}>
+                            {(s.evidence_frames || []).map((t) => (
+                              <button key={t} className="btn small secondary" title={`Jump to supporting frame at ${fmt(t)}`} onClick={() => seek(t)} style={{ marginLeft: 4 }}>
+                                <span className="num">▣ {fmt(t)}</span>
+                              </button>
+                            ))}
+                          </span>
+                        )}
                       </div>
                     </div>
                   </div>

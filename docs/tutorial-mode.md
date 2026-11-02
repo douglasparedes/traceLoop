@@ -1,17 +1,50 @@
 # TutorialMode + Tutorial Studio
 
-Record a 2–10 minute tutorial (camera + mic, in-browser
-`MediaRecorder`), upload it, and get back a shareable guide — then
+Record a 2-10 minute tutorial (camera + mic, in-browser
+`MediaRecorder`), **or upload an existing MP4/WebM/MOV/MKV file** (same
+endpoint, same pipeline), and get back a shareable guide - then
 refine everything in **Tutorial Studio** (Overview / Content / Guide /
 Video / Visuals). Tutorials live in a persistent library under the
-Tutorials destination, independent of the recording phase.
+Tutorials destination, independent of the recording phase. Uploaded
+files are queued on-device first and only removed after the server
+confirms persistence.
+
+## Input modes and visual-first understanding
+
+`POST /api/tutorial/start` accepts `mode`: `auto` (default), `narrated`,
+or `visual_first`, plus optional `equipment_name`, `task_description`,
+`context_notes`, and `origin` (`recorded`/`uploaded`).
+
+- **Narrated** (previous behavior): transcription is required; silent or
+  empty results fail with an actionable error, unchanged.
+- **Visual-First**: narration is optional supplementary context. The
+  pipeline samples timestamped keyframes and calls
+  `ai.analyze_tutorial_frames` (Muse Spark multimodal chat with ordered
+  JPEG frames + JSON schema; deterministic labelled fallback offline),
+  producing candidate steps with `evidence_frames`, `confidence`, and
+  `derivation: "visual"`. Steps flow through the same SAM segmentation,
+  guide generation, draft, review, and video stages.
+- **Automatic**: speech sufficiency is assessed (length, segment count,
+  density); weak narration routes to visual-first while keeping any
+  partial transcript as supplementary context. No-audio recordings never
+  fail in auto mode.
+
+Candidate steps are validated (timestamps clamped to duration, invalid
+entries dropped with reasons in provenance) and carry uncertainties;
+safety-critical details are never invented — missing evidence is an
+explicit `missing_information` item for the reviewer. Studio shows the
+selected strategy; visually-derived steps link to their sampled keyframes
+(`GET /api/tutorial/{jid}/keyframes/{name}`).
 
 ## Pipeline (all server-side, async with progress polling)
 
 1. `POST /api/tutorial/start` (multipart video + title, upload progress
    in the UI). Identical re-uploads return the cached finished guide.
+   Uploads stream to disk in 1 MB chunks (never fully in RAM) with an
+   incremental checksum, enforced 300 MB cap, atomic rename, and temp
+   cleanup on every path.
 2. Background job (`tutorial_jobs` table, thread worker):
-   - **Transcribe** — audio demuxed with bundled ffmpeg to WAV mono
+   - **Transcribe** - audio demuxed with bundled ffmpeg to WAV mono
      24kHz, then Muse Voice Transcribe
      (`muse-voice-transcribe-1.0`) in `ENDPOINTING` mode.
      **Muse Voice returns turn-level timestamps only**

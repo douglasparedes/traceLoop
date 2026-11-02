@@ -29,8 +29,8 @@ def _patch(monkeypatch):
     monkeypatch.setattr(tutorial, "extract_audio_wav", lambda s, o: o.write_bytes(b"wav"))
     monkeypatch.setattr(tutorial, "make_tracking_copy", lambda s, o, max_width=512: (o.write_bytes(b"mp4"), {"width": 320, "height": 240})[1])
     monkeypatch.setattr(ai, "transcribe_timed", lambda fn, data, duration_sec=0: {
-        "text": "This is my flag. Hold it up.", "simulated": False,
-        "segments": [{"text": "This is my flag.", "start": 1.0, "end": 4.0}]})
+        "text": "This is my flag. I hold it up high so you can see the whole component clearly while I explain each part of the repair task.", "simulated": False,
+        "segments": [{"text": "This is my flag. I hold it up high so you can see the whole component clearly.", "start": 1.0, "end": 4.0}, {"text": "I explain each part of the repair task as I show it.", "start": 4.0, "end": 8.0}]})
     monkeypatch.setattr(ai, "understand_tutorial", lambda segs, dur: {
         "objects": [{"label": "flag", "first_mentioned_at": 1.0, "obj_id": 1, "status": "pending"}],
         "steps": [{"step_number": 1, "title": "Show the flag", "start": 0.0, "end": 8.0,
@@ -51,7 +51,7 @@ def _patch(monkeypatch):
         (job_dir / "obj-1-overlay.png").write_bytes(_TINY_PNG)
         return {"illustration": "obj-1.png", "overlay": "obj-1-overlay.png"}
     monkeypatch.setattr(tutorial, "make_illustrations", _fake_illu)
-    monkeypatch.setattr(ai, "generate_guide", lambda title, steps, objects, segs, guide_format="work_instruction": {
+    monkeypatch.setattr(ai, "generate_guide", lambda title, steps, objects, segs, guide_format="work_instruction", **kw: {
         "guide_markdown": f"# {title}\n\nfmt:{guide_format}", "materials": ["flag"], "simulated": False})
 
 
