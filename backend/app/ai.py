@@ -187,8 +187,130 @@ def generate_draft(title: str, task_description: str, transcript: str, manual_ex
 
 # ---------------------------------------------------------------- Voice
 
+# Provider limits (dev.meta.ai/docs, Transcribe): WAV must be RIFF/WAVE mono
+# integer PCM at 16 or 24 kHz; audio over 10 minutes -> HTTP 400; request
+# body over 32 MB -> HTTP 413; 429 = rate/concurrency limit (backoff);
+# 500 = transient (retry once). Error bodies carry a client-safe message
+# with `type`, plus `code`/`param` when available — we surface those instead
+# of bare exception names.
+PROVIDER_MAX_AUDIO_SEC = 600
+PROVIDER_MAX_BODY_BYTES = 32 * 1024 * 1024
+
+
+def _wav_info(data: bytes) -> tuple[bool, str, dict]:
+    """Validate a server-acceptable WAV without trusting the container.
+
+    Checks the RIFF/WAVE header, fmt chunk (mono, 16-bit integer PCM,
+    16 or 24 kHz), and that the data chunk holds a usable amount of audio.
+    Returns (ok, reason, info). Never raises.
+    """
+    info: dict = {"channels": 0, "sample_rate": 0, "bits": 0, "seconds": 0.0}
+    try:
+        if len(data) < 44 or data[0:4] != b"RIFF" or data[8:12] != b"WAVE":
+            return False, "not a RIFF/WAVE file", info
+        pos, fmt = 12, None
+        data_len = 0
+        while pos + 8 <= len(data):
+            tag, size = data[pos:pos + 4], int.from_bytes(data[pos + 4:pos + 8], "little")
+            body = data[pos + 8:pos + 8 + size]
+            if tag == b"fmt " and len(body) >= 16:
+                audio_fmt = int.from_bytes(body[0:2], "little")
+                channels = int.from_bytes(body[2:4], "little")
+                rate = int.from_bytes(body[4:8], "little")
+                bits = int.from_bytes(body[14:16], "little")
+                fmt = {"audio_format": audio_fmt, "channels": channels,
+                       "sample_rate": rate, "bits": bits}
+            elif tag == b"data":
+                data_len = size
+            if tag == b"fmt ":
+                pass
+            pos += 8 + size + (size % 2)
+            if fmt is not None and data_len:
+                break
+        if fmt is None:
+            return False, "WAV has no format chunk", info
+        if fmt["audio_format"] != 1:
+            return False, f"WAV is not integer PCM (format {fmt['audio_format']})", info
+        if fmt["channels"] != 1:
+            return False, f"WAV has {fmt['channels']} channels, mono required", info
+        if fmt["sample_rate"] not in (16000, 24000):
+            return False, f"WAV sample rate is {fmt['sample_rate']} Hz, need 16 or 24 kHz", info
+        if fmt["bits"] != 16:
+            return False, f"WAV is {fmt['bits']}-bit, need 16-bit", info
+        seconds = data_len / max(1, (fmt["sample_rate"] * fmt["channels"] * fmt["bits"] // 8))
+        info.update({"channels": fmt["channels"], "sample_rate": fmt["sample_rate"],
+                     "bits": fmt["bits"], "seconds": round(seconds, 1)})
+        if seconds < 1.0:
+            return False, f"WAV holds only {seconds:.1f}s of audio — nothing usable to transcribe", info
+        return True, "", info
+    except Exception as e:
+        return False, f"unreadable WAV header ({type(e).__name__})", info
+
+
+def _provider_error(op: str, e: Exception) -> tuple[str, str, bool]:
+    """Turn a provider exception into (message, note, retryable).
+
+    Reads the response body for the documented client-safe error (message,
+    type/code) instead of surfacing a bare exception name. Deterministic
+    4xx failures are NOT retryable; 429/5xx are transient. Never includes
+    secrets — only status code and the provider's public message.
+    """
+    status = getattr(getattr(e, "response", None), "status_code", None)
+    body_text = ""
+    try:
+        raw = getattr(getattr(e, "response", None), "text", "") or ""
+        body_text = str(raw)[:500]
+    except Exception:
+        body_text = ""
+    provider_msg, err_type = "", ""
+    if body_text:
+        try:
+            parsed = json.loads(body_text)
+            if isinstance(parsed, dict):
+                err = parsed.get("error", parsed)
+                if isinstance(err, dict):
+                    provider_msg = str(err.get("message", "") or "")[:300]
+                    err_type = str(err.get("type", "") or parsed.get("type", "") or "")
+                    code = str(err.get("code", "") or parsed.get("code", "") or "")
+                    if code and code not in provider_msg:
+                        provider_msg = f"{provider_msg} (code: {code})".strip()
+                else:
+                    provider_msg = str(err)[:300]
+        except Exception:
+            pass
+    if status == 400:
+        if provider_msg:
+            msg = f"Transcription failed (HTTP 400): {provider_msg}."
+        else:
+            msg = ("Transcription failed (HTTP 400): the provider rejected the audio "
+                   "(unsupported WAV, or audio over the 10-minute limit).")
+        hint = (" If the recording is longer than 10 minutes, split it or use Visual-First mode, "
+                "which does not need transcription.")
+        return msg + hint, (f"provider 400 type={err_type or 'unknown'}: {provider_msg or body_text[:200]}"), False
+    if status == 413:
+        return ("Transcription failed (HTTP 413): the request body exceeds the provider's 32 MB limit. "
+                "Split the recording into shorter clips or use Visual-First mode.", "provider 413: body too large", False)
+    if status == 429:
+        return ("Transcription failed (HTTP 429): rate or concurrency limit reached. "
+                "Wait a minute and retry processing.", "provider 429: rate limited", True)
+    if status and status >= 500:
+        return (f"Transcription failed (HTTP {status}): the provider hit an internal error. "
+                "Retry once; if it persists, contact support with the session id from diagnostics.",
+                f"provider {status}: {provider_msg or body_text[:200]}", True)
+    if status in (401, 403):
+        return (f"Transcription failed (HTTP {status}): the API key was rejected. "
+                "Check META_API_KEY and retry.", f"provider auth {status}", False)
+    return (f"Transcription failed ({type(e).__name__}{f' HTTP {status}' if status else ''}"
+            f"{': ' + provider_msg if provider_msg else ''}).",
+            f"{type(e).__name__}{f' HTTP {status}' if status else ''}: {provider_msg or body_text[:200]}", False)
+
+
 def _to_wav(data: bytes, filename: str) -> bytes:
-    """Convert browser audio to mono 16-bit PCM WAV @24kHz via bundled ffmpeg."""
+    """Convert browser audio to mono 16-bit PCM WAV @24kHz via bundled ffmpeg.
+
+    Accepts regular video containers (mp4/webm/mov/mkv): -vn drops video
+    streams (incl. cover art) so only the audio track is converted.
+    """
     import imageio_ffmpeg
 
     suffix = Path(filename or "audio.webm").suffix or ".webm"
@@ -198,7 +320,7 @@ def _to_wav(data: bytes, filename: str) -> bytes:
         src.write_bytes(data)
         exe = imageio_ffmpeg.get_ffmpeg_exe()
         proc = subprocess.run(
-            [exe, "-y", "-i", str(src), "-ac", "1", "-ar", "24000", "-c:a", "pcm_s16le", "-map_metadata", "-1", str(dst)],
+            [exe, "-y", "-i", str(src), "-vn", "-ac", "1", "-ar", "24000", "-c:a", "pcm_s16le", "-map_metadata", "-1", str(dst)],
             capture_output=True, timeout=120,
         )
         if proc.returncode != 0 or not dst.exists():
@@ -221,6 +343,11 @@ def transcribe_audio(filename: str, data: bytes) -> dict:
         wav = data if data[:4] == b"RIFF" else _to_wav(data, filename)
     except Exception as e:
         return {"text": "", "simulated": False, "error": f"Audio conversion to WAV failed ({type(e).__name__}). Record again or paste the transcript.", "model": VOICE_MODEL}
+    ok, reason, info = _wav_info(wav)
+    if not ok:
+        return {"text": "", "simulated": False,
+                "error": f"Transcription failed: {reason}. Convert the recording to mono 16-bit PCM WAV (16 or 24 kHz) or record again.",
+                "note": f"local WAV validation failed: {reason}", "model": VOICE_MODEL, "fallback_visual": True}
     try:
         r = httpx.post(
             f"{META_BASE_URL}/asr/transcribe?sessionId={uuid.uuid4()}",
@@ -236,9 +363,8 @@ def transcribe_audio(filename: str, data: bytes) -> dict:
         text = body.get("transcript") or " ".join(t.get("transcript", "") for t in body.get("turns", [])).strip()
         return {"text": text, "simulated": False, "model": VOICE_MODEL, "raw_keys": list(body.keys())}
     except Exception as e:  # recoverable provider failure
-        status = getattr(getattr(e, "response", None), "status_code", None)
-        detail = f" HTTP {status}" if status else ""
-        return {"text": "", "simulated": False, "error": f"Transcription failed: {type(e).__name__}{detail}", "model": VOICE_MODEL}
+        msg, note, _retryable = _provider_error("transcribe", e)
+        return {"text": "", "simulated": False, "error": msg, "note": note, "model": VOICE_MODEL}
 
 
 # ---------------------------------------------------------------- SAM 3.1
@@ -695,6 +821,23 @@ def transcribe_timed(filename: str, data: bytes, duration_sec: float = 0) -> dic
         wav = data if data[:4] == b"RIFF" else _to_wav(data, filename)
     except Exception as e:
         return {"text": "", "segments": [], "simulated": False, "error": f"Audio conversion failed ({type(e).__name__})", "model": VOICE_MODEL}
+    ok, reason, info = _wav_info(wav)
+    if not ok:
+        return {"text": "", "segments": [], "simulated": False, "model": VOICE_MODEL,
+                "error": (f"Transcription failed: {reason}. The provider only accepts mono 16-bit PCM WAV "
+                          f"(16 or 24 kHz) with real audio content."),
+                "note": f"local WAV validation failed: {reason}", "fallback_visual": True}
+    if info.get("seconds", 0) > PROVIDER_MAX_AUDIO_SEC:
+        return {"text": "", "segments": [], "simulated": False, "model": VOICE_MODEL,
+                "error": (f"Transcription failed: this recording holds ~{int(info['seconds'] // 60)} min of audio, "
+                          f"over the provider's 10-minute transcription limit. Split it into shorter clips or use "
+                          f"Visual-First mode, which does not need transcription."),
+                "note": f"local WAV validation: {info['seconds']}s exceeds provider 600s cap", "fallback_visual": True}
+    if len(wav) > PROVIDER_MAX_BODY_BYTES:
+        return {"text": "", "segments": [], "simulated": False, "model": VOICE_MODEL,
+                "error": ("Transcription failed: the extracted audio exceeds the provider's 32 MB request limit. "
+                          "Split the recording into shorter clips or use Visual-First mode."),
+                "note": f"local WAV validation: {len(wav)} bytes exceeds provider 32MB cap", "fallback_visual": True}
     try:
         r = httpx.post(
             f"{META_BASE_URL}/asr/transcribe?sessionId={uuid.uuid4()}",
@@ -721,9 +864,16 @@ def transcribe_timed(filename: str, data: bytes, duration_sec: float = 0) -> dic
         return {"text": text, "segments": segments, "simulated": False, "model": VOICE_MODEL,
                 "audio_duration_ms": body.get("audioDurationMs")}
     except Exception as e:
-        status = getattr(getattr(e, "response", None), "status_code", None)
-        detail = f" HTTP {status}" if status else ""
-        return {"text": "", "segments": [], "simulated": False, "error": f"Transcription failed: {type(e).__name__}{detail}", "model": VOICE_MODEL}
+        msg, note, retryable = _provider_error("transcribe", e)
+        out: dict = {"text": "", "segments": [], "simulated": False, "error": msg,
+                     "note": note, "model": VOICE_MODEL, "retryable": retryable}
+        # Deterministic provider rejections (bad audio, over limits) can still
+        # yield a useful tutorial via visual analysis — flag that, never hide it.
+        if not retryable:
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status in (400, 413):
+                out["fallback_visual"] = True
+        return out
 
 
 _UNDERSTAND_SCHEMA = {
