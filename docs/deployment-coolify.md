@@ -74,7 +74,7 @@ follow-up; until then treat all data on the public URL as shared demo data.
    service worker and security cards should be green. The repo already ships:
    192/512 `any` + maskable icons, `screenshots` (narrow + wide, real captures),
    `categories`, `display_override`, precached app shell. The service worker
-   (`public/sw.js`, v5) also runtime-caches evidence/reference images and
+   (`public/sw.js`, v6) also runtime-caches evidence/reference images and
    tutorial/live videos (cache-first, ~120-entry cap, token URLs normalized),
    uses navigation preload for faster online navigations, and serves the
    offline-capable app shell for failed navigations — while `/api/*` JSON stays
@@ -85,6 +85,18 @@ follow-up; until then treat all data on the public URL as shared demo data.
    activates on Reload, never mid-job.
 3. Install prompt: Chrome desktop (⊕ icon) and Android (“Install app”).
    Smoke test: install → airplane mode → app opens, queued work syncs later.
+4. Install the PWA from the same origin that serves the API (single-service
+   image above). If the app is opened from a standalone static host or a
+   stale deployment while `/api` points elsewhere, uploads fail with an
+   "answered with a web page instead of data" error — the upload path now
+   says this explicitly instead of a raw JSON `SyntaxError`, and the file
+   stays queued for retry.
+5. Upload limits in front of the app: the in-app cap is 300 MB, but
+   proxies/CDNs enforce their own (e.g. Cloudflare free ≈ 100 MB,
+   Traefik `client_max_body_size` equivalents). An HTML 413 from a proxy
+   surfaces as "rejected as too large before reaching TraceLoop" with a
+   retry-safe queued copy — lower the proxy limit expectation or upload
+   over Wi-Fi with a trimmed file if you hit it.
 
 ## 3. Android TWA (after the site is live and PWABuilder is green)
 
