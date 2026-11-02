@@ -21,7 +21,7 @@ Capture → Record a tutorial: allow camera + mic (watch the mic-level meter mov
 
 Upload or record a video with no narration (or one short sentence) in Automatic mode. The pipeline detects insufficient speech and switches to **visual-first**: keyframes are sampled, Muse Spark describes observable actions [live] (or the labelled deterministic fallback offline), and candidate steps carry evidence-frame links plus low confidence — never fabricated transcripts. Studio → Overview shows the analysis strategy; Content shows visually-derived steps with frame links; Review shows transcript evidence where narration exists and frame evidence where it doesn't.
 
-Troubleshooting uploads: if an upload fails, the app now says *why* instead of a raw JSON error — a proxy/CDN 413 (“rejected as too large before reaching TraceLoop”: trim the file or use Wi-Fi), an HTML 200 (“talking to the wrong address”: open/install the PWA from the API server itself), or sign-in expiry. The file always stays queued on-device for retry.
+Troubleshooting uploads: large videos upload in 4 MB chunks, so per-request proxy limits no longer block them - a dropped connection simply resumes from the last confirmed byte instead of restarting. If an upload still fails, the app says why instead of a raw JSON error (wrong server address, sign-in expiry, or an unreadable proxy page), and the file stays queued on-device for retry.
 
 ## 2. Three formats (1 min)
 

@@ -347,6 +347,35 @@ class TutorialJob(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
 
 
+class TutorialUploadSession(Base):
+    """Chunked-upload session: a large tutorial video arrives as small,
+    offset-addressed chunks so per-request proxy/CDN size caps stop mattering.
+
+    Chunks are appended to one temp file; completion verifies total size +
+    client sha256, then atomically moves the file into place and creates the
+    TutorialJob — the same record a single-shot upload would create. Rows in
+    status "open" older than UPLOAD_SESSION_TTL_SEC are swept with their
+    temp files; completing or aborting removes the session.
+    """
+    __tablename__ = "tutorial_upload_sessions"
+    id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
+    actor: Mapped[str] = mapped_column(String, default="")
+    filename: Mapped[str] = mapped_column(String, default="tutorial.mp4")
+    mime_type: Mapped[str] = mapped_column(String, default="video/mp4")
+    total_size: Mapped[int] = mapped_column(Integer, default=0)
+    sha256: Mapped[str] = mapped_column(String, default="")
+    title: Mapped[str] = mapped_column(String, default="Untitled tutorial")
+    equipment_name: Mapped[str] = mapped_column(String, default="")
+    task_description: Mapped[str] = mapped_column(Text, default="")
+    context_notes: Mapped[str] = mapped_column(Text, default="")
+    input_mode: Mapped[str] = mapped_column(String, default="auto")
+    origin: Mapped[str] = mapped_column(String, default="uploaded")
+    received_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    status: Mapped[str] = mapped_column(String, default="open")  # open|complete|aborted
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=now, onupdate=now)
+
+
 class TutorialContentRevision(Base):
     """Versioned working draft of editable canonical tutorial content.
 
