@@ -199,4 +199,99 @@ def test_finish_requires_owner_or_reviewer():
     assert c.post(f"/api/jobs/{job['id']}/finish", json={"outcome": "completed", "reason": "", "summary": ""},
                   headers=TECH2).status_code == 403
     assert c.post(f"/api/jobs/{job['id']}/finish", json={"outcome": "completed", "reason": "", "summary": ""},
-                  headers=REV).status_code == 200
+                  headers=REV).status_code == 422  # coverage enforced, not blindly finished
+
+
+def _finish_all_but(job, ver, skip=(), block=()):
+    evs = []
+    for i, s in enumerate(ver["steps"]):
+        if i in skip:
+            kind = "step_skipped"
+        elif i in block:
+            kind = "step_blocked"
+        else:
+            kind = "step_completed"
+        evs.append({"event_id": f"evt:{job['id']}:{s['id']}:{kind}", "session_id": job["id"],
+                    "step_id": s["id"], "event_type": kind, "payload": {},
+                    "occurred_at": "2026-01-01T00:00:00Z"})
+    return evs
+
+
+def test_blocked_step_halts_normal_finish():
+    p, ver = _seed()
+    job = _start_job(p)
+    _sync(_finish_all_but(job, ver, block=[2]))
+    last = ver["steps"][-1]
+    r = c.post(f"/api/jobs/{job['id']}/finalize",
+               json={"step_id": last["id"], "event_id": "e-halt", "reason": ""}, headers=TECH)
+    assert r.status_code == 422, r.text
+    assert "blocked" in r.json()["detail"].lower()
+    st = c.get(f"/api/jobs/{job['id']}/state").json()
+    assert st["requires_exceptional_close"] is True
+    assert st["can_finalize_normally"] is False
+    assert st["blocked_step_orders"] == [3]
+
+
+def test_exceptional_close_needs_reason_and_audit():
+    p, ver = _seed()
+    job = _start_job(p)
+    _sync(_finish_all_but(job, ver, block=[1]))
+    last = ver["steps"][-1]
+    no_reason = c.post(f"/api/jobs/{job['id']}/finalize",
+                       json={"step_id": last["id"], "event_id": "e-exc", "reason": "",
+                             "exceptional_close": True}, headers=TECH)
+    assert no_reason.status_code == 422
+    # Another technician cannot exceptionally close someone else's halted job.
+    other = c.post(f"/api/jobs/{job['id']}/finalize",
+                   json={"step_id": last["id"], "event_id": "e-exc2", "reason": "x",
+                         "exceptional_close": True}, headers=TECH2)
+    assert other.status_code == 403
+    # The assigned tech closes with a reason; incident stays in history.
+    r = c.post(f"/api/jobs/{job['id']}/finalize",
+               json={"step_id": last["id"], "event_id": "e-exc3",
+                     "reason": "Sealant unavailable on site; verified by reviewer call",
+                     "exceptional_close": True}, headers=TECH)
+    assert r.status_code == 200, r.text
+    assert r.json() == {"ok": True, "outcome": "finished-with-exceptions"}
+
+
+def test_finish_adapter_enforces_coverage_and_outcome():
+    p, ver = _seed()
+    job = _start_job(p)
+    _sync(_finish_all_but(job, ver, skip=[4]))
+    # Legacy path computes the outcome server-side instead of trusting it.
+    r = c.post(f"/api/jobs/{job['id']}/finish",
+               json={"outcome": "completed", "reason": "", "summary": ""}, headers=TECH)
+    assert r.status_code == 200, r.text
+    assert r.json()["outcome"] == "finished-with-exceptions"
+    # Unfinished coverage is rejected rather than silently finished.
+    job2 = _start_job(p)
+    _sync([])
+    r2 = c.post(f"/api/jobs/{job2['id']}/finish",
+                json={"outcome": "completed", "reason": "", "summary": ""}, headers=TECH)
+    assert r2.status_code == 422, r2.text
+
+
+def test_concurrent_finalize_is_safe():
+    import threading
+    p, ver = _seed()
+    job = _start_job(p)
+    _sync(_finish_all_but(job, ver))
+    last = ver["steps"][-1]
+    results = []
+
+    def attempt(n):
+        r = c.post(f"/api/jobs/{job['id']}/finalize",
+                   json={"step_id": last["id"], "event_id": f"e-race-{n}", "reason": ""}, headers=TECH)
+        results.append(r.json())
+
+    ts = [threading.Thread(target=attempt, args=(n,)) for n in range(4)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert len(results) == 4
+    assert all(r.get("ok") for r in results)
+    outcomes = {r.get("outcome") for r in results}
+    assert outcomes == {"completed"}
+    st = c.get(f"/api/jobs/{job['id']}/state").json()
+    assert st["finished"] is True
+    assert st["events"] == 5  # exactly one step_completed per step, no duplicates

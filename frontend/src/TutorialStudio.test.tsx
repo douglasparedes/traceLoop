@@ -102,6 +102,20 @@ describe("TutorialStudio", () => {
     expect(screen.queryByRole("heading", { name: "Transcript" })).not.toBeInTheDocument();
   });
 
+  it("clears the unsaved badge when values are restored", async () => {
+    mockStudio([]);
+    const user = userEvent.setup();
+    render(<TutorialStudio item={item} onBack={() => undefined} onOpenReview={() => undefined} notify={() => undefined} />);
+    await screen.findByRole("heading", { name: "Seal check" });
+    expect(screen.getByText("saved")).toBeInTheDocument();
+    await user.type(screen.getByLabelText("Title"), "!");
+    expect(await screen.findByText("unsaved changes")).toBeInTheDocument();
+    // Restoring the original value returns the contract to clean.
+    await user.clear(screen.getByLabelText("Title"));
+    await user.type(screen.getByLabelText("Title"), "Seal check");
+    await waitFor(() => expect(screen.getByText("saved")).toBeInTheDocument());
+  });
+
   it("shows the analysis strategy and visual derivation with frame links", async () => {
     mockStudio([]);
     const user = userEvent.setup();

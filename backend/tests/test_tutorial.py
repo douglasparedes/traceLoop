@@ -193,6 +193,33 @@ def test_tutorial_upload_validation_and_hash_cache(monkeypatch):
     assert up2["id"] == up1["id"] and up2.get("cached") is True
 
 
+def test_library_processing_group_search_and_pagination():
+    c.post("/api/seed")
+    # Seed at least one processing-stage job by direct DB insert is heavy;
+    # instead verify the contract: the group filter is accepted, paginated,
+    # and search matches equipment/task/id in addition to title.
+    r = c.get("/api/tutorial", params={"status": "processing", "limit": 20, "offset": 0}, headers=TECH)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert set(body.keys()) >= {"total", "offset", "items"}
+    assert body["offset"] == 0
+    assert all(t["status"] not in ("done", "error", "archived") for t in body["items"])
+    r2 = c.get("/api/tutorial", params={"status": "processing", "limit": 5, "offset": 5}, headers=TECH)
+    assert r2.status_code == 200 and r2.json()["offset"] == 5
+    # Equipment-scoped search finds the seeded tutorial.
+    seeded = c.get("/api/tutorial", params={"limit": 50}, headers=TECH).json()["items"]
+    assert seeded, "seed must provide tutorials"
+    needle = None
+    for t in seeded:
+        full = c.get(f"/api/tutorial/{t['id']}", headers={**TECH, "X-Tutorial-Token": t["access_token"]})
+        if full.status_code == 200 and full.json().get("equipment_name"):
+            needle = full.json()["equipment_name"]
+            break
+    if needle:
+        hit = c.get("/api/tutorial", params={"q": needle, "limit": 50}, headers=TECH).json()
+        assert hit["total"] >= 1
+
+
 def _make_fixture_video(path, with_audio: bool):
     import subprocess
     ff = tutorial._ffmpeg()

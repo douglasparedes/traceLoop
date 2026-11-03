@@ -69,4 +69,33 @@ describe("primary navigation", () => {
     expect(screen.queryByRole("button", { name: /^Live$/ })).not.toBeInTheDocument();
     expect(screen.queryByRole("group", { name: /Capture mode/ })).not.toBeInTheDocument();
   });
+
+  it("workbench groups active work, attention, ready procedures, and completed jobs", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation((async (url: unknown) => {
+      const u = String(url);
+      let body: unknown = {};
+      if (u.endsWith("/api/auth/status")) body = { auth_enabled: false };
+      else if (u.endsWith("/api/procedures")) body = [{
+        id: "p1", title: "Reseat the seal", favorite: false, updated_at: "2026-10-20T10:00:00",
+        asset_type: "Pump", approved_version_id: "v1", has_pending_review: false,
+        versions: [{ id: "v1", version_number: 2, status: "approved" }, { id: "v2", version_number: 3, status: "draft" }],
+      }];
+      else if (u.endsWith("/api/jobs")) body = [
+        { id: "j1", procedure_title: "Reseat the seal", status: "finished", outcome: "completed", started_at: "2026-10-20T10:00:00", events: 5 },
+      ];
+      else if (u.includes("/api/tutorial?")) body = { total: 0, items: [] };
+      return { ok: true, status: 200, json: async () => body };
+    }) as typeof fetch);
+    render(<App />);
+    // Sectioned, predictable hierarchy with consistent status language.
+    expect(await screen.findByRole("region", { name: "My active work" })).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Needs attention" })).toBeInTheDocument();
+    expect(screen.getByText(/All clear/)).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Ready to start" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Start job" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /View procedure/ })).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "Recently completed" })).toBeInTheDocument();
+    expect(screen.getByText("Completed")).toBeInTheDocument();
+    expect(screen.queryByText("Pass")).not.toBeInTheDocument();
+  });
 });

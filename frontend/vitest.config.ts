@@ -6,5 +6,8 @@ export default defineConfig({
   test: {
     environment: "jsdom",
     setupFiles: ["./src/test-setup.ts"],
+    // Playwright browser specs live in ./smoke and run via `playwright test`,
+    // never under vitest (they need real browsers + a running server).
+    exclude: ["smoke/**", "node_modules/**"],
   },
 });

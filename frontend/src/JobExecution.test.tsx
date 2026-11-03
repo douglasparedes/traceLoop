@@ -132,9 +132,10 @@ describe("guided execution primary action", () => {
     await seed();
     const user = userEvent.setup();
     render(<App />);
-    await user.click(await screen.findByRole("button", { name: /Resume step 1/ }));
+    await user.click(await screen.findByRole("button", { name: /Continue job/ }));
     // Primary action advances the frontier step.
     expect(await screen.findByRole("button", { name: /Next step/ })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Finish job/ })).not.toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: /Next step/ }));
     expect(await screen.findByText("Step 2 of 3")).toBeInTheDocument();
     // Tracker reflects recorded state, not the view index.
@@ -165,7 +166,7 @@ describe("guided execution primary action", () => {
     await seed();
     render(<App />);
     const user = userEvent.setup();
-    await user.click(await screen.findByRole("button", { name: /Resume step 1/ }));
+    await user.click(await screen.findByRole("button", { name: /Continue job/ }));
     const next = await screen.findByRole("button", { name: /Next step/ });
     fireEvent.click(next);
     fireEvent.click(next);
@@ -182,18 +183,65 @@ describe("guided execution primary action", () => {
     await seed();
     const user = userEvent.setup();
     render(<App />);
-    await user.click(await screen.findByRole("button", { name: /Resume step 1/ }));
+    await user.click(await screen.findByRole("button", { name: /Continue job/ }));
     await user.click(await screen.findByRole("button", { name: /Report this step as blocked/ }));
     await user.type(await screen.findByLabelText(/Technician notes/), "Clip jammed");
     await user.click(await screen.findByRole("button", { name: /Log incident/ }));
-    // Frontier advanced past the halted step; the summary records the block.
-    expect(await screen.findByText(/1 blocked/)).toBeInTheDocument();
-    // Previous navigates back without undoing: the recorded state shows.
-    await user.click(await screen.findByRole("button", { name: /Previous/ }));
-    expect(await screen.findByText((_, el) => el?.textContent === "Step 1: blocked")).toBeInTheDocument();
+    // Halted at the blocked frontier: no Next, no Finish, no Skip.
+    expect(await screen.findByText(/Job halted at step 1/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Next step/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Finish job/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Skip step/ })).toBeDisabled();
+    // Skipped steps still count as exceptions, not completions.
+    // (Covered below; the halted step itself must be resolved first.)
     // Resume returns the step to the workable set with history preserved.
     await user.click(await screen.findByRole("button", { name: /resume step/i }));
     expect(await screen.findByRole("button", { name: /Next step/ })).toBeInTheDocument();
+  });
+
+  it("closes with exceptions only through the explicit exceptional path", async () => {
+    mockApi();
+    await seed();
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: /Continue job/ }));
+    await user.click(await screen.findByRole("button", { name: /Report this step as blocked/ }));
+    await user.type(await screen.findByLabelText(/Technician notes/), "Clip jammed");
+    await user.click(await screen.findByRole("button", { name: /Log incident/ }));
+    // Halted: Next and Finish are gone until resolve; Skip stays visible but locked.
+    expect(await screen.findByText(/Job halted at step 1/)).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Next step/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Skip step/ })).toBeDisabled();
+    expect(screen.queryByRole("button", { name: /^Finish job/ })).not.toBeInTheDocument();
+    // Resolve returns the step to the workable set with history preserved.
+    await user.click(await screen.findByRole("button", { name: /resume step/i }));
+    expect(await screen.findByRole("button", { name: /Next step/ })).toBeInTheDocument();
+  });
+
+  it("closes with exceptions only through the explicit exceptional path", async () => {
+    mockApi();
+    await seed();
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: /Continue job/ }));
+    // Complete steps 1-2, then block the final step.
+    await user.click(await screen.findByRole("button", { name: /Next step/ }));
+    await user.click(await screen.findByRole("button", { name: /Next step/ }));
+    expect(await screen.findByText("Step 3 of 3")).toBeInTheDocument();
+    await user.click(await screen.findByRole("button", { name: /Report this step as blocked/ }));
+    await user.type(await screen.findByLabelText(/Technician notes/), "Clip jammed");
+    await user.click(await screen.findByRole("button", { name: /Log incident/ }));
+    // No normal Finish while blocked — only the exceptional path.
+    expect(screen.queryByRole("button", { name: /^Finish job/ })).not.toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: /Review exceptions/ })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /Close with exceptions/ }));
+    // A reason is mandatory.
+    await user.click(screen.getByRole("button", { name: /Confirm exceptional close/ }));
+    expect(await screen.findByText(/requires a reason/)).toBeInTheDocument();
+    await user.type(screen.getByLabelText(/Reason \(required/), "Sealant unavailable on site");
+    await user.click(screen.getByRole("button", { name: /Confirm exceptional close/ }));
+    expect(finalizeCalls).toBe(1);
+    expect(await screen.findByText(/closed with exceptions/)).toBeInTheDocument();
   });
 
   it("counts skipped steps as exceptions, not completions", async () => {
@@ -201,7 +249,7 @@ describe("guided execution primary action", () => {
     await seed();
     const user = userEvent.setup();
     render(<App />);
-    await user.click(await screen.findByRole("button", { name: /Resume step 1/ }));
+    await user.click(await screen.findByRole("button", { name: /Continue job/ }));
     await user.click(await screen.findByRole("button", { name: /Skip step/ }));
     expect(await screen.findByRole("button", { name: /Next step/ })).toBeInTheDocument();
     expect(screen.getByText(/1 skipped/)).toBeInTheDocument();
@@ -212,7 +260,7 @@ describe("guided execution primary action", () => {
     await seed({ s1: "done", s2: "done", s3: "skipped" });
     const user = userEvent.setup();
     render(<App />);
-    await user.click(await screen.findByRole("button", { name: /Resume step 3/ }));
+    await user.click(await screen.findByRole("button", { name: /Continue job/ }));
     expect(await screen.findByRole("button", { name: /Finish job/ })).toBeInTheDocument();
   });
 
@@ -221,7 +269,7 @@ describe("guided execution primary action", () => {
     await seed();
     const user = userEvent.setup();
     render(<App />);
-    await user.click(await screen.findByRole("button", { name: /Resume step 1/ }));
+    await user.click(await screen.findByRole("button", { name: /Continue job/ }));
     await user.click(await screen.findByRole("button", { name: /Next step/ }));
     await user.click(await screen.findByRole("button", { name: /Next step/ }));
     await user.click(await screen.findByRole("button", { name: /Next step/ }));
@@ -239,7 +287,7 @@ describe("guided execution primary action", () => {
     await seed();
     const user = userEvent.setup();
     render(<App />);
-    await user.click(await screen.findByRole("button", { name: /Resume step 1/ }));
+    await user.click(await screen.findByRole("button", { name: /Continue job/ }));
     await user.click(await screen.findByRole("button", { name: /Next step/ }));
     await user.click(await screen.findByRole("button", { name: /Next step/ }));
     await user.click(await screen.findByRole("button", { name: /Next step/ }));

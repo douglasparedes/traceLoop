@@ -49,16 +49,24 @@ def _approved_procedure(title="Pump seal check"):
 
 
 def _start_finish_job(pid, vid):
+    from app.db import SessionLocal
+    from app import models as M
+    db = SessionLocal()
+    try:
+        step_ids = [s.id for s in db.query(M.ProcedureStep).filter(
+            M.ProcedureStep.procedure_version_id == vid).order_by(M.ProcedureStep.step_order).all()]
+    finally:
+        db.close()
     j = c.post("/api/jobs", json={"procedure_id": pid, "procedure_version_id": vid}, headers=TECH).json()
     jid = j["id"]
-    # some events first (proves proposals see execution evidence, not just feedback)
-    c.post("/api/sync/events", json={"events": [
-        {"event_id": f"{jid}-e1", "session_id": jid, "step_id": None,
-         "event_type": "step_completed", "payload": {"step_order": 1},
-         "occurred_at": "2026-01-01T00:00:00"},
-        {"event_id": f"{jid}-e2", "session_id": jid, "step_id": None,
-         "event_type": "issue_recorded", "payload": {"issue_type": "Instructions unclear", "note": "Which screw?"},
-         "occurred_at": "2026-01-01T00:01:00"}]}, headers=TECH)
+    # terminal events for every step (proves proposals see execution evidence, not just feedback)
+    evs = [{"event_id": f"{jid}-e{i}", "session_id": jid, "step_id": sid,
+            "event_type": "step_completed", "payload": {"step_order": i + 1},
+            "occurred_at": "2026-01-01T00:00:00"} for i, sid in enumerate(step_ids)]
+    evs.append({"event_id": f"{jid}-issue", "session_id": jid, "step_id": None,
+                "event_type": "issue_recorded", "payload": {"issue_type": "Instructions unclear", "note": "Which screw?"},
+                "occurred_at": "2026-01-01T00:01:00"})
+    c.post("/api/sync/events", json={"events": evs}, headers=TECH)
     assert c.post(f"/api/jobs/{jid}/finish", json={"outcome": "finished-with-exceptions", "reason": "step 2 unclear"}, headers=TECH).status_code == 200
     return jid
 

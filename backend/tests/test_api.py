@@ -105,9 +105,18 @@ def test_job_evidence_attach_and_list():
     assert img.status_code == 200 and img.headers["content-type"] == "image/png"
     detail = c.get(f"/api/jobs/{job['id']}").json()
     assert len(detail["evidence"]) == 1
-    c.post(f"/api/jobs/{job['id']}/finish", json={"outcome": "completed", "reason": "", "summary": ""}, headers=TECH)
+    # Complete every step, then finish, then attach late evidence: it is
+    # accepted and flagged as reconciled instead of rejected.
+    ver = c.get(f"/api/procedure-versions/{p['approved_version_id']}").json()
+    evs = [{"event_id": f"ev-{s['id']}", "session_id": job["id"], "step_id": s["id"],
+            "event_type": "step_completed", "payload": {},
+            "occurred_at": "2026-01-01T00:00:00Z"} for s in ver["steps"]]
+    assert c.post("/api/sync/events", json={"events": evs}, headers=TECH).json()["acknowledged"]
+    fin = c.post(f"/api/jobs/{job['id']}/finish", json={"outcome": "completed", "reason": "", "summary": ""}, headers=TECH)
+    assert fin.status_code == 200 and fin.json()["outcome"] == "completed", fin.text
     late = c.post(f"/api/jobs/{job['id']}/evidence", files={"file": ("b.png", png, "image/png")}, headers=TECH)
-    assert late.status_code == 409
+    assert late.status_code == 200 and late.json().get("reconciled") is True, late.text
+    assert len(c.get(f"/api/jobs/{job['id']}/evidence", headers=TECH).json()["evidence"]) == 2
 
 
 def test_approval_requires_reviewer_and_approved_immutable():
@@ -156,8 +165,14 @@ def test_job_procedure_mismatch_and_finish_idempotent():
     bad = c.post("/api/jobs", json={"procedure_id": "not-the-procedure", "procedure_version_id": p["approved_version_id"]}, headers=TECH)
     assert bad.status_code == 409
     job = c.post("/api/jobs", json={"procedure_id": p["id"], "procedure_version_id": p["approved_version_id"]}, headers=TECH).json()
-    assert c.post(f"/api/jobs/{job['id']}/finish", json={"outcome": "completed"}, headers=TECH).json()["ok"] is True
-    again = c.post(f"/api/jobs/{job['id']}/finish", json={"outcome": "completed"}, headers=TECH).json()
+    # Finishing with no recorded steps is refused instead of silently completed.
+    assert c.post(f"/api/jobs/{job['id']}/finish", json={"outcome": "completed"}, headers=TECH).status_code == 422
+    ver = c.get(f"/api/procedure-versions/{p['approved_version_id']}").json()
+    evs = [{"event_id": f"evt-{s['id']}", "session_id": job["id"], "step_id": s["id"],
+            "event_type": "step_completed", "payload": {}} for s in ver["steps"]]
+    assert c.post("/api/sync/events", json={"events": evs}, headers=TECH).json()["acknowledged"]
+    assert c.post(f"/api/jobs/{job['id']}/finish", json={"outcome": "ignored-by-server", "reason": ""}, headers=TECH).json() == {"ok": True, "outcome": "completed"}
+    again = c.post(f"/api/jobs/{job['id']}/finish", json={"outcome": "completed", "reason": ""}, headers=TECH).json()
     assert again.get("already_finished") is True
 
 
