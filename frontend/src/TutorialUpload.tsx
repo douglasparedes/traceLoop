@@ -53,7 +53,7 @@ export default function TutorialUpload({ mode, onModeChange, onOpenStudio, onUpl
   const [error, setError] = useState("");
   const [uploading, setUploading] = useState(false);
   const [pct, setPct] = useState<number | null>(null);
-  const [job, setJob] = useState<{ id: string; access_token: string; title: string; status: string; progress: number; error?: string } | null>(null);
+  const [job, setJob] = useState<{ id: string; access_token: string; title: string; status: string; progress: number; error?: string; cached?: boolean } | null>(null);
   const [queuedKey, setQueuedKey] = useState<string | null>(null);
   const cancelRef = useRef({ cancelled: false });
   const fileRef = useRef<HTMLInputElement | null>(null);
@@ -128,7 +128,7 @@ export default function TutorialUpload({ mode, onModeChange, onOpenStudio, onUpl
       setQueuedKey(entry.key);
       const j = await runQueuedUpload(entry, setPct, cancelRef.current);
       setPct(null);
-      setJob({ id: j.id, access_token: j.access_token, title: j.title, status: j.status, progress: j.progress, error: j.error });
+      setJob({ id: j.id, access_token: j.access_token, title: j.title, status: j.status, progress: j.progress, error: j.error, cached: j.cached });
       onUploaded();
     } catch (e) {
       setUploadFailed(true);
@@ -143,6 +143,38 @@ export default function TutorialUpload({ mode, onModeChange, onOpenStudio, onUpl
     if (!file || uploading) return;
     cancelRef.current = { cancelled: false };
     void start();
+  }
+
+  /** Re-process the exact same file as a brand-new tutorial, bypassing the
+   *  server's identical-bytes cache (e.g. same video, new title/mode). */
+  async function uploadAsNew() {
+    if (!file || uploading) return;
+    if (!title.trim()) { setError("Give the tutorial a title first."); return; }
+    setError("");
+    setUploadFailed(false);
+    setJob(null);
+    cancelRef.current = { cancelled: false };
+    const store = await checkStorageFor(file.size);
+    if (!store.ok) { setError(store.message); return; }
+    setUploading(true);
+    setPct(0);
+    try {
+      const entry = await queueTutorialUpload({
+        blob: file, filename: file.name, title: title.trim(),
+        equipment, task, notes, mode, origin: "uploaded",
+      });
+      setQueuedKey(entry.key);
+      const j = await runQueuedUpload(entry, setPct, cancelRef.current, { forceNew: true });
+      setPct(null);
+      setJob({ id: j.id, access_token: j.access_token, title: j.title, status: j.status, progress: j.progress, error: j.error, cached: j.cached });
+      onUploaded();
+    } catch (e) {
+      setUploadFailed(true);
+      setPct(null);
+      setError(e instanceof Error ? e.message : "Upload failed — your file is still queued on this device.");
+    } finally {
+      setUploading(false);
+    }
   }
 
   return (
@@ -191,9 +223,19 @@ export default function TutorialUpload({ mode, onModeChange, onOpenStudio, onUpl
         </div>
       )}
       {job?.status === "done" && (
-        <div className="row" style={{ marginTop: 10 }}>
-          <button className="btn" onClick={() => onOpenStudio({ id: job.id, access_token: job.access_token, title: job.title } as LibraryItem)}>Open in Tutorial Studio</button>
-          <span className="muted small-text">Processing complete — edit transcript, steps, guide, video, and visuals.</span>
+        <div style={{ marginTop: 10 }}>
+          {job.cached && (
+            <p className="notice warn" role="status" style={{ width: "100%", margin: "0 0 8px" }}>
+              <strong>This exact file was already processed</strong> — opened the existing tutorial “{job.title}” instead of duplicating it.
+              <span className="row" style={{ marginTop: 6 }}>
+                <button className="btn small secondary" onClick={() => void uploadAsNew()} disabled={uploading}>Upload as new instead</button>
+              </span>
+            </p>
+          )}
+          <div className="row">
+            <button className="btn" onClick={() => onOpenStudio({ id: job.id, access_token: job.access_token, title: job.title } as LibraryItem)}>Open in Tutorial Studio</button>
+            <span className="muted small-text">Processing complete — edit transcript, steps, guide, video, and visuals.</span>
+          </div>
         </div>
       )}
     </div>
