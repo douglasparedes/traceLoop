@@ -217,7 +217,9 @@ class GuideSnapshot(Base):
 
     The live guide_markdown on TutorialJob keeps moving (refreshes, tap
     corrections); snapshots preserve what each generation produced, with
-    what models, from which objects, and why.
+    what models, from which objects, in which format, and why. `steps`
+    is the canonical ordered step list the video pipeline renders from —
+    the video must follow this snapshot, never a newer draft.
     """
     __tablename__ = "guide_snapshots"
     id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
@@ -233,6 +235,7 @@ class GuideSnapshot(Base):
     format_source: Mapped[str] = mapped_column(String, default="")  # user|recommended
     format_rationale: Mapped[str] = mapped_column(String, default="")
     content_revision: Mapped[int] = mapped_column(Integer, default=0)
+    steps: Mapped[list] = mapped_column(JSON, default=list)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)
 
 
@@ -405,6 +408,9 @@ class VideoGuide(Base):
     overwrites a previous file (storage_key is unique per row). The voiceover
     is the user's own recorded narration, cut per scene with ffmpeg — never
     synthesized, never invented. status: queued|rendering|ready|error.
+
+    Source traceability: source_snapshot_id + source_steps_hash pin the
+    exact guide snapshot/version the segments were built from.
     """
     __tablename__ = "video_guides"
     id: Mapped[str] = mapped_column(String, primary_key=True, default=uid)
@@ -418,5 +424,8 @@ class VideoGuide(Base):
     scenes: Mapped[list] = mapped_column(JSON, default=list)
     simulated: Mapped[bool] = mapped_column(Boolean, default=False)
     provenance: Mapped[dict] = mapped_column(JSON, default=dict)
+    source_snapshot_id: Mapped[str] = mapped_column(String, default="")
+    source_steps_hash: Mapped[str] = mapped_column(String, default="")
+    source_content_revision: Mapped[int] = mapped_column(Integer, default=0)
     created_by: Mapped[str] = mapped_column(String, default="demo-tech")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=now)

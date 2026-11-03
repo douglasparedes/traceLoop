@@ -35,6 +35,10 @@ export const SceneSchema = z.object({
   step: z.number(),
   title: z.string(),
   caption: z.string(),
+  instruction: z.string().optional(),
+  narration: z.string().optional(),
+  caption_chunks: z.array(z.string()).optional(),
+  objects_used: z.array(z.number()).optional(),
   image: z.string().nullable(),
   startFrame: z.number(),
   durationFrames: z.number(),
@@ -120,13 +124,27 @@ const TitleCard: React.FC<{ title: string; format?: string }> = ({ title, format
   );
 };
 
-/** Balanced instructional image: contained card inside the safe area.
- *  Landscape sources render at most ~60% of the canvas width with full
- *  aspect preserved (contain) — instructions and captions keep their own
- *  space instead of fighting a full-bleed photo. Portrait keeps the
- *  blurred backdrop + contained main visual. */
-const StepImage: React.FC<{ src: string | null; portrait: boolean; zoomFrom: number; zoomTo: number; dim?: boolean; mainW?: number; mainH?: number }> = ({
-  src, portrait, zoomFrom, zoomTo, dim, mainW, mainH,
+/** Instruction-first side layout (16:9): text panel carries the guide
+ *  step (~60-65% of the canvas), supporting image is a compact side card
+ *  (~30%), captions own the bottom safe area. Illustrations support the
+ *  instruction — never the reverse. */
+const LAYOUT = {
+  headerTop: 44,
+  contentTop: 150,
+  captionTop: 550,
+  textX: 64,
+  textW: 660,
+  gap: 40,
+  imgX: 764,
+  imgW: 380,
+  imgH: 300,
+  radius: 18,
+} as const;
+
+/** Compact supporting visual: contained card, aspect preserved, aligned
+ *  highlight geometry. Portrait and landscape both fit — never cropped. */
+const StepImage: React.FC<{ src: string | null; portrait: boolean; zoomFrom: number; zoomTo: number; dim?: boolean; label?: string }> = ({
+  src, portrait, zoomFrom, zoomTo, dim, label,
 }) => {
   const frame = useCurrentFrame();
   const zoom = interpolate(frame, [0, Math.max(1, 60)], [zoomFrom, zoomTo], {
@@ -136,73 +154,84 @@ const StepImage: React.FC<{ src: string | null; portrait: boolean; zoomFrom: num
   });
   if (!src) {
     return (
-      <AbsoluteFill style={{ backgroundColor: BRAND_PANEL, justifyContent: "center", alignItems: "center" }}>
-        <div style={{ color: BRAND_MUTED, fontSize: 28, fontFamily: FONT }}>
-          Visual unavailable — see render diagnostics
-        </div>
-      </AbsoluteFill>
+      <div style={{
+        position: "absolute", left: LAYOUT.imgX, top: LAYOUT.contentTop,
+        width: LAYOUT.imgW, height: LAYOUT.imgH, borderRadius: LAYOUT.radius,
+        backgroundColor: BRAND_PANEL, display: "flex",
+        alignItems: "center", justifyContent: "center",
+        color: BRAND_MUTED, fontSize: 22, fontFamily: FONT, textAlign: "center",
+        padding: 20,
+      }}>
+        Visual unavailable — see render diagnostics
+      </div>
     );
   }
-  if (!portrait) {
-    // Card geometry: centered, capped so text zones stay clear.
-    const cardW = Math.min(TOKENS.imageCard.maxW, TOKENS.canvas.w - TOKENS.safe.x * 2);
-    const cardH = TOKENS.imageCard.maxH;
-    const cx = Math.round((TOKENS.canvas.w - cardW) / 2);
-    const cy = Math.round((TOKENS.canvas.h - cardH) / 2) - 10;
-    return (
-      <AbsoluteFill style={{ backgroundColor: BRAND_BG, justifyContent: "center", alignItems: "center" }}>
-        <Img
-          src={src}
-          style={{
-            position: "absolute",
-            left: cx,
-            top: cy,
-            width: cardW,
-            height: cardH,
-            objectFit: "contain",
-            borderRadius: TOKENS.imageCard.radius,
-            scale: zoom,
-            filter: dim ? TOKENS.overlay.dim : undefined,
-            backgroundColor: BRAND_PANEL,
-          }}
-        />
-      </AbsoluteFill>
-    );
-  }
-  // Explicit pixel geometry + absolute centering: flex centering of
-  // canvas-backed visuals is unreliable in headless SSR renders.
-  const h = mainH || 446;
-  const w = mainW || 300;
-  const cx = Math.round((1280 - w) / 2);
-  const cy = Math.round(Math.min(Math.max(380 - h / 2, 165), 720 - 140 - h));
+  void portrait;
   return (
-    <AbsoluteFill style={{ backgroundColor: BRAND_BG, justifyContent: "center", alignItems: "center" }}>
-      <CanvasImage
-        src={src}
-        style={{
-          position: "absolute",
-          width: "100%",
-          height: "100%",
-          objectFit: "cover",
-          filter: "blur(28px) brightness(0.45)",
-          scale: 1.15,
-        }}
-      />
+    <div style={{ position: "absolute", left: LAYOUT.imgX, top: LAYOUT.contentTop }}>
       <Img
         src={src}
         style={{
-          position: "absolute",
-          left: cx,
-          top: cy,
-          width: w,
-          height: h,
+          width: LAYOUT.imgW,
+          height: LAYOUT.imgH,
           objectFit: "contain",
-          borderRadius: 18,
+          borderRadius: LAYOUT.radius,
           scale: zoom,
-          filter: dim ? "brightness(0.7)" : undefined,
+          filter: dim ? TOKENS.overlay.dim : undefined,
+          backgroundColor: BRAND_PANEL,
         }}
       />
-    </AbsoluteFill>
+      {label ? (
+        <div style={{
+          position: "absolute", left: 12, bottom: 12,
+          backgroundColor: "rgba(0,0,0,0.72)", borderRadius: 8, padding: "6px 12px",
+          fontSize: 20, color: BRAND_ACCENT, letterSpacing: 1, fontFamily: FONT,
+        }}>
+          {label}
+        </div>
+      ) : null}
+    </div>
+  );
+};
+
+const InstructionPanel: React.FC<{ scene: Scene; total: number; format?: string }> = ({ scene, total, format }) => {
+  const instruction = (scene.instruction || "").trim();
+  const tools = scene.tools || [];
+  return (
+    <div style={{
+      position: "absolute", left: LAYOUT.textX, top: LAYOUT.contentTop,
+      width: LAYOUT.textW, fontFamily: FONT,
+    }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
+        <div style={{
+          width: 56, height: 56, borderRadius: 14, backgroundColor: BRAND_ACCENT,
+          color: "#201600", fontSize: 30, fontWeight: 800,
+          display: "flex", alignItems: "center", justifyContent: "center",
+        }}>
+          {scene.step}
+        </div>
+        <div>
+          <div style={{ fontSize: 34, color: BRAND_TEXT, fontWeight: 700, lineHeight: 1.15 }}>{scene.title}</div>
+          <div style={{ fontSize: 20, color: BRAND_MUTED, marginTop: 2 }}>
+            {stepWord(format)} {scene.step} of {total}
+          </div>
+        </div>
+      </div>
+      {instruction ? (
+        <div style={{ fontSize: 26, color: BRAND_TEXT, marginTop: 18, lineHeight: 1.35 }}>{instruction}</div>
+      ) : null}
+      {scene.expected ? (
+        <div style={{ fontSize: 22, color: BRAND_MUTED, marginTop: 14 }}>
+          <span style={{ color: BRAND_ACCENT, letterSpacing: 2, fontSize: 18 }}>EXPECTED RESULT · </span>
+          {scene.expected}
+        </div>
+      ) : null}
+      {tools.length > 0 ? (
+        <div style={{ fontSize: 20, color: BRAND_MUTED, marginTop: 10 }}>
+          Tools: {tools.join(" · ")}
+        </div>
+      ) : null}
+    </div>
   );
 };
 
@@ -285,12 +314,11 @@ const CaptionBar: React.FC<{ text: string; big?: boolean }> = ({ text, big }) =>
   );
 };
 
-/** One visual beat: dissolves in over the outgoing beat and holds a
- *  purposeful camera move or overlay for its whole duration — never a
- *  frozen still, never a dip to black. */
-const BeatView: React.FC<{ scene: Scene; beat: Beat; beatIndex: number }> = ({ scene, beat, beatIndex }) => {
+/** One visual beat: same static instruction panel throughout; exactly one
+ *  caption chunk on screen at a time. Beats dissolve into each other —
+ *  never a frozen still, never a dip to black. */
+const BeatView: React.FC<{ scene: Scene; beat: Beat; beatIndex: number; total: number; format?: string }> = ({ scene, beat, beatIndex, total, format }) => {
   const frame = useCurrentFrame();
-  const tools = scene.tools || [];
   const fadeLen = 8;
   // Dissolve in over the outgoing beat (which stays fully opaque beneath).
   const fadeIn = interpolate(frame, [0, fadeLen], [0, 1], { extrapolateLeft: "clamp", extrapolateRight: "clamp" });
@@ -299,45 +327,30 @@ const BeatView: React.FC<{ scene: Scene; beat: Beat; beatIndex: number }> = ({ s
     <AbsoluteFill style={{ opacity: fadeIn, backgroundColor: BRAND_BG }}>
       {beat.kind === "verify" ? (
         <AbsoluteFill style={{ backgroundColor: BRAND_BG, justifyContent: "center", alignItems: "center", fontFamily: FONT }}>
-          <div style={{ backgroundColor: BRAND_PANEL, borderRadius: 20, padding: "48px 72px", maxWidth: 980, border: `2px solid ${BRAND_ACCENT}` }}>
+          <div style={{ backgroundColor: BRAND_PANEL, borderRadius: 20, padding: "40px 64px", maxWidth: 980, border: `2px solid ${BRAND_ACCENT}` }}>
             <div style={{ fontSize: 26, color: BRAND_ACCENT, letterSpacing: 3 }}>EXPECTED RESULT</div>
-            <div style={{ fontSize: 40, color: BRAND_TEXT, fontWeight: 700, marginTop: 16 }}>
+            <div style={{ fontSize: 36, color: BRAND_TEXT, fontWeight: 700, marginTop: 14 }}>
               {beat.body || scene.expected || scene.caption}
             </div>
-            {(tools).length > 0 && (
-              <div style={{ fontSize: 26, color: BRAND_MUTED, marginTop: 20 }}>
-                Tools: {tools.join(" · ")}
+            {(scene.tools || []).length > 0 && (
+              <div style={{ fontSize: 24, color: BRAND_MUTED, marginTop: 18 }}>
+                Tools: {(scene.tools || []).join(" · ")}
               </div>
             )}
           </div>
         </AbsoluteFill>
       ) : (
         <>
+          <InstructionPanel scene={scene} total={total} format={format} />
           <StepImage
             src={beat.image}
             portrait={portrait}
             zoomFrom={beat.kind === "hero" ? 1 : 1.02}
-            zoomTo={beat.kind === "hero" ? 1.08 : 1.16}
+            zoomTo={beat.kind === "hero" ? 1.06 : 1.1}
             dim={false}
-            mainW={Math.min(900, Math.round(446 * (scene.imageW || 3) / Math.max(1, scene.imageH || 4)))}
-            mainH={446}
+            label={beat.headline || undefined}
           />
-          {beat.kind === "caption" ? (
-            <CaptionBar text={beat.body || scene.caption} big />
-          ) : (
-            <>
-              {beatIndex > 0 || beat.kind === "detail" ? (
-                <div style={{
-                  position: "absolute", top: 150, left: 64,
-                  backgroundColor: "rgba(0,0,0,0.68)", borderRadius: 10, padding: "10px 20px",
-                  fontSize: 26, color: BRAND_ACCENT, letterSpacing: 2, fontFamily: FONT, opacity: fadeIn,
-                }}>
-                  {beat.kind === "detail" ? "FOCUS" : beat.headline || "STEP"}
-                </div>
-              ) : null}
-              <CaptionBar text={beat.body || scene.caption} />
-            </>
-          )}
+          <CaptionBar text={beat.body} />
         </>
       )}
     </AbsoluteFill>
@@ -347,13 +360,13 @@ const BeatView: React.FC<{ scene: Scene; beat: Beat; beatIndex: number }> = ({ s
 const StepScene: React.FC<{ scene: Scene; total: number; format?: string }> = ({ scene, total, format }) => {
   const beats = (scene.beats || []).filter((b) => b.durationFrames > 0);
   if (!beats.length) {
-    // Backward compatible: older saved props without beats render as before.
+    // Backward compatible: older saved props without beats render the same
+    // instruction-first layout with a single caption.
     const portrait = (scene.imageH || 0) > (scene.imageW || 0);
     return (
       <AbsoluteFill style={{ backgroundColor: BRAND_BG, fontFamily: FONT }}>
-        <StepImage src={scene.image} portrait={portrait} zoomFrom={1} zoomTo={1.06}
-          mainW={Math.min(900, Math.round(446 * (scene.imageW || 3) / Math.max(1, scene.imageH || 4)))}
-          mainH={446} />
+        <InstructionPanel scene={scene} total={total} format={format} />
+        <StepImage src={scene.image} portrait={portrait} zoomFrom={1} zoomTo={1.05} />
         <StepHeader scene={scene} total={total} format={format} />
         <CaptionBar text={scene.caption} />
       </AbsoluteFill>
@@ -367,10 +380,9 @@ const StepScene: React.FC<{ scene: Scene; total: number; format?: string }> = ({
         // stays mounted beneath the incoming dissolve (except the last).
         <Sequence key={i} from={b.startFrame - scene.startFrame}
           durationInFrames={b.durationFrames + (i < beats.length - 1 ? 8 : 0)}>
-          <BeatView scene={scene} beat={b} beatIndex={i} />
+          <BeatView scene={scene} beat={b} beatIndex={i} total={total} format={format} />
         </Sequence>
       ))}
-      <StepHeader scene={scene} total={total} format={format} />
       <ProgressRail index={index} total={total} />
     </AbsoluteFill>
   );

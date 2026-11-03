@@ -288,17 +288,20 @@ def test_asset_paths_resolve_under_custom_media_root(monkeypatch, tmp_path):
 def test_beats_are_contiguous_and_captioned():
     from app import videoguide as vgmod
     scene = {"step": 1, "step_number": 1, "title": "Do it",
-             "caption": "Do the thing.", "audio_start": 0.0, "audio_end": 5.0}
-    segments = [{"text": "first part", "start": 0.0, "end": 2.0},
-                {"text": "second part", "start": 2.0, "end": 5.0}]
-    beats = vgmod.plan_visual_beats(scene, segments, 150, 45)
-    assert len(beats) == 2, "short scenes get establish + focus"
+             "caption": "Do the thing carefully now.",
+             "caption_chunks": ["Do the thing", "carefully now."],
+             "audio_start": 0.0, "audio_end": 5.0}
+    beats = vgmod.plan_visual_beats(scene, [], 150, 45)
+    assert len(beats) == 2, "one beat per caption chunk"
     assert beats[0]["startFrame"] == 45
     assert beats[0]["startFrame"] + beats[0]["durationFrames"] == beats[1]["startFrame"]
     assert sum(b["durationFrames"] for b in beats) == 150
-    assert beats[0]["body"] == "first part"
-    long_scene = dict(scene, audio_end=25.0)
-    long_beats = vgmod.plan_visual_beats(long_scene, segments, 750, 45)
+    assert beats[0]["body"] == "Do the thing"
+    assert beats[1]["body"] == "carefully now."
+    long_scene = dict(scene, audio_end=25.0,
+                      caption_chunks=["one", "two", "three"],
+                      expected_result="Done.")
+    long_beats = vgmod.plan_visual_beats(long_scene, [], 750, 45)
     kinds = [b["kind"] for b in long_beats]
     assert kinds == ["hero", "detail", "caption", "verify"]
     assert sum(b["durationFrames"] for b in long_beats) == 750

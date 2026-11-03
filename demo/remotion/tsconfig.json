@@ -1,0 +1,1 @@
+{"compilerOptions": {"esModuleInterop": true, "jsx": "react-jsx", "lib": ["dom", "dom.iterable", "esnext"], "module": "esnext", "moduleResolution": "bundler", "skipLibCheck": true, "strict": true, "target": "es2019"}, "exclude": ["node_modules", "bundle", "build"]}

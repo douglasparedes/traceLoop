@@ -251,106 +251,175 @@ def _segments_for_range(segments: list[dict], start: float, end: float) -> list[
     return out
 
 
+def _split_caption_chunks(text: str, max_len: int = 90, max_chunks: int = 4) -> list[str]:
+    """Split narration into short readable caption phrases (≤2 lines each).
+
+    Sentence/punctuation-aware; merges tiny fragments; caps chunk count by
+    merging overflow into the last chunk. Deterministic — same text, same
+    chunks. Each chunk is shown exactly once, in order, timed to its share
+    of the scene audio.
+    """
+    import re as _re
+    t = _re.sub(r"\s+", " ", (text or "")).strip()
+    if not t:
+        return []
+    parts = _re.split(r"(?<=[.!?;:])\s+|\s+—\s+|\s+–\s+", t)
+    chunks: list[str] = []
+    buf = ""
+    for p in parts:
+        p = p.strip()
+        if not p:
+            continue
+        if len(p) > max_len:
+            # Hard-split long sentences on commas/clauses.
+            subs = _re.split(r",\s+|\s+and\s+|\s+then\s+", p)
+            for s in subs:
+                s = s.strip()
+                if not s:
+                    continue
+                if len(buf) + len(s) + 1 <= max_len:
+                    buf = (buf + " " + s).strip()
+                else:
+                    if buf:
+                        chunks.append(buf)
+                    buf = s if len(s) <= max_len else s[:max_len].rsplit(" ", 1)[0]
+            continue
+        if len(buf) + len(p) + 1 <= max_len:
+            buf = (buf + " " + p).strip()
+        else:
+            if buf:
+                chunks.append(buf)
+            buf = p
+    if buf:
+        chunks.append(buf)
+    while len(chunks) > max_chunks:
+        chunks[-2] = (chunks[-2] + " " + chunks[-1]).strip()[: max_len * 2]
+        chunks.pop()
+    return [c for c in chunks if c]
+
+
+def _concise_instruction(step: dict, max_len: int = 140) -> str:
+    """One-to-two-line on-screen action derived from the guide step.
+
+    Shorter than the narration by design: the static panel must not
+    reproduce the full spoken paragraph verbatim.
+    """
+    import re as _re
+    summary = _re.sub(r"\s+", " ", str(step.get("summary") or step.get("instruction") or "")).strip()
+    title = str(step.get("title") or "").strip()
+    if summary and len(summary) <= max_len:
+        return summary
+    if summary:
+        cut = summary[:max_len].rsplit(" ", 1)[0]
+        return (cut or summary[:max_len]).rstrip(" ,;:") + "…"
+    return title[:max_len]
+
+
+def _scenes_from_guide_steps(job_title: str, guide_steps: list[dict],
+                             segments: list[dict]) -> tuple[list[dict], list[str]]:
+    """Deterministic guide→scene mapping: one scene per guide step, in order.
+
+    No AI reinterpretation: titles, instructions, warnings, verifications,
+    and object links come straight from the guide step. Narration text is
+    the guide's own wording; the voiceover remains the user's recorded
+    audio cut to the step's time range. Returns (scenes, warnings).
+    """
+    warnings: list[str] = []
+    scenes: list[dict] = []
+    seen: set[int] = set()
+    for i, s in enumerate(guide_steps or []):
+        try:
+            n = int(s.get("step_number", i + 1))
+        except (TypeError, ValueError):
+            n = i + 1
+        if n in seen:
+            warnings.append(f"duplicate step_number {n} deduplicated")
+            continue
+        seen.add(n)
+        try:
+            start, end = float(s.get("start", 0)), float(s.get("end", 0))
+        except (TypeError, ValueError):
+            start, end = 0.0, 0.0
+        if end <= start:
+            end = start + 5.0
+        title = str(s.get("title") or f"Step {n}").strip()[:200]
+        summary = str(s.get("summary") or s.get("instruction") or "").strip()
+        expected = str(s.get("expected_result") or s.get("verification_notes") or "").strip()[:300]
+        tools = [str(x) for x in (s.get("required_tools") or [])][:6]
+        instruction = _concise_instruction(s)
+        narration = (f"{title}. {summary}".strip())[:1200] or title
+        caption_chunks = _split_caption_chunks(narration) or [narration[:90]]
+        scenes.append({
+            "step": n, "step_number": n,
+            "title": title, "instruction": instruction,
+            "narration": narration, "caption": narration,
+            "caption_chunks": caption_chunks,
+            "caption_src": "guide step",
+            "audio_start": round(start, 2), "audio_end": round(end, 2),
+            "objects_used": list(s.get("objects_used") or []),
+            "expected_result": expected,
+            "required_tools": tools,
+            "visual": None, "simulated": False,
+        })
+    # Order + completeness guard: scenes follow guide order exactly.
+    scenes.sort(key=lambda s: s["step_number"])
+    return scenes, warnings
+
+
 def plan_visual_beats(scene: dict, segments: list[dict], duration_frames: int,
                       start_frame: int) -> list[dict]:
-    """Split a scene into purposeful visual beats (deterministic frames).
+    """One caption chunk per beat, in order, exactly once — no repetition.
 
-    Short scenes (<8s) get establish + focus; longer scenes get introduce,
-    focus, explain, and verify/recap beats so no still sits unchanged for
-    20+ seconds. Each narrative beat's body is the transcript actually
-    overlapping that beat's own time window — on-screen text follows the
-    voiceover instead of repeating one static block. Consecutive beats
-    never share identical bodies when any alternative exists. Frame ranges
-    are contiguous integers summing exactly to duration_frames.
+    The static instruction panel (scene title + concise instruction) stays
+    constant across the scene; each beat advances exactly one caption chunk
+    of the spoken narration. Bodies never repeat across beats and never
+    reproduce the full static paragraph. Frame shares follow chunk length
+    (min 1s each), summing exactly to duration_frames.
     """
     if duration_frames <= 0:
         return []
-    try:
-        start = float(scene.get("audio_start", 0) or 0)
-        end = float(scene.get("audio_end", 0) or 0)
-    except (TypeError, ValueError):
-        start, end = 0.0, 0.0
-    scene_dur = max(0.0, end - start)
     scene_sec = duration_frames / max(1, VIDEO_FPS)
     expected = str(scene.get("expected_result", "") or "")[:220]
     tools = [str(x) for x in (scene.get("required_tools") or [])][:4]
-    tools_line = f"Tools: {', '.join(tools)}" if tools else ""
-    caption = str(scene.get("caption", "") or "")[:220]
-    title = str(scene.get("title", "") or "")
-    step_no = int(scene.get("step", scene.get("step_number", 0)) or 0)
-    recap = f"Step {step_no} of {title}" if title else caption
+    chunks = [c for c in (scene.get("caption_chunks") or []) if str(c).strip()]
+    if not chunks:
+        chunks = _split_caption_chunks(str(scene.get("caption") or scene.get("narration") or "") or "Follow the narration.")
+    if not chunks:
+        chunks = ["Follow the narration."]
+    chunks = chunks[:4]
+    has_verify = bool(expected) and scene_sec >= 8 and len(chunks) >= 2
+    n_beats = len(chunks) + (1 if has_verify else 0)
     if scene_sec < 8:
-        kinds = ["hero", "detail"]
-        ratios = [0.55, 0.45]
+        kinds = ["hero", "detail"][:n_beats]
     else:
-        kinds = ["hero", "detail", "caption", "verify"]
-        ratios = [0.30, 0.30, 0.25, 0.15]
-    # Frame ranges first (contiguous, exact sum).
+        base = ["hero", "detail", "caption", "caption"]
+        kinds = (base[:len(chunks)] + (["verify"] if has_verify else []))[:n_beats]
+    # Proportional frame shares by chunk length (min 1s each).
+    weights = [max(1, len(c)) for c in chunks]
+    if has_verify:
+        weights.append(max(1, int(sum(weights) * 0.15)))
+    total_w = sum(weights)
     durs: list[int] = []
     offset = 0
-    for i, ratio in enumerate(ratios):
-        if i == len(ratios) - 1:
+    min_frames = VIDEO_FPS  # 1s floor per beat
+    for i, w in enumerate(weights):
+        if i == len(weights) - 1:
             dur = duration_frames - offset
         else:
-            dur = max(1, int(round(duration_frames * ratio)))
-            dur = min(dur, duration_frames - offset - (len(ratios) - i - 1))
+            dur = max(min_frames, int(round(duration_frames * w / total_w)))
+            dur = min(dur, duration_frames - offset - (len(weights) - i - 1) * min_frames)
         if dur <= 0:
             continue
         durs.append(dur)
         offset += dur
     kinds = kinds[:len(durs)]
-    # Bodies by time overlap with each beat's own window.
-    timed = []
-    for x in segments or []:
-        try:
-            ss, se = float(x.get("start", 0) or 0), float(x.get("end", 0) or 0)
-        except (TypeError, ValueError):
-            continue
-        text = str(x.get("text", "") or "").strip()
-        if text and se > start and ss < end:
-            timed.append((ss, se, text))
-    used: list[str] = []
-
-    def pick_timed(ws: float, we: float) -> str:
-        """The line actually spoken during [ws, we): max overlap wins.
-
-        Repeating a still-spoken line across a beat boundary is honest;
-        showing a line that is not being spoken is not.
-        """
-        best: tuple[float, str] | None = None
-        best_ov = 0.0
-        for ss, se, text in timed:
-            ov = min(se, we) - max(ss, ws)
-            if ov > 0 and (best is None or ov > best_ov or
-                           (ov == best_ov and ss < best[0])):
-                best, best_ov = (ss, text), ov
-        return best[1] if best else ""
-
-    def pick_fallback(options: list[str]) -> str:
-        for fb in options:
-            if fb and fb not in used:
-                used.append(fb)
-                return fb
-        for fb in options:
-            if fb:
-                return fb
-        return ""
-
     beats = []
     offset = 0
     for i, (kind, dur) in enumerate(zip(kinds, durs)):
-        ws = start + (offset / max(1, duration_frames)) * scene_dur if scene_dur > 0 else start
-        we = start + ((offset + dur) / max(1, duration_frames)) * scene_dur if scene_dur > 0 else start
-        body = pick_timed(ws, we)
-        if not body:
-            if kind == "verify":
-                body = pick_fallback([t for t in [expected, tools_line, recap, caption] if t])
-            elif kind == "caption":
-                body = pick_fallback([t for t in [recap, caption, expected, tools_line] if t])
-            else:
-                body = pick_fallback([t for t in [caption, recap, expected, tools_line] if t])
-        if not body:
-            body = recap or caption or expected or "Follow the narration."
+        if kind == "verify":
+            body = expected or (f"Tools: {', '.join(tools)}" if tools else chunks[-1])
+        else:
+            body = chunks[i] if i < len(chunks) else chunks[-1]
         beats.append({"kind": kind, "headline": "", "body": body,
                       "startFrame": start_frame + offset, "durationFrames": dur})
         offset += dur
@@ -379,6 +448,7 @@ def build_video_props(job: M.TutorialJob, scenes: list[dict], voiceover: Path | 
                                 "visual_kind": str((s.get("visual") or {}).get("kind", "")),
                                 "diagnostic": diag})
         cap_text = str(s.get("caption") or s.get("narration") or "")
+        instruction = str(s.get("instruction") or "")[:200]
         dur_frames = int(round(dur * fps))
         scene_start = frame
         beats = plan_visual_beats(s, getattr(job, "timed_segments", None) or [], dur_frames, scene_start)
@@ -423,6 +493,10 @@ def build_video_props(job: M.TutorialJob, scenes: list[dict], voiceover: Path | 
             "step": int(s.get("step_number", len(out_scenes) + 1)),
             "title": str(s.get("title", "")),
             "caption": cap_text,
+            "instruction": instruction,
+            "narration": str(s.get("narration") or cap_text or ""),
+            "caption_chunks": list(s.get("caption_chunks") or []),
+            "objects_used": list(s.get("objects_used") or []),
             "image": img,
             "startFrame": scene_start,
             "durationFrames": dur_frames,
@@ -444,7 +518,9 @@ def build_video_props(job: M.TutorialJob, scenes: list[dict], voiceover: Path | 
 def validate_video_props(props: dict) -> list[str]:
     """Composition QA before render: every scene needs a visual in bounds,
     captions inside safe margins, durations accommodating narration, and
-    highlights aligned. Returns blocking issues (empty = renderable)."""
+    highlights aligned. Also enforces the no-duplication contract: one
+    caption chunk per beat, no repeated bodies, static instruction never
+    identical to a caption chunk. Returns blocking issues (empty = renderable)."""
     issues: list[str] = []
     try:
         w, h = int(props.get("width", 0)), int(props.get("height", 0))
@@ -453,23 +529,42 @@ def validate_video_props(props: dict) -> list[str]:
         scenes = props.get("scenes") or []
         if not scenes:
             issues.append("no scenes to render")
+        seen_steps: list = []
         for s in scenes:
             n = s.get("step", "?")
+            seen_steps.append(s.get("step"))
             if not s.get("image"):
                 issues.append(f"step {n}: missing visual")
                 continue
             iw, ih = int(s.get("imageW", 0)), int(s.get("imageH", 0))
             if iw <= 0 or ih <= 0:
                 issues.append(f"step {n}: unreadable image dimensions")
+            # Display is always a contained side card (see ProcedureVideo
+            # LAYOUT.imgW/imgH); sources may be full-canvas frames — they are
+            # scaled into the card, never stretched. Guard only aspect sanity.
+            if iw > 0 and ih > 0 and (iw / ih > 8 or ih / iw > 8):
+                issues.append(f"step {n}: implausible image aspect ratio")
             if not str(s.get("caption", "") or "").strip() and not str(s.get("title", "") or "").strip():
                 issues.append(f"step {n}: no caption or title")
             if int(s.get("durationFrames", 0)) <= 0:
                 issues.append(f"step {n}: non-positive duration")
+            bodies = [str(b.get("body", "") or "") for b in (s.get("beats") or []) if int(b.get("durationFrames", 0)) > 0]
+            if bodies and len(set(bodies)) != len(bodies):
+                issues.append(f"step {n}: duplicate caption chunks across beats")
+            instr = str(s.get("instruction") or "").strip()
+            for b in bodies:
+                if instr and b.strip() == instr:
+                    issues.append(f"step {n}: static instruction duplicated verbatim as caption")
+                    break
             for b in (s.get("beats") or []):
                 if int(b.get("durationFrames", 0)) <= 0:
                     issues.append(f"step {n}: beat with non-positive duration")
                 if len(str(b.get("body", "") or "")) > 500:
                     issues.append(f"step {n}: caption beat exceeds readable length")
+        if seen_steps != sorted(seen_steps):
+            issues.append("scenes are not in guide step order")
+        if len(set(seen_steps)) != len(seen_steps):
+            issues.append("duplicated guide steps in scene plan")
     except Exception as e:
         issues.append(f"validation crashed: {type(e).__name__}")
     return issues
@@ -512,13 +607,30 @@ def validate_scene_plan(scenes: object, duration_sec: float) -> list[dict]:
             raise ValueError(f"Scene {i + 1}: range exceeds the {dur:.0f}s source recording")
         vis = s.get("visual") or {}
         vis_name = str(vis.get("name", "") or "")[:200] if isinstance(vis, dict) else ""
+        # Preserve guide linkage + content through validation: dropping
+        # objects_used/narration here silently degrades accepted-visual and
+        # overlay matching downstream.
+        _oids = s.get("objects_used") or []
+        try:
+            _oids = [int(x) for x in _oids]
+        except (TypeError, ValueError):
+            _oids = [x for x in _oids if isinstance(x, int)]
+        _chunks = [str(x)[:200] for x in (s.get("caption_chunks") or []) if str(x).strip()][:4]
         clean.append({
             "step": int(s.get("step", s.get("step_number", i + 1)) or (i + 1)),
             "title": title,
             "caption": caption,
+            "instruction": str(s.get("instruction") or "")[:300],
+            "narration": str(s.get("narration") or caption)[:1200],
+            "caption_chunks": _chunks,
+            "objects_used": _oids,
+            "expected_result": str(s.get("expected_result") or "")[:300],
+            "required_tools": [str(x) for x in (s.get("required_tools") or [])][:6],
             "audio_start": round(astart, 2),
             "audio_end": round(aend, 2),
-            "visual": {"name": vis_name} if vis_name else {},
+            "visual": ({"name": vis_name,
+                        "kind": str(vis.get("kind", ""))[:40],
+                        "label": str(vis.get("label", ""))[:120]} if vis_name else {}),
             "include": bool(s.get("include", True)),
         })
     included = [c for c in clean if c["include"]]
@@ -560,6 +672,12 @@ def suggest_scene_plan(job: M.TutorialJob, db=None) -> dict:
             "step": int(sc.get("step_number", sc.get("step", i + 1)) or (i + 1)),
             "title": str(sc.get("title", "") or f"Scene {i + 1}"),
             "caption": str(sc.get("caption", "") or ""),
+            "instruction": str(sc.get("instruction") or "")[:300],
+            "narration": str(sc.get("narration") or sc.get("caption") or "")[:1200],
+            "caption_chunks": [str(x)[:200] for x in (sc.get("caption_chunks") or []) if str(x).strip()][:4],
+            "objects_used": sc.get("objects_used") or [],
+            "expected_result": str(sc.get("expected_result") or "")[:300],
+            "required_tools": sc.get("required_tools") or [],
             "audio_start": sc.get("audio_start", sc.get("start", 0)),
             "audio_end": sc.get("audio_end", sc.get("end", 0)),
             "visual": {"name": vis_name} if vis_name else {},
@@ -594,15 +712,6 @@ def accepted_visual_hints(db, job_id: str) -> list[dict]:
         out.append({"label": a.instruction or a.kind or "visual", "name": name,
                     "asset_id": a.id, "kind": a.kind})
     return out
-
-
-def _latest_guide_snapshot(db, job_id: str):
-    try:
-        return db.scalars(select(M.GuideSnapshot).where(
-            M.GuideSnapshot.tutorial_id == job_id
-        ).order_by(M.GuideSnapshot.created_at.desc())).first()
-    except Exception:
-        return None
 
 
 def _latest_guide_snapshot(db, job_id: str):
@@ -1252,28 +1361,63 @@ def run_video_guide_job(vg_id: str) -> dict:
         vg.status, vg.progress = "rendering", 5
         db.commit()
         # Studio-edited scene plan (stored on the row by the scenes endpoint)
-        # wins over AI planning: the render reproduces exactly the saved plan.
+        # wins: the render reproduces exactly the saved plan. Otherwise the
+        # automatic path builds scenes deterministically from the frozen
+        # guide snapshot — never a fresh AI reinterpretation of the
+        # transcript. The guide is the source of truth.
         stored = [s for s in (vg.scenes or []) if isinstance(s, dict) and s.get("title")]
         stored = [s for s in stored if s.get("include", True)]
         if stored:
             scenes = [{"step": int(s.get("step", i + 1)), "title": str(s.get("title", "")),
                        "caption": str(s.get("caption", "") or ""),
+                       "instruction": str(s.get("instruction") or "")[:300],
+                       "narration": str(s.get("narration") or s.get("caption") or "")[:1200],
+                       "caption_chunks": [str(x)[:200] for x in (s.get("caption_chunks") or []) if str(x).strip()][:4],
+                       "objects_used": s.get("objects_used") or [],
+                       "expected_result": str(s.get("expected_result", "") or "")[:300],
+                       "required_tools": s.get("required_tools") or [],
                        "audio_start": float(s.get("audio_start", s.get("start", 0)) or 0),
                        "audio_end": float(s.get("audio_end", s.get("end", 0)) or 0),
                        "visual": s.get("visual") or {}} for i, s in enumerate(stored)]
             plan = {"scenes": scenes, "model": "studio-scene-plan", "simulated": False,
                     "note": "Edited scene plan from Tutorial Studio; voiceover cut from the original recording."}
+            source_snapshot_id = str(vg.source_snapshot_id or "")
+            source_steps_hash = str(vg.source_steps_hash or "")
+            source_content_revision = int(vg.source_content_revision or 0)
         else:
-            with proc.timed() as t:
-                plan = ai.plan_video_scenes(job.title, job.steps or [], job.objects or [],
-                                            job.timed_segments or [],
-                                            guide_markdown=job.guide_markdown or "",
-                                            guide_format=job.guide_format or "",
-                                            accepted_visuals=accepted_visual_hints(db, job.id))
-            plan_ms = t.ms
-            scenes = plan.get("scenes", [])
+            from .tutorial import _canonical_hash
+            snap = _latest_guide_snapshot(db, job.id)
+            if snap is None:
+                raise RuntimeError("No generated guide snapshot found — generate the guide before generating the video.")
+            snap_steps = list(snap.steps or [])
+            if not snap_steps:
+                # Backfill for snapshots created before steps were recorded.
+                snap_steps = list(job.steps or [])
+            if not snap_steps:
+                raise RuntimeError("The guide snapshot has no steps to render.")
+            scenes, scene_warnings = _scenes_from_guide_steps(job.title, snap_steps, job.timed_segments or [])
             if not scenes:
-                raise RuntimeError("Could not plan video scenes from this tutorial.")
+                raise RuntimeError("Could not plan video scenes from this guide.")
+            # Fidelity guard: exactly the snapshot's steps, in order, once each.
+            snap_nums = []
+            for s in snap_steps:
+                try:
+                    snap_nums.append(int(s.get("step_number", 0)))
+                except (TypeError, ValueError):
+                    continue
+            got_nums = [int(s.get("step_number", 0)) for s in scenes]
+            if got_nums != snap_nums:
+                raise RuntimeError(f"Scene plan does not match the guide snapshot (expected steps {snap_nums}, got {got_nums}).")
+            source_snapshot_id = snap.id
+            source_steps_hash = _canonical_hash(snap_steps)
+            source_content_revision = int(snap.content_revision or 0)
+            plan = {"scenes": scenes, "model": "guide-snapshot-direct", "simulated": False,
+                    "note": f"Deterministic scenes from guide snapshot {snap.id[:8]} ({len(scenes)} steps, in guide order)."}
+            plan_ms = 0
+            if scene_warnings:
+                proc.safe_record(db, "tutorial", job.id, "video_guide", "succeeded",
+                                 operation="plan_scenes_from_guide", actor=actor,
+                                 summary={"warnings": scene_warnings})
         if stored:
             plan_ms = 0
         # Every scene gets a real visual: accepted -> source-derived ->
@@ -1349,11 +1493,23 @@ def run_video_guide_job(vg_id: str) -> dict:
         vg.scenes = [{"step": int(s.get("step", s.get("step_number", i + 1)) or (i + 1)),
                       "title": str(s.get("title", "")),
                       "caption": str(s.get("caption", "") or ""),
+                      "instruction": str(s.get("instruction") or "")[:300],
+                      "narration": str(s.get("narration") or s.get("caption") or "")[:1200],
+                      "caption_chunks": list(s.get("caption_chunks") or []),
+                      "objects_used": list(s.get("objects_used") or []),
+                      "expected_result": str(s.get("expected_result", "") or "")[:300],
                       "audio_start": float(s.get("audio_start", 0) or 0),
                       "audio_end": float(s.get("audio_end", 0) or 0),
                       "visual": s.get("visual") or {}, "include": True} for i, s in enumerate(scenes)]
         vg.simulated = bool(plan.get("simulated", True))
+        vg.source_snapshot_id = source_snapshot_id if not stored else str(vg.source_snapshot_id or "")
+        if not stored:
+            vg.source_steps_hash = source_steps_hash
+            vg.source_content_revision = source_content_revision
         vg.provenance = {**_video_fingerprint(db, job),
+                         "source_snapshot_id": vg.source_snapshot_id,
+                         "source_steps_hash": vg.source_steps_hash,
+                         "source_content_revision": vg.source_content_revision,
                          "model": plan.get("model", ""), "note": plan.get("note", ""),
                          "voiceover_sec": round(voice_sec, 1),
                          "voiceover": ("original-recording-cut" if voiceover else

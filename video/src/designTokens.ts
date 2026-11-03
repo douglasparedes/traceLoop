@@ -14,11 +14,11 @@ export const TOKENS = {
   muted: "#9fc3b5",
   font: "system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif",
   radius: { card: 18, pill: 14, badge: 16 },
-  // Balanced instructional layout (16:9): image 55-65%, text/captions rest.
-  // Landscape images render as a contained card inside the safe area —
-  // never full-bleed — so instructions stay readable.
-  safe: { x: 64, top: 160, bottom: 170 },
-  imageCard: { maxW: 780, maxH: 430, radius: 18 },
+  // Balanced instructional-video layout (16:9): ~60% text/instruction,
+  // ~30% supporting illustration card, rest spacing + captions. Images
+  // render contained in the fixed side card — never full-bleed.
+  safe: { x: 64, top: 150, bottom: 170 },
+  imageCard: { maxW: 380, maxH: 300, radius: 18 },
   caption: { maxLines: 2, font: 32, fontBig: 38, bottom: 52 },
   header: { top: 44, badge: 72 },
   overlay: { dim: "brightness(0.55)" },

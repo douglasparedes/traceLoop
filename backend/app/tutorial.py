@@ -1189,7 +1189,6 @@ def snapshot_guide(db, job: M.TutorialJob, trigger: str, md: str, objects: list 
                    model: str = "", simulated: bool = True, materials: list | None = None,
                    guide_format: str = "", format_source: str = "", format_rationale: str = "") -> M.GuideSnapshot:
     """Persist an immutable record of one guide generation.
-
     The live guide_markdown on TutorialJob keeps moving (refreshes, tap
     corrections); snapshots preserve what each generation produced, with
     which models, from which objects, in which format, and why.
@@ -1205,7 +1204,11 @@ def snapshot_guide(db, job: M.TutorialJob, trigger: str, md: str, objects: list 
         content_revision=int(getattr(job, "content_revision", 1) or 1),
         object_statuses=[{"obj_id": o.get("obj_id"), "label": o.get("label"),
                           "status": o.get("status"), "confidence": o.get("confidence")}
-                         for o in (objects or [])])
+                         for o in (objects or [])],
+        steps=[{k: s.get(k) for k in ("step_number", "title", "summary", "start", "end",
+                                      "objects_used", "expected_result", "verification_notes",
+                                      "required_tools", "evidence_frames", "confidence", "derivation")
+                if k in (s or {})} for s in (job.steps or [])])
     db.add(snap)
     db.flush()
     return snap

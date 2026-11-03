@@ -2,7 +2,7 @@
 import asyncio, json, time
 from playwright.async_api import async_playwright
 
-OUT = "C:/Users/dougl/Documents/MetaHackaton/demo/assets/captures"
+OUT = "C:/Users/dougl/AppData/Local/Temp/traceloop_stage/shots"
 PHOTO = "C:/Users/dougl/Documents/MetaHackaton/demo/assets/source-footage/trainer.png"
 T0 = time.time()
 def mark(n):
@@ -25,6 +25,13 @@ async def main():
         ctx = await b.new_context(viewport={"width":390,"height":844}, is_mobile=True,
             has_touch=True, device_scale_factor=2,
             record_video_dir=OUT, record_video_size={"width":390,"height":844})
+        try:
+            await run(ctx)
+        finally:
+            await ctx.close(); await b.close()
+
+
+async def run(ctx):
         pg = await ctx.new_page()
         await pg.goto("http://localhost:5173", wait_until="networkidle")
         await pg.wait_for_timeout(1500)
@@ -37,12 +44,19 @@ async def main():
         await pg.wait_for_timeout(1000)
         mark("card")
         await pg.wait_for_timeout(3500)
-        # download icon = first empty-text button after first "Start job"
-        await pg.evaluate("var bs=[...document.querySelectorAll('button')];var i=bs.findIndex(b=>/Start (job|additional run)/.test(b.textContent));var dl=bs.slice(i).find(b=>b.textContent.trim()==='');if(dl)dl.click();")
+        await pg.screenshot(path=f"{OUT}/c2-card-check.png")
+        # card-scoped: walk up from title until container holds the Start button
+        dl_js = """var t=[...document.querySelectorAll('*')].find(e=>e.children.length===0&&/Adjustment-knob check \\(tutorial\\)/.test(e.textContent));
+var el=t;var guard=0;while(el&&guard<12){var bs=[...el.querySelectorAll(':scope button')];if(bs.some(b=>/Start (job|additional run)|Run again/.test(b.textContent)))break;el=el.parentElement;guard++;}
+var bs=[...el.querySelectorAll('button')];var i=bs.findIndex(b=>/Start (job|additional run)|Run again/.test(b.textContent));var dl=bs.slice(i).find(b=>b.textContent.trim()==='');window.__cardTitle=el.innerText.slice(0,120);if(dl)dl.click();window.__dlClicked=!!dl;"""
+        await pg.evaluate(dl_js)
+        print("CARD:", await pg.evaluate("window.__cardTitle"), "DL:", await pg.evaluate("window.__dlClicked"))
         await pg.wait_for_timeout(4000)
         mark("offline-saved")
         await pg.screenshot(path=f"{OUT}/c2-cached.png")
-        await pg.evaluate("var b=[...document.querySelectorAll('button')].find(x=>/Start (job|additional run)/.test(x.textContent));if(b)b.click()")
+        await pg.evaluate("""var t=[...document.querySelectorAll('*')].find(e=>e.children.length===0&&/Adjustment-knob check \\(tutorial\\)/.test(e.textContent));
+var el=t;var guard=0;while(el&&guard<12){var bs=[...el.querySelectorAll(':scope button')];if(bs.some(b=>/Start (job|additional run)|Run again/.test(b.textContent)))break;el=el.parentElement;guard++;}
+var b=[...el.querySelectorAll('button')].find(x=>/Start (job|additional run)|Run again/.test(x.textContent));if(b)b.click()""")
         await pg.wait_for_timeout(3000)
         mark("job-started")
         await pg.screenshot(path=f"{OUT}/c2-job1.png")
@@ -75,7 +89,7 @@ async def main():
             await pg.wait_for_timeout(1500)
             await pg.screenshot(path=f"{OUT}/c2-note-open.png")
             await dump(pg, "NOTEBTN:")
-            inputs = pg.locator("textarea, input[type=text], input:not([type])")
+            inputs = pg.locator("textarea[placeholder^='e.g. Left clip']")
             cnt = await inputs.count()
             print("NOTEINPUTS:", cnt)
             if cnt:
@@ -111,12 +125,15 @@ async def main():
         await dump(pg, "ACTBTN:")
         await pg.screenshot(path=f"{OUT}/c2-activity.png")
         try:
-            await pg.locator("button", has_text="Sync now").click(timeout=6000)
-            await pg.wait_for_timeout(5000)
+            await pg.locator("button", has_text="Sync now").click(timeout=4000)
+            await pg.wait_for_timeout(4000)
             mark("synced")
             await pg.screenshot(path=f"{OUT}/c2-synced.png")
         except Exception as e:
-            print("SYNC-FAIL", str(e)[:200])
-        await ctx.close(); await b.close()
+            print("SYNC-FAIL (auto-sync likely done)", str(e)[:120])
+            await pg.wait_for_timeout(2000)
+            await pg.screenshot(path=f"{OUT}/c2-synced.png")
+        await pg.wait_for_timeout(2000)
+        mark("session-done")
 
 asyncio.run(main())

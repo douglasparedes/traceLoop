@@ -66,7 +66,11 @@ with engine.begin() as _conn:
                                 ("tutorial_jobs", "strategy_reason", "TEXT DEFAULT ''"),
                                 ("tutorial_jobs", "origin", "VARCHAR DEFAULT 'recorded'"),
                                 ("tutorial_jobs", "keyframes", "TEXT DEFAULT '[]'"),
-                                ("video_guides", "version_number", "INTEGER DEFAULT 1")):
+                                ("video_guides", "version_number", "INTEGER DEFAULT 1"),
+                                ("video_guides", "source_snapshot_id", "VARCHAR DEFAULT ''"),
+                                ("video_guides", "source_steps_hash", "VARCHAR DEFAULT ''"),
+                                ("video_guides", "source_content_revision", "INTEGER DEFAULT 0"),
+                                ("guide_snapshots", "steps", "TEXT DEFAULT '[]'")):
         if _insp.has_table(_table) and _col not in {c["name"] for c in _insp.get_columns(_table)}:
             _conn.execute(_text(f"ALTER TABLE {_table} ADD COLUMN {_col} {_type}"))
 
