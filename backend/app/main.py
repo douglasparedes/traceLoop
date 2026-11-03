@@ -3181,20 +3181,31 @@ def get_job_evidence(jid: str, db: Session = Depends(get_db)):
 
 @app.post("/api/jobs/{jid}/evidence")
 async def add_job_evidence(jid: str, file: UploadFile = File(...), description: str = Form(default="Job photo evidence"),
-                           step_id: str = Form(default=""), db: Session = Depends(get_db), who=Depends(actor)):
+                           step_id: str = Form(default=""), reconcile: bool = False,
+                           db: Session = Depends(get_db), who=Depends(actor)):
     j = db.get(M.JobSession, jid)
     if not j: raise HTTPException(404, "Job not found")
     if who["id"] != j.technician_id and who["role"] not in ("reviewer", "admin", "expert"):
         raise HTTPException(403, "Only the assigned technician or a reviewer can attach evidence to this job")
-    if j.status == "finished": raise HTTPException(409, "Job is finished; evidence can no longer be attached")
+    reconciled = False
+    if j.status == "finished":
+        # Reconciliation window: evidence captured around finalization (or
+        # still uploading when the job closed) may land afterwards, marked
+        # explicitly — never silently, and only with intent + authorization.
+        if not reconcile:
+            raise HTTPException(409, "Job is finished; pass reconcile=true to attach this as reconciled evidence")
+        reconciled = True
     if file.content_type not in ("image/jpeg", "image/png", "image/webp"):
         raise HTTPException(415, "Only JPEG, PNG or WebP images are supported")
     data = await file.read()
     if len(data) > MAX_IMG_BYTES: raise HTTPException(413, "Image too large (max 8 MB)")
     digest = hashlib.sha256(data).hexdigest()[:16]
     ref = f"job:{jid}" + (f":{step_id}" if step_id else "")
+    extra: dict = {"sha256_16": digest, "size": len(data)}
+    if reconciled:
+        extra["reconciled_after_finish"] = True
     e = M.Evidence(capture_session_id=None, evidence_type="image", description=description or "Job photo evidence",
-                   source_reference=ref, created_by=who["id"], extra={"sha256_16": digest, "size": len(data)})
+                   source_reference=ref, created_by=who["id"], extra=extra)
     db.add(e); db.flush()
     suffix = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}.get(file.content_type or "", ".jpg")
     store_dir = _storage.media_root() / "evidence"
@@ -3208,16 +3219,100 @@ async def add_job_evidence(jid: str, file: UploadFile = File(...), description: 
 
 @app.post("/api/jobs/{jid}/finish")
 def finish_job(jid: str, body: S.FinishJob, db: Session = Depends(get_db), who=Depends(actor)):
+    """Legacy finish entry point — now routed through the canonical finalizer
+    so online and offline completions obey identical lifecycle rules."""
+    return _finalize_job_core(db, jid, who, reason=body.reason, exceptional=False)
+
+
+@app.post("/api/jobs/{jid}/finish-exceptional")
+def finish_job_exceptional(jid: str, body: S.FinishExceptional, db: Session = Depends(get_db), who=Depends(actor)):
+    """Exceptional closure for jobs with unresolved blocked steps.
+
+    Distinct, permission-controlled action: requires a reviewer (or admin),
+    a non-empty reason, and records the exception explicitly. It is never
+    the default Finish flow.
+    """
+    if who["role"] not in ("reviewer", "admin"):
+        raise HTTPException(403, "Exceptional closure requires a reviewer or admin")
+    if not (body.reason or "").strip():
+        raise HTTPException(422, "A reason is required for exceptional closure")
+    return _finalize_job_core(db, jid, who, reason=body.reason.strip(), exceptional=True)
+
+
+def _finalize_job_core(db, jid: str, who: dict, reason: str, exceptional: bool,
+                       step_event: dict | None = None) -> dict:
+    """One canonical finalization service used by every finish path.
+
+    Optionally records one step_completed event first (idempotent on its
+    event id — this is how the final step and the finish land atomically),
+    then validates ownership, job state, pinned revision, and full terminal
+    coverage in a single transaction and computes the outcome server-side.
+    Blocked steps halt normal finalization — only an explicit, authorized
+    exceptional close with a reason may finish over them.
+    """
+    from sqlalchemy.exc import IntegrityError as _IntegrityError
     j = db.get(M.JobSession, jid)
-    if not j: raise HTTPException(404, "Job not found")
+    if not j:
+        raise HTTPException(404, "Job not found")
     if who["id"] != j.technician_id and who["role"] not in ("reviewer", "admin", "expert"):
         raise HTTPException(403, "Only the assigned technician or a reviewer can finish this job")
-    if j.status == "finished": return {"ok": True, "already_finished": True}
-    j.status = "finished"; j.outcome = body.outcome; j.finish_reason = body.reason
-    j.ended_at = datetime.now(timezone.utc)
-    audit(db, who["id"], "job.finish", "job_session", j.id, {"outcome": body.outcome})
-    db.commit()
-    return {"ok": True}
+    if j.status == "finished":
+        return {"ok": True, "already_finished": True, "outcome": j.outcome}
+    v = db.get(M.ProcedureVersion, j.procedure_version_id)
+    if not v:
+        raise HTTPException(409, "The job's pinned procedure revision is missing")
+    if v.status != "approved" and v.status != "superseded":
+        raise HTTPException(409, "The job's pinned revision is not executable")
+    step_ids = {s.id for s in v.steps}
+    if step_event is not None and step_event.get("step_id") not in step_ids:
+        raise HTTPException(422, "That step does not belong to this job's pinned procedure revision")
+    try:
+        if step_event is not None:
+            if not db.scalar(select(M.JobEvent).where(M.JobEvent.event_id == step_event["event_id"])):
+                if not db.scalar(select(M.JobEvent).where(
+                        M.JobEvent.session_id == jid, M.JobEvent.step_id == step_event["step_id"],
+                        M.JobEvent.event_type == "step_completed")):
+                    db.add(M.JobEvent(event_id=step_event["event_id"], session_id=jid,
+                                      step_id=step_event["step_id"], event_type="step_completed",
+                                      payload={"final": True, "step_order": step_event.get("step_order")},
+                                      occurred_at=step_event["occurred_at"], created_by=who["id"]))
+                    db.flush()
+        fp = _project_job_state(db, j)
+        missing = list(fp["missing_step_orders"])
+        if missing:
+            db.rollback()
+            raise HTTPException(422, "Steps still need an outcome on the server before finishing: "
+                                + ", ".join(str(n) for n in missing)
+                                + ". Complete, skip, or resolve each listed step first — "
+                                + "unsynced work cannot finalize what the server has not seen.")
+        blocked = [p["step_order"] for p in fp["steps"] if p["state"] == "blocked"]
+        if blocked and not exceptional:
+            db.rollback()
+            raise HTTPException(422, "Step(s) " + ", ".join(str(n) for n in blocked)
+                                + " are blocked. Resolve each blocked step, skip it explicitly, "
+                                + "or ask a reviewer for an exceptional closure with a recorded reason.")
+        outcome = "completed"
+        if any(p["state"] != "done" for p in fp["steps"]) or exceptional:
+            outcome = "finished-with-exceptions"
+        if exceptional and not blocked:
+            outcome = "finished-with-exceptions"
+        j.status = "finished"
+        j.outcome = outcome
+        j.finish_reason = reason
+        j.ended_at = datetime.now(timezone.utc)
+        audit(db, who["id"], "job.finalize" if not exceptional else "job.finish_exceptional",
+              "job_session", j.id, {"outcome": outcome, "reason": reason, "exceptional": exceptional})
+        db.commit()
+        db.refresh(j)
+        return {"ok": True, "outcome": outcome}
+    except HTTPException:
+        raise
+    except _IntegrityError:
+        db.rollback()
+        rej = db.get(M.JobSession, jid)
+        if rej is not None and rej.status == "finished":
+            return {"ok": True, "already_finished": True, "outcome": rej.outcome}
+        raise HTTPException(409, "Finalization conflict — reload the job and retry")
 
 
 # Event types the server accepts. Unknown types are rejected at the sync
@@ -3269,12 +3364,19 @@ def _project_job_state(db, job: M.JobSession) -> dict:
               "blocked": sum(1 for p in per_step if p["state"] == "blocked")}
     last = evs[-1].occurred_at.isoformat() if evs else None
     missing = [p["step_order"] for p in per_step if p["state"] == "pending"]
+    blocked_here = [p["step_order"] for p in per_step if p["state"] == "blocked"]
     return {"job_id": job.id, "status": job.status, "outcome": job.outcome,
             "procedure_version_id": job.procedure_version_id,
             "steps": per_step, "current": current, "counts": counts,
             "missing_step_orders": missing, "events": len(evs),
             "last_activity": last, "finished": job.status == "finished",
-            "ended_at": job.ended_at.isoformat() if job.ended_at else None}
+            "ended_at": job.ended_at.isoformat() if job.ended_at else None,
+            # Authoritative execution gates: the frontend displays these,
+            # it does not recompute them.
+            "can_proceed": (not job.status == "finished") and not blocked_here and current is not None,
+            "can_finalize": (not job.status == "finished") and not missing and not blocked_here,
+            "blocking_step_orders": blocked_here,
+            "exceptional_close_allowed": (not job.status == "finished") and bool(blocked_here)}
 
 
 @app.get("/api/jobs/{jid}/state")
@@ -3293,72 +3395,65 @@ def job_state(jid: str, db: Session = Depends(get_db)):
 def finalize_job(jid: str, body: S.FinalizeJob, db: Session = Depends(get_db), who=Depends(actor)):
     """Atomically record the final step completion and finish the job.
 
-    One transaction: the step_completed event (idempotent on event_id) plus
-    the finished status, outcome, and timestamp. Finalization requires every
-    step to already carry a terminal state (completed/skipped/blocked);
-    otherwise it fails with 422 listing the missing steps — the client must
-    complete, skip, or resolve them first. The outcome is always computed
-    server-side: all-completed gives "completed", anything else gives
-    "completed-with-exceptions".
+    Delegates to the canonical finalizer shared by every finish path, so
+    online and offline completions obey identical lifecycle rules. The step
+    event rides along idempotently; blocked steps halt normal finalization
+    (use the exceptional close for those).
     """
-    from sqlalchemy.exc import IntegrityError as _IntegrityError
-    j = db.get(M.JobSession, jid)
-    if not j: raise HTTPException(404, "Job not found")
-    if who["id"] != j.technician_id and who["role"] not in ("reviewer", "admin", "expert"):
-        raise HTTPException(403, "Only the assigned technician or a reviewer can finalize this job")
-    if j.status == "finished":
-        return {"ok": True, "already_finished": True, "outcome": j.outcome}
-    v = db.get(M.ProcedureVersion, j.procedure_version_id)
-    if not v: raise HTTPException(409, "The job's pinned procedure revision is missing")
-    step_ids = {s.id for s in v.steps}
-    if body.step_id not in step_ids:
-        raise HTTPException(422, "That step does not belong to this job's pinned procedure revision")
     occ = datetime.now(timezone.utc)
     if body.occurred_at:
-        try: occ = datetime.fromisoformat(body.occurred_at.replace("Z", "+00:00"))
-        except ValueError: pass
-    try:
-        if not db.scalar(select(M.JobEvent).where(M.JobEvent.event_id == body.event_id)):
-            if not db.scalar(select(M.JobEvent).where(
-                    M.JobEvent.session_id == jid, M.JobEvent.step_id == body.step_id,
-                    M.JobEvent.event_type == "step_completed")):
-                db.add(M.JobEvent(event_id=body.event_id, session_id=jid, step_id=body.step_id,
-                                  event_type="step_completed",
-                                  payload={"final": True}, occurred_at=occ, created_by=who["id"]))
-        proj = _project_job_state(db, j)
-        order = sorted(v.steps, key=lambda s: s.step_order)
-        effective = {p["step_id"]: p["state"] for p in proj["steps"]}
-        effective[body.step_id] = "done"  # the event recorded above (or already present)
-        terminal = {"done", "skipped", "blocked"}
-        missing = [s.step_order for s in order if effective.get(s.id) not in terminal]
-        if missing:
-            db.rollback()
-            raise HTTPException(422, "Steps still need an outcome on the server before finishing: "
-                                + ", ".join(str(n) for n in missing)
-                                + ". If you already recorded them on this device, sync first — "
-                                "unsynced work cannot be finalized. Otherwise complete, skip, or "
-                                "resolve each listed step first.")
-        outcome = ("completed" if all(effective.get(s.id) == "done" for s in order)
-                   else "finished-with-exceptions")
-        j.status = "finished"; j.outcome = outcome; j.finish_reason = body.reason
-        j.ended_at = datetime.now(timezone.utc)
-        audit(db, who["id"], "job.finalize", "job_session", j.id, {"outcome": outcome})
-        db.commit()
-        return {"ok": True, "outcome": outcome}
-    except HTTPException:
-        raise
-    except _IntegrityError:
-        db.rollback()
-        rej = db.get(M.JobSession, jid)
-        if rej is not None and rej.status == "finished":
-            return {"ok": True, "already_finished": True, "outcome": rej.outcome}
-        raise HTTPException(409, "Finalization conflict — reload the job and retry")
+        try:
+            occ = datetime.fromisoformat(body.occurred_at.replace("Z", "+00:00"))
+        except ValueError:
+            pass
+    _job = db.get(M.JobSession, jid)
+    _ver = db.get(M.ProcedureVersion, _job.procedure_version_id) if _job else None
+    step_order = next((s.step_order for s in (_ver.steps if _ver else []) if s.id == body.step_id), None)
+    return _finalize_job_core(db, jid, who, reason="", exceptional=False, step_event={
+        "step_id": body.step_id, "event_id": body.event_id, "occurred_at": occ,
+        "step_order": step_order})
 
 
 @app.post("/api/sync/events")
 def sync_events(body: S.SyncRequest, db: Session = Depends(get_db), who=Depends(actor)):
+    """Durable, idempotent event intake with lifecycle validation.
+
+    Every event is acknowledged individually: unknown types, unknown
+    sessions/sessions already finished, unknown step ids, and illegal
+    terminal transitions are reported as failures (the client classifies
+    them and keeps the item queued for a human decision) — never silently
+    stored and never silently dropped.
+    """
+    TERMINAL = {"step_completed", "step_skipped", "step_blocked"}
+    STEP_SCOPED = {"step_completed", "step_skipped", "step_blocked", "step_resumed"}
     acked, dupes, failed = [], [], []
     seen: set[str] = set()
+    # Per-session caches so validation is one query per session, not event.
+    sessions: dict[str, object] = {}
+    terminals: dict[str, dict[str, str]] = {}
+    valid_steps: dict[str, set[str]] = {}
+
+    def session_state(sid: str):
+        if sid not in sessions:
+            s = db.get(M.JobSession, sid)
+            sessions[sid] = s
+            if s is None:
+                return None, None, None
+            v = db.get(M.ProcedureVersion, s.procedure_version_id)
+            valid_steps[sid] = {st.id for st in v.steps} if v else set()
+            term: dict[str, str] = {}
+            rows = db.scalars(select(M.JobEvent).where(
+                M.JobEvent.session_id == sid).order_by(M.JobEvent.occurred_at)).all()
+            for r in rows:
+                if not r.step_id:
+                    continue
+                if r.event_type in ("step_completed", "step_skipped", "step_blocked"):
+                    term[r.step_id] = r.event_type
+                elif r.event_type == "step_resumed":
+                    term.pop(r.step_id, None)
+            terminals[sid] = term
+        return sessions[sid], terminals.get(sid, {}), valid_steps.get(sid, set())
+
     for ev in body.events:
         if not ev.event_id or not ev.session_id:
             failed.append({"event_id": ev.event_id, "error": "event_id and session_id are required"}); continue
@@ -3371,18 +3466,48 @@ def sync_events(body: S.SyncRequest, db: Session = Depends(get_db), who=Depends(
         if ev.event_type not in SYNC_EVENT_TYPES:
             failed.append({"event_id": ev.event_id,
                            "error": f"Unknown event_type '{ev.event_type}' — this client version is sending events the server does not understand"}); continue
-        session = db.get(M.JobSession, ev.session_id)
-        if not session:
+        session, term, steps = session_state(ev.session_id)
+        if session is None:
             failed.append({"event_id": ev.event_id, "error": "Unknown session_id"}); continue
-        if session.status == "finished":
+        if ev.step_id and ev.event_type in STEP_SCOPED and ev.step_id not in steps:
             failed.append({"event_id": ev.event_id,
-                           "error": "Session already finished — step events cannot be recorded after finalization"}); continue
+                           "error": "Step does not belong to this job's pinned procedure revision"}); continue
+        if session.status == "finished":
+            # Post-finalization only reconciled evidence may land; everything
+            # else would silently rewrite a closed job.
+            if ev.event_type == "evidence_attached":
+                pass
+            else:
+                failed.append({"event_id": ev.event_id,
+                               "error": "Session already finished — step events cannot be recorded after finalization"}); continue
+        if ev.step_id and ev.event_type in TERMINAL:
+            identical = db.scalar(select(M.JobEvent).where(
+                M.JobEvent.session_id == ev.session_id, M.JobEvent.step_id == ev.step_id,
+                M.JobEvent.event_type == ev.event_type))
+            if identical:
+                dupes.append(ev.event_id); continue
+            cur = term.get(ev.step_id)
+            if cur is not None:
+                failed.append({"event_id": ev.event_id,
+                               "error": f"Step already has a terminal state ({cur}). Resume it first if it was blocked; completed or skipped steps cannot be silently overwritten."}); continue
+        if ev.event_type == "step_resumed" and ev.step_id:
+            if term.get(ev.step_id) != "step_blocked":
+                failed.append({"event_id": ev.event_id,
+                               "error": "Only a blocked step can be resumed"}); continue
+        if ev.event_type == "step_blocked" and ev.step_id and term.get(ev.step_id) == "blocked":
+            dupes.append(ev.event_id); continue
         occ = datetime.now(timezone.utc)
         if ev.occurred_at:
             try: occ = datetime.fromisoformat(ev.occurred_at.replace("Z", "+00:00"))
             except ValueError: pass
         db.add(M.JobEvent(event_id=ev.event_id, session_id=ev.session_id, step_id=ev.step_id,
                           event_type=ev.event_type, payload=ev.payload, occurred_at=occ, created_by=who["id"]))
+        # Keep the in-batch projection current for subsequent events.
+        if ev.step_id:
+            if ev.event_type in ("step_completed", "step_skipped", "step_blocked"):
+                term[ev.step_id] = ev.event_type
+            elif ev.event_type == "step_resumed":
+                term.pop(ev.step_id, None)
         acked.append(ev.event_id)
     db.commit()
     return {"acknowledged": acked, "duplicates": dupes, "failed": failed}

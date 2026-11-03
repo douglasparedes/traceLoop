@@ -194,9 +194,90 @@ def test_start_duplicate_id_is_idempotent():
 
 
 def test_finish_requires_owner_or_reviewer():
-    p, _ = _seed()
+    p, ver = _seed()
     job = _start_job(p, headers=TECH)
     assert c.post(f"/api/jobs/{job['id']}/finish", json={"outcome": "completed", "reason": "", "summary": ""},
                   headers=TECH2).status_code == 403
+    # Unified finalizer: even an authorized reviewer cannot finish a job
+    # whose steps have no recorded outcomes.
     assert c.post(f"/api/jobs/{job['id']}/finish", json={"outcome": "completed", "reason": "", "summary": ""},
-                  headers=REV).status_code == 200
+                  headers=REV).status_code == 422
+    _sync(_step_events(job["id"], ver, [(i, "step_completed") for i in range(5)]), headers=TECH)
+    r = c.post(f"/api/jobs/{job['id']}/finish", json={"outcome": "completed", "reason": "", "summary": ""},
+               headers=REV)
+    assert r.status_code == 200, r.text
+    assert r.json()["outcome"] == "completed"
+
+
+def test_blocked_step_halts_normal_finalization():
+    p, ver = _seed()
+    job = _start_job(p)
+    _sync(_step_events(job["id"], ver, [(0, "step_completed"), (1, "step_blocked")] +
+                       [(i, "step_completed") for i in range(2, 5)]))
+    last = ver["steps"][-1]
+    r = c.post(f"/api/jobs/{job['id']}/finalize",
+               json={"step_id": last["id"], "event_id": "e-blocked-fin", "reason": ""}, headers=TECH)
+    assert r.status_code == 422, r.text
+    assert "blocked" in r.json()["detail"].lower()
+    assert c.post(f"/api/jobs/{job['id']}/finish",
+                  json={"outcome": "completed", "reason": "", "summary": ""}, headers=TECH).status_code == 422
+    st = c.get(f"/api/jobs/{job['id']}/state").json()
+    assert st["finished"] is False
+    assert st["can_finalize"] is False and st["can_proceed"] is False
+    assert st["blocking_step_orders"] == [2]
+    assert st["exceptional_close_allowed"] is True
+
+
+def test_exceptional_close_is_permission_controlled_and_reasoned():
+    p, ver = _seed()
+    job = _start_job(p)
+    _sync(_step_events(job["id"], ver, [(0, "step_completed"), (1, "step_blocked")] +
+                       [(i, "step_completed") for i in range(2, 5)]))
+    # Technician cannot exceptionally close someone else's blocked job path.
+    assert c.post(f"/api/jobs/{job['id']}/finish-exceptional",
+                  json={"reason": "parts unavailable"}, headers=TECH2).status_code == 403
+    # Reviewer still needs a recorded reason.
+    assert c.post(f"/api/jobs/{job['id']}/finish-exceptional",
+                  json={"reason": "   "}, headers=REV).status_code == 422
+    # Reviewer with a reason closes it, explicitly marked.
+    r = c.post(f"/api/jobs/{job['id']}/finish-exceptional",
+               json={"reason": "Seal discontinued; supervisor approved deferral"}, headers=REV)
+    assert r.status_code == 200, r.text
+    assert r.json()["outcome"] == "finished-with-exceptions"
+    st = c.get(f"/api/jobs/{job['id']}/state").json()
+    assert st["finished"] is True and st["outcome"] == "finished-with-exceptions"
+
+
+def test_sync_rejects_terminal_overwrites_and_bad_steps():
+    p, ver = _seed()
+    job = _start_job(p)
+    s0, s1 = ver["steps"][0]["id"], ver["steps"][1]["id"]
+    out = _sync([{"event_id": "e-t0", "session_id": job["id"], "step_id": s0,
+                  "event_type": "step_completed", "payload": {},
+                  "occurred_at": "2026-01-01T00:00:00Z"}])
+    assert out["acknowledged"] == ["e-t0"]
+    # A second, different terminal state for the same step is rejected, not stored.
+    out2 = _sync([{"event_id": "e-t0b", "session_id": job["id"], "step_id": s0,
+                   "event_type": "step_skipped", "payload": {},
+                   "occurred_at": "2026-01-01T00:00:01Z"}])
+    assert len(out2["failed"]) == 1 and "terminal" in out2["failed"][0]["error"].lower()
+    # Resuming a step that was never blocked is rejected.
+    out3 = _sync([{"event_id": "e-r9", "session_id": job["id"], "step_id": s1,
+                   "event_type": "step_resumed", "payload": {},
+                   "occurred_at": "2026-01-01T00:00:02Z"}])
+    assert len(out3["failed"]) == 1 and "blocked" in out3["failed"][0]["error"].lower()
+    # Events for steps outside the pinned revision are rejected.
+    out4 = _sync([{"event_id": "e-ghost", "session_id": job["id"], "step_id": "no-such-step",
+                   "event_type": "step_completed", "payload": {},
+                   "occurred_at": "2026-01-01T00:00:03Z"}])
+    assert len(out4["failed"]) == 1 and "pinned" in out4["failed"][0]["error"].lower()
+    # Block -> resume -> complete is the legal path back.
+    out5 = _sync([
+        {"event_id": "e-b1", "session_id": job["id"], "step_id": s1,
+         "event_type": "step_blocked", "payload": {}, "occurred_at": "2026-01-01T00:00:04Z"},
+        {"event_id": "e-r1", "session_id": job["id"], "step_id": s1,
+         "event_type": "step_resumed", "payload": {}, "occurred_at": "2026-01-01T00:00:05Z"},
+        {"event_id": "e-c1", "session_id": job["id"], "step_id": s1,
+         "event_type": "step_completed", "payload": {}, "occurred_at": "2026-01-01T00:00:06Z"},
+    ])
+    assert out5["failed"] == [] and len(out5["acknowledged"]) == 3

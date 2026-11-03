@@ -86,6 +86,10 @@ class FinishJob(BaseModel):
     summary: str = ""
 
 
+class FinishExceptional(BaseModel):
+    reason: str = ""
+
+
 class FinalizeJob(BaseModel):
     """One-shot final step completion + job finalization.
 

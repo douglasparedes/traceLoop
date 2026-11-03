@@ -105,9 +105,18 @@ def test_job_evidence_attach_and_list():
     assert img.status_code == 200 and img.headers["content-type"] == "image/png"
     detail = c.get(f"/api/jobs/{job['id']}").json()
     assert len(detail["evidence"]) == 1
-    c.post(f"/api/jobs/{job['id']}/finish", json={"outcome": "completed", "reason": "", "summary": ""}, headers=TECH)
+    ver = c.get(f"/api/procedure-versions/{p['approved_version_id']}", headers=TECH).json()
+    evs = [{"event_id": f"ev-{s['id']}", "session_id": job["id"], "step_id": s["id"],
+            "event_type": "step_completed", "payload": {}, "occurred_at": "2026-01-01T00:00:00Z"}
+           for s in ver["steps"]]
+    assert c.post("/api/sync/events", json={"events": evs}, headers=TECH).status_code == 200
+    fin = c.post(f"/api/jobs/{job['id']}/finish", json={"outcome": "completed", "reason": "", "summary": ""}, headers=TECH)
+    assert fin.status_code == 200, fin.text
     late = c.post(f"/api/jobs/{job['id']}/evidence", files={"file": ("b.png", png, "image/png")}, headers=TECH)
     assert late.status_code == 409
+    # ...but the same photo lands when explicitly marked as reconciliation.
+    rec = c.post(f"/api/jobs/{job['id']}/evidence?reconcile=true", files={"file": ("b.png", png, "image/png")}, headers=TECH)
+    assert rec.status_code == 200 and "id" in rec.json()
 
 
 def test_approval_requires_reviewer_and_approved_immutable():
@@ -156,6 +165,11 @@ def test_job_procedure_mismatch_and_finish_idempotent():
     bad = c.post("/api/jobs", json={"procedure_id": "not-the-procedure", "procedure_version_id": p["approved_version_id"]}, headers=TECH)
     assert bad.status_code == 409
     job = c.post("/api/jobs", json={"procedure_id": p["id"], "procedure_version_id": p["approved_version_id"]}, headers=TECH).json()
+    ver = c.get(f"/api/procedure-versions/{p['approved_version_id']}", headers=TECH).json()
+    evs = [{"event_id": f"mm-{s['id']}", "session_id": job["id"], "step_id": s["id"],
+            "event_type": "step_completed", "payload": {}, "occurred_at": "2026-01-01T00:00:00Z"}
+           for s in ver["steps"]]
+    assert c.post("/api/sync/events", json={"events": evs}, headers=TECH).status_code == 200
     assert c.post(f"/api/jobs/{job['id']}/finish", json={"outcome": "completed"}, headers=TECH).json()["ok"] is True
     again = c.post(f"/api/jobs/{job['id']}/finish", json={"outcome": "completed"}, headers=TECH).json()
     assert again.get("already_finished") is True

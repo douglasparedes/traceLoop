@@ -294,7 +294,26 @@ export async function runSync(): Promise<SyncResult> {
           fd.append("file", blob, "job-photo.jpg");
           fd.append("description", ph.description);
           if (ph.step_id) fd.append("step_id", ph.step_id);
-          const up = await api.upload<{ id: string }>(`/api/jobs/${ph.job_id}/evidence`, fd);
+          let up: { id: string } | null = null;
+          try {
+            up = await api.upload<{ id: string }>(`/api/jobs/${ph.job_id}/evidence`, fd);
+          } catch (uploadErr) {
+            if (uploadErr instanceof HttpError && uploadErr.status === 409 && /finished/i.test(uploadErr.message)) {
+              // The job closed while this photo was queued: re-attempt as an
+              // explicit reconciliation instead of failing or dropping it.
+              try {
+                up = await api.upload<{ id: string }>(`/api/jobs/${ph.job_id}/evidence?reconcile=true`, fd);
+                // Reconciled after finalization: accepted, flagged server-side.
+                // Clear any earlier failure record — this is resolved, not pending.
+                report = drop(report, "photo", ph.key);
+              } catch (reconcileErr) {
+                throw reconcileErr;
+              }
+            } else {
+              throw uploadErr;
+            }
+          }
+          if (!up) throw new Error("Photo upload produced no response");
           await idb.del("media", ph.key);
           // Stable id derived from the queue key: photo retries must not
           // mint duplicate evidence_attached events.

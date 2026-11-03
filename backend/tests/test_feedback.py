@@ -48,18 +48,21 @@ def _approved_procedure(title="Pump seal check"):
         db.close()
 
 
-def _start_finish_job(pid, vid):
+def _start_finish_job(pid, vid, sids):
     j = c.post("/api/jobs", json={"procedure_id": pid, "procedure_version_id": vid}, headers=TECH).json()
     jid = j["id"]
-    # some events first (proves proposals see execution evidence, not just feedback)
+    # Real per-step outcomes (proves proposals see execution evidence, not just feedback).
     c.post("/api/sync/events", json={"events": [
-        {"event_id": f"{jid}-e1", "session_id": jid, "step_id": None,
+        {"event_id": f"{jid}-e1", "session_id": jid, "step_id": sids[0],
          "event_type": "step_completed", "payload": {"step_order": 1},
          "occurred_at": "2026-01-01T00:00:00"},
-        {"event_id": f"{jid}-e2", "session_id": jid, "step_id": None,
+        {"event_id": f"{jid}-e2", "session_id": jid, "step_id": sids[1],
+         "event_type": "step_completed", "payload": {"step_order": 2},
+         "occurred_at": "2026-01-01T00:00:01"},
+        {"event_id": f"{jid}-e3", "session_id": jid, "step_id": None,
          "event_type": "issue_recorded", "payload": {"issue_type": "Instructions unclear", "note": "Which screw?"},
          "occurred_at": "2026-01-01T00:01:00"}]}, headers=TECH)
-    assert c.post(f"/api/jobs/{jid}/finish", json={"outcome": "finished-with-exceptions", "reason": "step 2 unclear"}, headers=TECH).status_code == 200
+    assert c.post(f"/api/jobs/{jid}/finish", json={"outcome": "completed", "reason": ""}, headers=TECH).status_code == 200
     return jid
 
 
@@ -73,7 +76,7 @@ def _feedback_body(step_ids, status="confusing", note="Which screw do you mean?"
 
 def test_feedback_validation_and_lifecycle():
     pid, vid, sids = _approved_procedure("Feedback validation")
-    jid = _start_finish_job(pid, vid)
+    jid = _start_finish_job(pid, vid, sids)
     # Unknown step rejected, not silently dropped.
     bad = _feedback_body(sids)
     bad["step_outcomes"] = [{"step_id": "nope", "status": "confusing", "note": "x"}]
@@ -100,7 +103,7 @@ def test_feedback_validation_and_lifecycle():
 
 def test_propose_improvement_guards_and_draft():
     pid, vid, sids = _approved_procedure("Proposal guards")
-    jid = _start_finish_job(pid, vid)
+    jid = _start_finish_job(pid, vid, sids)
     # Technician cannot propose.
     assert c.post(f"/api/jobs/{jid}/propose-improvement", json={}, headers=TECH).status_code == 403
     # No feedback yet -> 409.
@@ -134,7 +137,7 @@ def test_propose_improvement_guards_and_draft():
 def test_full_loop_feedback_proposal_approval_pinning():
     """Journey D end-to-end: feedback becomes a new revision; old jobs stay pinned."""
     pid, vid, sids = _approved_procedure("Full loop")
-    jid = _start_finish_job(pid, vid)
+    jid = _start_finish_job(pid, vid, sids)
     assert c.post(f"/api/jobs/{jid}/feedback", json=_feedback_body(sids), headers=TECH).status_code == 200
     r = c.post(f"/api/jobs/{jid}/propose-improvement", json={}, headers=REV).json()
     assert r["ok"] and len(r["changes"]) == 1

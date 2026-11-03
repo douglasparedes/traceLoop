@@ -127,7 +127,7 @@ beforeEach(async () => {
 });
 
 describe("guided execution primary action", () => {
-  it("advances steps with one Next action and finishes on the last step", async () => {
+  it("advances steps with one Next action and finishes on the last step with one tap", async () => {
     mockApi();
     await seed();
     const user = userEvent.setup();
@@ -142,8 +142,7 @@ describe("guided execution primary action", () => {
     expect(track?.children[0].className).toMatch(/on-done/);
     expect(track?.children[1].className).not.toMatch(/on/);
     await user.click(screen.getByRole("button", { name: /Next step/ }));
-    // Final step offers Finish, not another Next.
-    await user.click(screen.getByRole("button", { name: /Next step/ }));
+    // Final step offers single-tap Finish, not another Next.
     expect(await screen.findByRole("button", { name: /Finish job/ })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Next step/ })).not.toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: /Finish job/ }));
@@ -177,7 +176,7 @@ describe("guided execution primary action", () => {
     expect(evs).toHaveLength(1);
   });
 
-  it("blocks a step through the incident flow and resumes it", async () => {
+  it("halts on a blocked step: no Next, resolve resumes the same step", async () => {
     mockApi();
     await seed();
     const user = userEvent.setup();
@@ -186,8 +185,11 @@ describe("guided execution primary action", () => {
     await user.click(await screen.findByRole("button", { name: /Report this step as blocked/ }));
     await user.type(await screen.findByLabelText(/Technician notes/), "Clip jammed");
     await user.click(await screen.findByRole("button", { name: /Log incident/ }));
-    // Frontier advanced past the halted step; the summary records the block.
+    // The job halts AT the blocked step: no Next, resolve action shown.
     expect(await screen.findByText(/1 blocked/)).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: /Resolve.*resume step/i })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Next step/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Finish job/ })).not.toBeInTheDocument();
     // Previous navigates back without undoing: the recorded state shows.
     await user.click(await screen.findByRole("button", { name: /Previous/ }));
     expect(await screen.findByText((_, el) => el?.textContent === "Step 1: blocked")).toBeInTheDocument();
@@ -196,13 +198,16 @@ describe("guided execution primary action", () => {
     expect(await screen.findByRole("button", { name: /Next step/ })).toBeInTheDocument();
   });
 
-  it("counts skipped steps as exceptions, not completions", async () => {
+  it("requires a reason to skip a step", async () => {
     mockApi();
     await seed();
     const user = userEvent.setup();
     render(<App />);
     await user.click(await screen.findByRole("button", { name: /Resume step 1/ }));
     await user.click(await screen.findByRole("button", { name: /Skip step/ }));
+    expect(await screen.findByLabelText(/Reason for skipping/)).toBeInTheDocument();
+    await user.type(screen.getByLabelText(/Reason for skipping/), "Not applicable on this unit");
+    await user.click(await screen.findByRole("button", { name: /Confirm skip/ }));
     expect(await screen.findByRole("button", { name: /Next step/ })).toBeInTheDocument();
     expect(screen.getByText(/1 skipped/)).toBeInTheDocument();
   });
@@ -224,7 +229,7 @@ describe("guided execution primary action", () => {
     await user.click(await screen.findByRole("button", { name: /Resume step 1/ }));
     await user.click(await screen.findByRole("button", { name: /Next step/ }));
     await user.click(await screen.findByRole("button", { name: /Next step/ }));
-    await user.click(await screen.findByRole("button", { name: /Next step/ }));
+    // Final step single-taps: Finish records step 3 AND the job.
     await user.click(await screen.findByRole("button", { name: /Finish job/ }));
     await vi.waitFor(() => expect(finalizeCalls).toBe(1));
     // All three step completions reached the server before the finalize call.
@@ -240,7 +245,6 @@ describe("guided execution primary action", () => {
     const user = userEvent.setup();
     render(<App />);
     await user.click(await screen.findByRole("button", { name: /Resume step 1/ }));
-    await user.click(await screen.findByRole("button", { name: /Next step/ }));
     await user.click(await screen.findByRole("button", { name: /Next step/ }));
     await user.click(await screen.findByRole("button", { name: /Next step/ }));
     await user.click(await screen.findByRole("button", { name: /Finish job/ }));
