@@ -1,7 +1,7 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
 import { HttpError } from "./api";
 import {
-  runSync, loadReport, discardQueuedItem, classifyError, isNetworkError,
+  runSync, loadReport, discardQueuedItem, classifyError, isNetworkError, pendingCounts, pendingForJob,
   type PendingReg, type PendingFinish, type PendingPhoto,
 } from "./sync";
 import type { JobEventRec } from "./types";
@@ -235,5 +235,34 @@ describe("runSync", () => {
     await discardQueuedItem("event", "e1");
     expect(await idb.get("events", "e1")).toBeUndefined();
     expect((await loadReport()).items).toHaveLength(0);
+  });
+});
+
+describe("pendingCounts", () => {
+  it("totals every queue so status never hides queued work", async () => {
+    await seedMeta("pending-regs", [{ job_id: "j1", procedure_id: "p", procedure_version_id: "v" } as PendingReg]);
+    await idb.put("media", "ph1", new Blob(["x"]));
+    await seedMeta("pending-photos", [{ key: "ph1", job_id: "j1", step_id: null, description: "d" } as PendingPhoto]);
+    await idb.put("events", "e1", ev("e1", "j1"));
+    await idb.put("events", "e2", { ...ev("e2", "j1"), sync_status: "synced" });
+    await seedMeta("pending-finishes", [{ job_id: "j1", outcome: "completed" } as PendingFinish]);
+    const c = await pendingCounts();
+    expect(c).toEqual({ regs: 1, photos: 1, events: 1, finishes: 1, total: 4 });
+  });
+
+  it("is zero when everything synced", async () => {
+    await idb.put("events", "e1", { ...ev("e1", "j1"), sync_status: "synced" });
+    expect(await pendingCounts()).toEqual({ regs: 0, photos: 0, events: 0, finishes: 0, total: 0 });
+  });
+
+  it("scopes counts to one job", async () => {
+    await seedMeta("pending-regs", [{ job_id: "j1", procedure_id: "p", procedure_version_id: "v" } as PendingReg]);
+    await seedMeta("pending-photos", [{ key: "ph1", job_id: "j2", step_id: null, description: "d" } as PendingPhoto]);
+    await idb.put("events", "e1", ev("e1", "j1"));
+    await idb.put("events", "e2", ev("e2", "j2"));
+    await seedMeta("pending-finishes", [{ job_id: "j1", outcome: "completed" } as PendingFinish]);
+    expect(await pendingForJob("j1")).toEqual({ registrations: 1, events: 1, photos: 0, finishes: 1, total: 3 });
+    expect(await pendingForJob("j2")).toEqual({ registrations: 0, events: 1, photos: 1, finishes: 0, total: 2 });
+    expect(await pendingForJob("nope")).toEqual({ registrations: 0, events: 0, photos: 0, finishes: 0, total: 0 });
   });
 });

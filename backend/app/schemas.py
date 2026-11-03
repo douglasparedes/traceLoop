@@ -86,6 +86,21 @@ class FinishJob(BaseModel):
     summary: str = ""
 
 
+class FinalizeJob(BaseModel):
+    """One-shot final step completion + job finalization.
+
+    step_id must belong to the job's pinned procedure revision. event_id
+    makes retries idempotent: re-sending the same finalization never
+    duplicates the step event or the finish. The server computes the
+    outcome (completed vs completed-with-exceptions) and ignores any
+    client-supplied outcome.
+    """
+    step_id: str
+    event_id: str
+    occurred_at: str | None = None
+    reason: str = ""
+
+
 class SegmentRequest(BaseModel):
     prompt_text: str = Field(default="", max_length=200)
     prompt_nx: float | None = Field(default=None, ge=0.0, le=1.0)

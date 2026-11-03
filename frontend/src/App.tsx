@@ -10,7 +10,7 @@ import { requestPersistentStorage, type AnalysisMode } from "./uploadQueue";
 import type { JobEventRec, LocalJob, ProcSummary, Role, Step, Version, View } from "./types";
 import { checkAssetLinks, usePwaInstall, type AssetLinksStatus } from "./pwaInstall";
 import { clearMediaCache } from "./mediaCache";
-import { runSync, storeGrant, getStoredGrant, type PendingReg, type PendingFinish, type PendingPhoto } from "./sync";
+import { runSync, storeGrant, getStoredGrant, isNetworkError, pendingCounts, pendingForJob, type PendingReg, type PendingFinish, type PendingPhoto } from "./sync";
 import SyncDiagnostics from "./SyncDiagnostics";
 
 const ISSUE_TYPES = ["Component not found", "Instructions unclear", "Expected result not observed", "Tool unavailable", "Manual mismatch", "Unexpected condition", "Other"];
@@ -49,6 +49,7 @@ export default function App() {
   const [cachedIds, setCachedIds] = useState<Set<string>>(new Set());
   const [activeVersion, setActiveVersion] = useState<Version | null>(null);
   const [activeJob, setActiveJob] = useState<LocalJob | null>(null);
+  const [recentFinishes, setRecentFinishes] = useState<LocalJob[]>([]);
   const [updateReady, setUpdateReady] = useState(false);
   const [reviewVersion, setReviewVersion] = useState<Version | null>(null);
   const [studioItem, setStudioItem] = useState<LibraryItem | null>(null);
@@ -65,8 +66,21 @@ export default function App() {
   }, []);
 
   const refreshPending = useCallback(async () => {
-    const evs = await idb.all<JobEventRec>("events");
-    setPending(evs.filter((e) => e.sync_status === "pending").length);
+    try {
+      setPending((await pendingCounts()).total);
+    } catch { /* storage unavailable: keep last count */ }
+  }, []);
+
+  const loadRecentFinishes = useCallback(async () => {
+    try { setRecentFinishes((await idb.get<LocalJob[]>("meta", "recent-finishes")) || []); }
+    catch { /* storage unavailable */ }
+  }, []);
+  const dismissRecentFinish = useCallback(async (id: string) => {
+    try {
+      const recent = ((await idb.get<LocalJob[]>("meta", "recent-finishes")) || []).filter((r) => r.id !== id);
+      await idb.put("meta", "recent-finishes", recent);
+      setRecentFinishes(recent);
+    } catch { /* best effort */ }
   }, []);
 
   const loadLists = useCallback(async () => {
@@ -84,9 +98,22 @@ export default function App() {
       if (!res.ran) { setSyncState("idle"); notify(res.message, "info"); return; }
       setSyncState(res.problems || res.aborted ? "failed" : "idle");
       notify(res.message, res.problems || res.aborted ? "error" : "ok");
-      await refreshPending(); await loadLists();
+      await refreshPending(); await loadLists(); await loadRecentFinishes();
+      // Drop locally-kept completions once nothing remains unsynced for
+      // them — the server Activity list is authoritative from here on.
+      try {
+        const recent = (await idb.get<LocalJob[]>("meta", "recent-finishes")) || [];
+        const kept: LocalJob[] = [];
+        for (const r of recent) {
+          if ((await pendingForJob(r.id)).total > 0) kept.push(r);
+        }
+        if (kept.length !== recent.length) {
+          await idb.put("meta", "recent-finishes", kept);
+          setRecentFinishes(kept);
+        }
+      } catch { /* best effort */ }
     } catch (e) { setSyncState("failed"); notify(e instanceof Error ? e.message : "Sync failed", "error"); }
-  }, [loadLists, notify, refreshPending]);
+  }, [loadLists, notify, refreshPending, loadRecentFinishes]);
 
   useEffect(() => { setIdentity(role === "technician" ? "demo-tech" : role === "expert" ? "demo-expert" : "demo-reviewer", role); loadLists(); }, [role, loadLists]);
   useEffect(() => {
@@ -131,7 +158,7 @@ export default function App() {
     notify("Signed out on this device. Queued work stays saved locally.", "info");
   }
   useEffect(() => {
-    loadLists(); refreshPending(); refreshCached();
+    loadLists(); refreshPending(); refreshCached(); loadRecentFinishes();
     idb.get<{ procs: ProcSummary[]; jobs: JobRow[] }>("meta", "lists").then((l) => { if (l) { setProcs(l.procs); setJobs(l.jobs); } });
     idb.get<LocalJob>("jobs", "active").then(async (j) => {
       if (j && !j.finished) {
@@ -143,7 +170,7 @@ export default function App() {
     const on = () => { setOnline(true); void syncNow(); }; const off = () => setOnline(false);
     window.addEventListener("online", on); window.addEventListener("offline", off);
     return () => { window.removeEventListener("online", on); window.removeEventListener("offline", off); };
-  }, [loadLists, refreshPending, refreshCached, syncNow]);
+  }, [loadLists, refreshPending, refreshCached, syncNow, loadRecentFinishes]);
 
   useEffect(() => {
     const h = document.querySelector<HTMLElement>("main h2");
@@ -239,12 +266,16 @@ export default function App() {
     if (!v) { notify("Could not load the approved procedure. Connect once to download it for offline use.", "error"); return; }
     if (!v.steps.length) { notify("This approved version has no steps and cannot start a job.", "error"); return; }
     let jobId = uuid();
-    let registered = true;
     try {
       const j = await api.post<{ id: string }>("/api/jobs", { procedure_id: p.id, procedure_version_id: v.id });
       jobId = j.id;
-    } catch {
-      registered = false;
+    } catch (e) {
+      if (!isNetworkError(e)) {
+        // Real server rejection (e.g. 409 revision conflict, 404): do NOT
+        // queue offline — tell the technician exactly what went wrong.
+        notify(e instanceof Error ? e.message : "Could not start the job.", "error");
+        return;
+      }
       const regs = await loadPending<PendingReg>("pending-regs");
       if (!regs.some((r) => r.job_id === jobId)) {
         regs.push({ job_id: jobId, procedure_id: p.id, procedure_version_id: v.id, grant: await getStoredGrant(v.id) });
@@ -255,7 +286,6 @@ export default function App() {
     const local: LocalJob = { id: jobId, procedure_id: p.id, procedure_version_id: v.id, title: p.title, current: 0, stepStates: {}, started_at: new Date().toISOString(), finished: false };
     await idb.put("jobs", "active", local);
     setActiveJob(local); setActiveVersion(v); setView("job");
-    void registered;
   }
 
   const pendingReview = procs.filter((p) => p.has_pending_review).length;
@@ -287,12 +317,26 @@ export default function App() {
     if (!j) { setActiveJob(null); return; }
     if (j.finished) {
       setActiveJob(null);
-      const finishes = await loadPending<PendingFinish>("pending-finishes");
-      if (!finishes.some((f) => f.job_id === j.id)) {
-        finishes.push({ job_id: j.id, outcome: j.finish_outcome || "completed" });
-        await savePending("pending-finishes", finishes);
-        await refreshPending();
+      // Queue the finish for sync only if it is not already confirmed:
+      // a server-confirmed finalize leaves nothing to deliver.
+      const finishId = `evt:${j.id}:finish`;
+      const finEv = await idb.get<JobEventRec>("events", finishId).catch(() => undefined);
+      if (!finEv || finEv.sync_status !== "synced") {
+        const finishes = await loadPending<PendingFinish>("pending-finishes");
+        if (!finishes.some((f) => f.job_id === j.id)) {
+          finishes.push({ job_id: j.id, outcome: j.finish_outcome || "completed" });
+          await savePending("pending-finishes", finishes);
+          await refreshPending();
+        }
       }
+      // Immediate local record so a just-finished job appears in Workbench
+      // and Activity before the server confirms it — never silently gone.
+      try {
+        const recent = (await idb.get<LocalJob[]>("meta", "recent-finishes")) || [];
+        const updated = [{ ...j }, ...recent.filter((r) => r.id !== j.id)].slice(0, 20);
+        await idb.put("meta", "recent-finishes", updated);
+        setRecentFinishes(updated);
+      } catch { /* best effort */ }
       await idb.del("jobs", "active");
       return;
     }
@@ -378,7 +422,7 @@ export default function App() {
           )}
           {msg && <div className={`notice ${msgKind === "error" ? "error" : msgKind === "info" ? "info" : "ok"}`} role={msgKind === "error" ? "alert" : "status"}>{msg} <button className="btn small secondary" onClick={() => setMsg("")}>Dismiss</button></div>}
           {listsLoading && procs.length === 0 && <div className="card" aria-label="Loading procedures"><div className="skeleton" /><div className="skeleton" /><div className="skeleton" /></div>}
-          {view === "home" && <Home procs={procs} jobs={jobs} activeJob={activeJob} activeVersion={activeVersion} pending={pending} online={online} storageNote={storageNote} role={role} go={setView} pwa={pwa} openReview={async (vid) => { const v = await openVersion(vid); if (v) { setReviewVersion(v); setView("review"); } else notify("That version is not available offline yet.", "error"); }} continueJob={() => { if (activeJob) { openVersion(activeJob.procedure_version_id).then((v) => { if (v) { setActiveVersion(v); setView("job"); } else notify("Downloaded procedure not found on this device. Reconnect and open it from Procedures.", "error"); }); } }} />}
+          {view === "home" && <Home procs={procs} jobs={jobs} activeJob={activeJob} activeVersion={activeVersion} pending={pending} online={online} storageNote={storageNote} role={role} go={setView} recentFinishes={recentFinishes} pwa={pwa} openReview={async (vid) => { const v = await openVersion(vid); if (v) { setReviewVersion(v); setView("review"); } else notify("That version is not available offline yet.", "error"); }} continueJob={() => { if (activeJob) { openVersion(activeJob.procedure_version_id).then((v) => { if (v) { setActiveVersion(v); setView("job"); } else notify("Downloaded procedure not found on this device. Reconnect and open it from Procedures.", "error"); }); } }} />}
           {view === "library" && <Library procs={procs} cachedIds={cachedIds} reload={loadLists} startJob={startJob} openVersion={openDetail} cache={async (vid) => { const v = await openVersion(vid); notify(v ? "Saved for offline use — verified in local storage on this device." : "Download failed — check connection.", v ? "ok" : "error"); }} />}
           {view === "detail" && <ProcedureDetail title={(detailVersion && procs.find((x) => x.id === detailVersion.procedure_id)?.title) || ""} version={detailVersion} cached={detailVersion ? cachedIds.has(detailVersion.id) : false} startJob={() => { const p = detailVersion ? procs.find((x) => x.id === detailVersion.procedure_id) : undefined; if (p) startJob(p); else if (detailVersion) notify("Procedure record unavailable — reload the library.", "error"); }} cache={async () => { if (detailVersion) { const v = await openVersion(detailVersion.id); notify(v ? "Saved for offline use — verified in local storage on this device." : "Download failed — check connection.", v ? "ok" : "error"); } }} openReview={() => { if (detailVersion) { setReviewVersion(detailVersion); setView("review"); } }} go={setView} />}
           {view === "capture" && <TutorialsView
@@ -393,9 +437,9 @@ export default function App() {
               notify={notify} />
             : <div className="card"><div className="empty"><h3>No tutorial selected</h3><p>Pick a tutorial from the library to edit it in the Studio.</p><button className="btn" onClick={() => setView("tutorials")}>Open Tutorials</button></div></div>)}
           {view === "review" && <ReviewView version={reviewVersion} setVersion={setReviewVersion} procs={procs} openVersion={openVersion} role={role} reload={loadLists} notify={notify} />}
-          {view === "job" && <JobView job={activeJob} version={activeVersion} queueEvent={queueEvent} setJob={handleSetJob} notify={notify} reload={loadLists} go={setView} pending={pending} online={online} offlineReady={activeVersion ? cachedIds.has(activeVersion.id) : false} />}
-          {view === "activity" && <Activity jobs={jobs} pending={pending} pendingReview={pendingReview} reload={loadLists} go={setView} syncNow={() => void syncNow()} syncing={syncState === "syncing"} role={role} notify={notify} onProposeRevision={async (vid) => { const v = await openVersion(vid); if (v) { setReviewVersion(v); setView("review"); notify("Opened the job's exact revision. Use “Propose new revision” there — it goes through normal review."); } else notify("That revision is not available offline yet.", "error"); }} />}
-          {view === "history" && <Activity jobs={jobs} pending={pending} pendingReview={pendingReview} reload={loadLists} go={setView} syncNow={() => void syncNow()} syncing={syncState === "syncing"} role={role} notify={notify} onProposeRevision={async (vid) => { const v = await openVersion(vid); if (v) { setReviewVersion(v); setView("review"); notify("Opened the job's exact revision. Use “Propose new revision” there — it goes through normal review."); } else notify("That revision is not available offline yet.", "error"); }} />}
+          {view === "job" && <JobView job={activeJob} version={activeVersion} queueEvent={queueEvent} setJob={handleSetJob} notify={notify} reload={loadLists} refreshPending={refreshPending} go={setView} pending={pending} online={online} offlineReady={activeVersion ? cachedIds.has(activeVersion.id) : false} />}
+          {view === "activity" && <Activity jobs={jobs} pending={pending} pendingReview={pendingReview} reload={loadLists} go={setView} syncNow={() => void syncNow()} syncing={syncState === "syncing"} role={role} notify={notify} recent={recentFinishes} onDismissRecent={(id) => void dismissRecentFinish(id)} onProposeRevision={async (vid) => { const v = await openVersion(vid); if (v) { setReviewVersion(v); setView("review"); notify("Opened the job's exact revision. Use “Propose new revision” there — it goes through normal review."); } else notify("That revision is not available offline yet.", "error"); }} />}
+          {view === "history" && <Activity jobs={jobs} pending={pending} pendingReview={pendingReview} reload={loadLists} go={setView} syncNow={() => void syncNow()} syncing={syncState === "syncing"} role={role} notify={notify} recent={recentFinishes} onDismissRecent={(id) => void dismissRecentFinish(id)} onProposeRevision={async (vid) => { const v = await openVersion(vid); if (v) { setReviewVersion(v); setView("review"); notify("Opened the job's exact revision. Use “Propose new revision” there — it goes through normal review."); } else notify("That revision is not available offline yet.", "error"); }} />}
           {view === "manuals" && <Manuals notify={notify} />}
           {view === "settings" && <Settings pending={pending} role={role} setRole={setRole} onSignOut={doLogout} pwa={pwa} clearCache={async () => { await idb.clear("versions"); await refreshCached(); notify("Offline procedure cache cleared. Downloaded jobs and queued events were kept."); }} />}
         </main>
@@ -411,22 +455,33 @@ export default function App() {
   );
 }
 
-function Home({ procs, jobs, activeJob, activeVersion, pending, online, storageNote, role, go, openReview, continueJob, pwa }: {
+function Home({ procs, jobs, activeJob, activeVersion, pending, online, storageNote, role, go, recentFinishes, openReview, continueJob, pwa }: {
   procs: ProcSummary[]; jobs: JobRow[]; activeJob: LocalJob | null; activeVersion: Version | null;
   pending: number; online: boolean; storageNote: string | null; role: Role; go: (v: View) => void;
+  recentFinishes: LocalJob[];
   openReview: (vid: string) => void; continueJob: () => void;
   pwa: { canInstall: boolean; installed: boolean; outcome: string | null; install: () => Promise<void> };
 }) {
   const approved = procs.filter((p) => p.approved_version_id);
   const reviewQueue = procs.flatMap((p) => p.versions.filter((v) => v.status === "pending_review" || v.status === "draft" || v.status === "rejected").map((v) => ({ ...v, title: p.title })));
-  const pendingDrafts = reviewQueue.filter((v) => v.status === "pending_review");
+  const pendingReview = reviewQueue.filter((v) => v.status === "pending_review");
+  const drafts = reviewQueue.filter((v) => v.status === "draft");
+  const returned = reviewQueue.filter((v) => v.status === "rejected");
   const hour = new Date().getHours();
   const greeting = hour < 12 ? "Good morning" : hour < 18 ? "Good afternoon" : "Good evening";
   const roleLabel = role === "reviewer" ? "Reviewer" : role === "expert" ? "Expert" : "Technician";
   const today = new Date().toLocaleDateString(undefined, { weekday: "long", month: "short", day: "numeric" });
   const doneCount = activeJob && activeVersion
     ? activeVersion.steps.filter((s) => activeJob.stepStates[s.id] === "done").length : 0;
+  const blockedSteps = activeJob && activeVersion
+    ? activeVersion.steps.filter((s) => activeJob.stepStates[s.id] === "blocked") : [];
   const totalSteps = activeVersion?.steps.length || 0;
+  const homeNext = activeJob && activeVersion ? (() => {
+    // Resume label = first step without a recorded terminal state.
+    const sts = [...activeVersion.steps].sort((a, b) => a.step_order - b.step_order);
+    const i = sts.findIndex((s) => !["done", "skipped", "blocked"].includes(activeJob.stepStates[s.id]));
+    return i === -1 ? sts.length : i + 1;
+  })() : 1;
   return (
     <div>
       <div style={{ marginBottom: 12 }}>
@@ -453,27 +508,47 @@ function Home({ procs, jobs, activeJob, activeVersion, pending, online, storageN
       {activeJob ? (
         <div className="card accent-edge">
           <div className="row" style={{ justifyContent: "space-between" }}>
-            <span className="badge ok"><Icon name="play" size={13} /> In-progress field job</span>
+            {blockedSteps.length > 0
+              ? <span className="badge crit"><Icon name="warning" size={13} /> Job blocked — needs attention</span>
+              : <span className="badge ok"><Icon name="play" size={13} /> In-progress field job</span>}
             <span className="muted small-text num">{new Date(activeJob.started_at).toLocaleString()}</span>
           </div>
           <h2 style={{ marginTop: 8 }}>{activeJob.title}</h2>
           <p className="muted small-text">Rev {activeVersion?.version_number} ({activeVersion?.status}) · saved on this device</p>
+          {blockedSteps.length > 0 && (
+            <p className="notice warn" role="status" style={{ margin: "8px 0 0" }}>
+              Halted at: {blockedSteps.map((s) => `step ${s.step_order} (${s.title})`).join("; ")}. Open the job to resolve and resume.
+            </p>
+          )}
           {totalSteps > 0 && (
             <div className="panel" style={{ marginTop: 10 }}>
               <div className="row" style={{ justifyContent: "space-between" }}>
-                <span className="small-text">Step {Math.min(activeJob.current + 1, totalSteps)} of {totalSteps}</span>
+                <span className="small-text">Step {totalSteps ? Math.min(homeNext, totalSteps) : ""} of {totalSteps}</span>
                 <strong className="num">{Math.round((doneCount / totalSteps) * 100)}%</strong>
               </div>
               <div className="progress" role="progressbar" aria-valuenow={doneCount} aria-valuemin={0} aria-valuemax={totalSteps} aria-label={`${doneCount} of ${totalSteps} steps complete`} style={{ marginTop: 6 }}><div style={{ width: `${(doneCount / totalSteps) * 100}%` }} /></div>
             </div>
           )}
-          <button className="btn" style={{ width: "100%", marginTop: 12 }} onClick={continueJob}>Resume step {totalSteps ? Math.min(activeJob.current + 1, totalSteps) : ""} <Icon name="forward" size={18} /></button>
+          <button className="btn" style={{ width: "100%", marginTop: 12 }} onClick={continueJob}>{blockedSteps.length > 0 ? "Resolve issue" : "Resume"} step {totalSteps ? homeNext : ""} <Icon name="forward" size={18} /></button>
         </div>
       ) : (
         <div className="card primary-action">
           <h2>What needs doing?</h2>
           <p className="muted">Start from an approved procedure, or record new expert knowledge as a tutorial. Approved work keeps running without a connection.</p>
           <div className="row"><button className="btn" onClick={() => go("library")}>Find an approved procedure</button><button className="btn secondary" onClick={() => go("tutorials")}>Record a tutorial</button></div>
+        </div>
+      )}
+      {recentFinishes.filter((r) => !jobs.some((j) => j.id === r.id)).slice(0, 3).length > 0 && (
+        <div className="card" style={{ marginBottom: 14 }}>
+          <h3 style={{ marginTop: 0 }}>Recently completed on this device</h3>
+          {recentFinishes.filter((r) => !jobs.some((j) => j.id === r.id)).slice(0, 3).map((r) => (
+            <p key={r.id} className="list-row">
+              <strong>{r.title}</strong>{" "}
+              <span className={`tag ${r.finish_outcome === "completed" ? "approved" : "warn"}`}>{r.finish_outcome === "completed" ? "completed" : "finished with exceptions"}</span>{" "}
+              <span className="muted small-text">saved on this device — appears here until the server confirms it</span>{" "}
+              <button className="btn small secondary" onClick={() => go("activity")}>View in Activity</button>
+            </p>
+          ))}
         </div>
       )}
       <div className="grid" style={{ marginBottom: 14 }}>
@@ -490,21 +565,26 @@ function Home({ procs, jobs, activeJob, activeVersion, pending, online, storageN
       </div>
       {reviewQueue.length > 0 && (
         <div style={{ marginBottom: 14 }}>
-          <div className="row" style={{ justifyContent: "space-between" }}>
-            <h3><Icon name="flag" size={17} /> Needs human sign-off</h3>
-            {pendingDrafts.length > 0 && <span className="badge review">{pendingDrafts.length} pending</span>}
-          </div>
-          <div className="card">
-            <div className="row" style={{ justifyContent: "space-between" }}>
-              <strong>{reviewQueue[0].title}</strong>
-              <span className="badge review">v{reviewQueue[0].version_number} · {reviewQueue[0].status.replace("_", " ")}</span>
+          <h3><Icon name="flag" size={17} /> Review pipeline</h3>
+          {pendingReview.length > 0 && (
+            <div className="card">
+              <div className="row" style={{ justifyContent: "space-between" }}>
+                <strong>Pending approval</strong>
+                <span className="badge review">{pendingReview.length} awaiting decision</span>
+              </div>
+              <p className="muted small-text">AI drafts are never executable until a reviewer approves them.</p>
+              <div className="row" style={{ justifyContent: "space-between" }}>
+                <span className="muted small-text">{pendingReview[0].title} · v{pendingReview[0].version_number}</span>
+                <button className="btn secondary" onClick={() => openReview(pendingReview[0].id)}>Review revision <Icon name="chevronRight" size={17} /></button>
+              </div>
             </div>
-            <p className="muted small-text">AI drafts are never executable until a reviewer approves them.</p>
-            <div className="row" style={{ justifyContent: "space-between" }}>
-              <span className="muted small-text">{reviewQueue.length} version{reviewQueue.length === 1 ? "" : "s"} awaiting review</span>
-              <button className="btn secondary" onClick={() => openReview(reviewQueue[0].id)}>Review draft &amp; evidence <Icon name="chevronRight" size={17} /></button>
-            </div>
-          </div>
+          )}
+          {drafts.length > 0 && (
+            <p className="muted small-text">{drafts.length} draft{drafts.length === 1 ? "" : "s"} in progress — continue editing from the Procedures library.</p>
+          )}
+          {returned.length > 0 && (
+            <p className="muted small-text">{returned.length} returned for changes — edit and resubmit from the Procedures library.</p>
+          )}
         </div>
       )}
       <div>
@@ -615,20 +695,53 @@ function ProcessingLog() {
   );
 }
 
-function Activity({ jobs, pending, pendingReview, reload, go, syncNow, syncing, role, notify, onProposeRevision }: { jobs: JobRow[]; pending: number; pendingReview: number; reload: () => void; go: (v: View) => void; syncNow: () => void; syncing: boolean; role: Role; notify: (s: string, kind?: "ok" | "error" | "info") => void; onProposeRevision: (versionId: string) => void }) {
+function Activity({ jobs, pending, pendingReview, reload, go, syncNow, syncing, role, notify, onProposeRevision, recent, onDismissRecent }: { jobs: JobRow[]; pending: number; pendingReview: number; reload: () => void; go: (v: View) => void; syncNow: () => void; syncing: boolean; role: Role; notify: (s: string, kind?: "ok" | "error" | "info") => void; onProposeRevision: (versionId: string) => void; recent: LocalJob[]; onDismissRecent: (id: string) => void }) {
+  const fresh = recent.filter((r) => !jobs.some((j) => j.id === r.id));
   return (
     <div>
       <div className="card"><h2><Icon name="schedule" size={20} /> Activity</h2>
-        <p>{pending} event(s) pending synchronization. Events are only marked synced after the server acknowledges them.</p>
+        <p>{pending} update{pending === 1 ? "" : "s"} pending synchronization. Items are only marked synced after the server acknowledges them.</p>
         <div className="row">
           <button className="btn secondary" onClick={() => go("review")}><Icon name="flag" size={17} /> Review queue{pendingReview ? ` (${pendingReview})` : ""}</button>
           <button className="btn secondary" onClick={() => go("manuals")}><Icon name="book" size={17} /> Manuals</button>
           <button className="btn secondary" onClick={() => go("settings")}><Icon name="cog" size={17} /> Settings</button>
         </div>
       </div>
+      {fresh.map((r) => <CompletionSummary key={r.id} job={r} go={go} onDismiss={() => onDismissRecent(r.id)} />)}
       <SyncDiagnostics pending={pending} syncing={syncing} onSync={syncNow} onChanged={reload} notify={notify} />
       <History jobs={jobs} reload={reload} role={role} notify={notify} onProposeRevision={onProposeRevision} />
       <ProcessingLog />
+    </div>
+  );
+}
+
+function CompletionSummary({ job, go, onDismiss }: { job: LocalJob; go: (v: View) => void; onDismiss: () => void }) {
+  const [unsynced, setUnsynced] = useState<number | null>(null);
+  useEffect(() => {
+    let alive = true;
+    pendingForJob(job.id).then((p) => { if (alive) setUnsynced(p.total); }).catch(() => undefined);
+    return () => { alive = false; };
+  }, [job.id]);
+  const steps = Object.keys(job.stepStates).length;
+  const done = Object.values(job.stepStates).filter((s) => s === "done").length;
+  const skipped = Object.values(job.stepStates).filter((s) => s === "skipped").length;
+  const blocked = Object.values(job.stepStates).filter((s) => s === "blocked").length;
+  const ok = job.finish_outcome === "completed";
+  return (
+    <div className="card accent-edge" role="status" aria-label="Job completion summary">
+      <div className="row" style={{ justifyContent: "space-between" }}>
+        <span className={`badge ${ok ? "ok" : "warn"}`}>{ok ? "Job completed" : "Finished with exceptions"}</span>
+        <span className="muted small-text">{unsynced == null ? "Checking sync…" : unsynced > 0 ? `${unsynced} item${unsynced === 1 ? "" : "s"} waiting to sync` : "Synced with server"}</span>
+      </div>
+      <h3 style={{ margin: "8px 0 4px" }}>{job.title}</h3>
+      <p className="muted small-text" style={{ margin: 0 }}>
+        {done} completed · {skipped} skipped · {blocked} blocked of {steps} recorded steps.
+        {ok ? " All required steps completed." : " Skipped/blocked steps are listed above — the outcome reflects the exceptions."}
+      </p>
+      <div className="row" style={{ marginTop: 8 }}>
+        <button className="btn small" onClick={() => go("home")}>Back to Workbench</button>
+        <button className="btn small secondary" onClick={onDismiss}>Got it</button>
+      </div>
     </div>
   );
 }
@@ -697,18 +810,19 @@ function Library({ procs, cachedIds, reload, startJob, openVersion, cache }: { p
   const [cat, setCat] = useState<string>("all");
   const [sort, setSort] = useState<"updated" | "title">("updated");
   const isOfflineReady = (p: ProcSummary) => !!(p.approved_version_id && cachedIds.has(p.approved_version_id));
-  const hasDraft = (p: ProcSummary) => p.versions.some((v) => v.status === "draft" || v.status === "rejected");
+  const hasDraft = (p: ProcSummary) => p.versions.some((v) => v.status === "draft");
+  const hasReturned = (p: ProcSummary) => p.versions.some((v) => v.status === "rejected");
   const needsReview = (p: ProcSummary) => p.versions.some((v) => v.status === "pending_review");
   const counts = {
     all: procs.length,
     approved: procs.filter((p) => p.approved_version_id).length,
     offline: procs.filter(isOfflineReady).length,
-    drafts: procs.filter(hasDraft).length,
+    drafts: procs.filter((p) => hasDraft(p) || hasReturned(p)).length,
     review: procs.filter(needsReview).length,
   };
   const cats = [...new Set(procs.map((p) => (p.asset_type || "").trim()).filter(Boolean))].sort();
   const list = procs
-    .filter((p) => (p.title + " " + (p.asset_type || "")).toLowerCase().includes(q.toLowerCase()))
+    .filter((p) => (p.title + " " + p.id + " " + (p.asset_type || "")).toLowerCase().includes(q.toLowerCase()))
     .filter((p) => filter === "all" || (filter === "approved" ? !!p.approved_version_id : filter === "offline" ? isOfflineReady(p) : filter === "drafts" ? hasDraft(p) : needsReview(p)))
     .filter((p) => cat === "all" || (p.asset_type || "").trim() === cat)
     .sort((a, b) => sort === "title" ? a.title.localeCompare(b.title) : (b.updated_at || "").localeCompare(a.updated_at || ""));
@@ -739,11 +853,11 @@ function Library({ procs, cachedIds, reload, startJob, openVersion, cache }: { p
       <div className="panel" style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
         <Icon name="search" size={20} />
         <label htmlFor="proc-search" className="visually-hidden">Search procedures</label>
-        <input id="proc-search" value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search by equipment, tag, or ID..." style={{ border: 0, background: "transparent", minHeight: 40, padding: "6px 0" }} />
+        <input id="proc-search" value={q} onChange={(e) => setQ(e.target.value)} placeholder="Search title, procedure ID, or equipment type..." style={{ border: 0, background: "transparent", minHeight: 40, padding: "6px 0" }} />
         {q && <button className="btn small secondary icon-only" aria-label="Clear search" onClick={() => setQ("")}><Icon name="close" size={17} /></button>}
       </div>
       <div className="filter-tabs" role="group" aria-label="Status filter">
-        {tab("all", "All")}{tab("approved", "Approved")}{tab("offline", "Downloaded")}{tab("drafts", "Drafts")}{tab("review", "Review")}
+        {tab("all", "All")}{tab("approved", "Approved")}{tab("offline", "Downloaded")}{tab("drafts", "Drafts & returned")}{tab("review", "In review")}
       </div>
       {cats.length > 1 && (
         <div className="cat-pills" role="group" aria-label="Equipment category">
@@ -763,7 +877,8 @@ function Library({ procs, cachedIds, reload, startJob, openVersion, cache }: { p
       {list.map((p) => {
         const offlineReady = isOfflineReady(p);
         const review = p.versions.find((v) => v.status === "pending_review");
-        const draft = p.versions.find((v) => v.status === "draft" || v.status === "rejected");
+        const draft = p.versions.find((v) => v.status === "draft");
+        const returned = p.versions.find((v) => v.status === "rejected");
         const approvedV = p.versions.filter((v) => v.status === "approved").slice(-1)[0];
         return (
           <article key={p.id} className="proc-card">
@@ -772,6 +887,7 @@ function Library({ procs, cachedIds, reload, startJob, openVersion, cache }: { p
                 ? <span className="badge ok"><Icon name="verified" size={13} /> Approved (Rev {approvedV.version_number})</span>
                 : review ? <span className="badge review"><Icon name="warning" size={13} /> Pending review · Draft v{review.version_number}</span>
                 : draft ? <span className="badge neutral"><Icon name="note" size={13} /> Draft v{draft.version_number} · in progress</span>
+                : returned ? <span className="badge warn"><Icon name="note" size={13} /> Returned v{returned.version_number} · needs changes</span>
                 : <span className="badge neutral">No approved version</span>}
               {p.approved_version_id && (offlineReady
                 ? <span className="badge ok"><Icon name="check" size={13} /> Offline cached</span>
@@ -793,11 +909,15 @@ function Library({ procs, cachedIds, reload, startJob, openVersion, cache }: { p
                 ? <><button className="btn" onClick={() => startJob(p)}><Icon name="play" size={19} /> Start Job</button>
                   <button className="btn secondary" aria-label={offlineReady ? `Update offline copy of ${p.title}` : `Download ${p.title} for offline use`} onClick={() => p.approved_version_id && cache(p.approved_version_id)}><Icon name="download" size={19} /></button></>
                 : review
-                  ? <button className="btn review" onClick={() => openVersion(review.id)}><Icon name="flag" size={19} /> Review Draft</button>
+                  ? <button className="btn review" onClick={() => openVersion(review.id)}><Icon name="flag" size={19} /> Review revision</button>
                   : draft
-                    ? <button className="btn secondary" onClick={() => openVersion(draft.id)}><Icon name="edit" size={19} /> Continue Editing</button>
-                    : null}
-              <button className="btn secondary" aria-label={`View details of ${p.title}`} onClick={() => openVersion((review || draft || approvedV || p.versions[p.versions.length - 1])?.id || "")}><Icon name="eye" size={19} /></button>
+                    ? <button className="btn secondary" onClick={() => openVersion(draft.id)}><Icon name="edit" size={19} /> Continue editing</button>
+                    : returned
+                      ? <button className="btn secondary" onClick={() => openVersion(returned.id)}><Icon name="edit" size={19} /> Revise &amp; resubmit</button>
+                      : null}
+              {(review || draft || returned || approvedV) && (
+                <button className="btn secondary" aria-label={`View details of ${p.title}`} onClick={() => openVersion((review || draft || returned || approvedV)!.id)}><Icon name="eye" size={19} /></button>
+              )}
             </div>
           </article>
         );
@@ -978,6 +1098,13 @@ function ReviewView({ version, setVersion, procs, openVersion, role, reload, not
   const [comment, setComment] = useState("");
   const [confirmApprove, setConfirmApprove] = useState(false);
   const queue = procs.flatMap((p) => p.versions.filter((v) => v.status === "pending_review" || v.status === "draft" || v.status === "rejected").map((v) => ({ ...v, title: p.title })));
+  const [queueTab, setQueueTab] = useState<"pending" | "draft" | "returned">("pending");
+  const queueGroups: Record<"pending" | "draft" | "returned", typeof queue> = {
+    pending: queue.filter((v) => v.status === "pending_review"),
+    draft: queue.filter((v) => v.status === "draft"),
+    returned: queue.filter((v) => v.status === "rejected"),
+  };
+  const shownQueue = queueGroups[queueTab];
   const canReview = role === "reviewer" || role === "expert";
   const autoOpened = useRef<string | null>(null);
   useEffect(() => {
@@ -992,21 +1119,30 @@ function ReviewView({ version, setVersion, procs, openVersion, role, reload, not
     setBusy(true);
     try { await api.post(`/api/procedure-versions/${version.id}/${path}`, { comment: comment || "Reviewed in FieldGuard" }); notify(ok); setComment(""); setConfirmApprove(false); reload(); const v = await openVersion(version.id); setVersion(v); }
     catch (e) { notify(e instanceof Error ? e.message : "Action failed", "error"); }
-    setBusy(false);
+    finally { setBusy(false); }
   }
   async function saveEdits() {
     if (!version) return; setBusy(true);
     try { const v = await api.put<Version>(`/api/procedure-versions/${version.id}`, { summary: version.summary, prerequisites: version.prerequisites, steps: version.steps }); setVersion(v); notify("Draft edits saved. Approved versions are never edited in place."); }
     catch (e) { notify(e instanceof Error ? e.message : "Save failed", "error"); }
-    setBusy(false);
+    finally { setBusy(false); }
   }
   return (
     <div className="review-layout">
       <div className="card"><h2><Icon name="flag" size={20} /> Review &amp; approvals</h2>
         <p className="muted">AI drafts are never approved automatically. {canReview ? "You can approve or reject versions pending review." : "Approval needs the Reviewer demo role (Activity → Settings) — the server enforces this."} Signed-in role: <strong>{role}</strong>.</p>
+        <div className="filter-tabs" role="group" aria-label="Review queue">
+          {(["pending", "draft", "returned"] as const).map((t) => (
+            <button key={t} className="filter-tab" aria-pressed={queueTab === t} onClick={() => setQueueTab(t)}>
+              {t === "pending" ? "Pending review" : t === "draft" ? "Drafts in progress" : "Returned for changes"} <span className="num">({queueGroups[t].length})</span>
+            </button>
+          ))}
+        </div>
         {queue.length === 0
           ? <div className="empty">Queue empty — generate a draft in Capture.</div>
-          : queue.map((v) => (
+          : shownQueue.length === 0
+          ? <div className="empty">Nothing here — try another queue tab.</div>
+          : shownQueue.map((v) => (
             <div key={v.id} className="list-row">
               <div className="row" style={{ justifyContent: "space-between" }}>
                 <div style={{ minWidth: 0 }}>
@@ -1173,10 +1309,10 @@ interface JobPhoto {
   id: string; description: string; step_id: string | null; captured_at: string | null; image_url: string | null;
 }
 
-function JobView({ job, version, queueEvent, setJob, notify, reload, go, pending, online, offlineReady }: {
+function JobView({ job, version, queueEvent, setJob, notify, reload, refreshPending, go, pending, online, offlineReady }: {
   job: LocalJob | null; version: Version | null;
   queueEvent: (e: Omit<JobEventRec, "sync_status">) => Promise<void>; setJob: (j: LocalJob | null) => Promise<void>;
-  notify: (s: string, kind?: "ok" | "error" | "info") => void; reload: () => void; go: (v: View) => void;
+  notify: (s: string, kind?: "ok" | "error" | "info") => void; reload: () => void; refreshPending: () => void; go: (v: View) => void;
   pending: number; online: boolean; offlineReady: boolean;
 }) {
   const [issueType, setIssueType] = useState(ISSUE_TYPES[0]);
@@ -1186,15 +1322,76 @@ function JobView({ job, version, queueEvent, setJob, notify, reload, go, pending
   const [fieldNote, setFieldNote] = useState("");
   const [askQ, setAskQ] = useState("");
   const [answer, setAnswer] = useState("");
-  const [confirmFinish, setConfirmFinish] = useState(false);
-  const [acting, setActing] = useState(false);
   const [photos, setPhotos] = useState<JobPhoto[]>([]);
   const [pendingPhotos, setPendingPhotos] = useState(0);
   const [uploading, setUploading] = useState(false);
   const photoInputRef = useRef<HTMLInputElement | null>(null);
   const steps = version ? [...version.steps].sort((a, b) => a.step_order - b.step_order) : [];
-  const step = job && steps.length ? steps[Math.min(job.current, steps.length - 1)] : undefined;
+  const isTerminal = (st: string | undefined) => st === "done" || st === "skipped" || st === "blocked";
+  const frontierIdx = (() => {
+    if (!job) return 0;
+    const i = steps.findIndex((s) => !isTerminal(job.stepStates[s.id]));
+    return i === -1 ? steps.length : i;
+  })();
+  const allTerminal = job !== null && steps.length > 0 && frontierIdx >= steps.length;
   const doneCount = job ? steps.filter((s) => job.stepStates[s.id] === "done").length : 0;
+  // Viewed step (Previous navigation) vs frontier (where work happens).
+  // Reviewing history never mutates it; actions always target the frontier.
+  const [viewIdx, setViewIdx] = useState<number | null>(null);
+  useEffect(() => { setViewIdx(null); setMediaError(""); }, [job?.id]);
+  const effectiveIdx = viewIdx ?? (allTerminal ? steps.length - 1 : frontierIdx);
+  const step = job && steps.length ? steps[Math.min(Math.max(effectiveIdx, 0), steps.length - 1)] : undefined;
+  const viewingPast = viewIdx !== null && viewIdx < frontierIdx && !allTerminal;
+  const [mediaError, setMediaError] = useState("");
+  const [jobPending, setJobPending] = useState(0);
+  const [askBusy, setAskBusy] = useState(false);
+  // actingRef is the guard (stale closures made the state check pass twice
+  // on rapid clicks); actingUi only drives disabled buttons.
+  const actingRef = useRef(false);
+  const [actingUi, setActingUi] = useState(false);
+  function setActing(v: boolean) { actingRef.current = v; setActingUi(v); }
+  useEffect(() => {
+    let alive = true;
+    if (job) {
+      pendingForJob(job.id).then((p) => { if (alive) setJobPending(p.total); }).catch(() => undefined);
+    } else setJobPending(0);
+    return () => { alive = false; };
+  }, [job?.id, pending, job?.finished]);
+  // Server reconciliation on mount/resume: adopt server-terminal states we
+  // lack locally, and finalize locally if the server already finished.
+  // Local pending work always survives; server state never deletes it.
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      if (!job || !online || job.finished) return;
+      try {
+        const st = await api.get<{
+          steps: { step_id: string; state: string }[]; finished: boolean; outcome: string | null;
+        }>(`/api/jobs/${job.id}/state`);
+        if (!alive) return;
+        let changed = false;
+        const merged = { ...job.stepStates };
+        for (const p of st.steps) {
+          if ((p.state === "done" || p.state === "skipped" || p.state === "blocked") && !merged[p.step_id]) {
+            merged[p.step_id] = p.state as "done" | "skipped" | "blocked";
+            changed = true;
+          }
+        }
+        if (st.finished) {
+          await setJob({ ...job, stepStates: merged, finished: true, finish_outcome: st.outcome || "completed" });
+          notify("The server shows this job finished — marked complete locally.", "info");
+          go("history");
+          return;
+        }
+        if (changed) {
+          await setJob({ ...job, stepStates: merged });
+          notify("Recovered progress confirmed by the server.", "info");
+        }
+      } catch { /* offline or gone: local state stands */ }
+    })();
+    return () => { alive = false; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [job?.id]);
 
   async function loadPhotos() {
     if (!job || !step) return;
@@ -1212,28 +1409,62 @@ function JobView({ job, version, queueEvent, setJob, notify, reload, go, pending
   if (!job || !version) return <div className="card"><div className="empty"><h3>No active job</h3><p>Start one from an approved procedure. Downloaded procedures open here even in airplane mode.</p><button className="btn" onClick={() => go("library")}>Open procedure library</button></div></div>;
   if (steps.length === 0 || !step) return <div className="card"><div className="empty"><h3>No steps in this version</h3><p>This procedure version has no steps, so a guided job cannot run. Ask a reviewer to create a revision with steps.</p><button className="btn" onClick={() => go("library")}>Open procedure library</button></div></div>;
 
+  /** Record a terminal state for the FRONTIER step and advance the view.
+   *  Viewing history can never overwrite it: same-state repeats no-op. */
   async function mark(state: "done" | "skipped" | "blocked") {
-    if (!job || !step || acting) return;
-    if (job.stepStates[step.id] === state) { notify("Already recorded — no duplicate event created."); return; }
+    if (!job || actingRef.current || allTerminal) return;
+    const target = steps[frontierIdx];
+    if (!target) return;
+    if (job.stepStates[target.id] === state) { notify("Already recorded — no duplicate event created."); return; }
     setActing(true);
     try {
-      await queueEvent({ event_id: uuid(), session_id: job.id, step_id: step.id, event_type: state === "done" ? "step_completed" : state === "skipped" ? "step_skipped" : "step_blocked", payload: { step_order: step.step_order }, occurred_at: new Date().toISOString() });
-      const next = { ...job, stepStates: { ...job.stepStates, [step.id]: state }, current: Math.min(job.current + 1, steps.length - 1) };
-      await setJob(next); notify(state === "done" ? "Step completed and saved on this device." : `Step marked ${state} and saved on this device.`);
+      const eventId = `evt:${job.id}:${target.id}:${state === "done" ? "complete" : state}`;
+      const existing = await idb.get<JobEventRec>("events", eventId);
+      if (!existing) {
+        await queueEvent({ event_id: eventId, session_id: job.id, step_id: target.id, event_type: state === "done" ? "step_completed" : state === "skipped" ? "step_skipped" : "step_blocked", payload: { step_order: target.step_order }, occurred_at: new Date().toISOString() });
+      }
+      const next = { ...job, stepStates: { ...job.stepStates, [target.id]: state }, current: Math.min(frontierIdx + 1, steps.length) };
+      await setJob(next); setViewIdx(null);
+      notify(state === "done" ? "Step completed and saved on this device." : `Step marked ${state} and saved on this device.`);
     } finally { setActing(false); }
   }
   async function recordIssue() {
-    if (!job || !step || acting) return;
+    if (!job || !step || actingRef.current) return;
     if (!note.trim()) { notify("Describe the anomaly first so the reviewer knows what to fix.", "error"); return; }
     setActing(true);
     try {
       await queueEvent({ event_id: uuid(), session_id: job.id, step_id: step.id, event_type: "issue_recorded", payload: { issue_type: issueType, note }, occurred_at: new Date().toISOString() });
-      await mark("blocked");
-      setNote(""); setDrawerOpen(false); notify("Anomaly logged and step marked blocked. It syncs when connectivity returns — nothing is lost offline.");
+      let halted = job.stepStates[step.id] === "blocked";
+      if (!halted) {
+        await queueEvent({ event_id: `evt:${job.id}:${step.id}:blocked`, session_id: job.id, step_id: step.id, event_type: "step_blocked", payload: { step_order: step.step_order }, occurred_at: new Date().toISOString() });
+        halted = true;
+      }
+      await setJob({ ...job, stepStates: { ...job.stepStates, [step.id]: "blocked" } });
+      setNote(""); setDrawerOpen(false);
+      notify("Anomaly logged and step marked blocked. It syncs when connectivity returns — nothing is lost offline.");
+    } catch {
+      notify("Could not save the incident on this device — nothing was recorded. Retry.", "error");
+    } finally { setActing(false); }
+  }
+  /** Resume a halted step: history is preserved as events; the step simply
+   *  becomes workable again (it returns to the frontier). */
+  async function resumeStep() {
+    if (!job || !step || actingRef.current) return;
+    if (job.stepStates[step.id] !== "blocked") { notify("Only a blocked step can be resumed."); return; }
+    setActing(true);
+    try {
+      await queueEvent({ event_id: uuid(), session_id: job.id, step_id: step.id, event_type: "step_resumed", payload: { step_order: step.step_order }, occurred_at: new Date().toISOString() });
+      const next = { ...job.stepStates };
+      delete next[step.id];
+      await setJob({ ...job, stepStates: next });
+      setViewIdx(null);
+      notify("Step resumed — it is workable again. The halt stays in the audit history.", "ok");
+    } catch {
+      notify("Could not resume on this device — nothing changed. Retry.", "error");
     } finally { setActing(false); }
   }
   async function saveFieldNote() {
-    if (!job || !step || acting) return;
+    if (!job || !step || actingRef.current) return;
     if (!fieldNote.trim()) { notify("Write the note first.", "error"); return; }
     setActing(true);
     try {
@@ -1242,7 +1473,7 @@ function JobView({ job, version, queueEvent, setJob, notify, reload, go, pending
     } finally { setActing(false); }
   }
   async function attachPhoto(f: File | undefined) {
-    if (!f || !job || !step || uploading) return;
+    if (!f || !job || !step || uploading || actingRef.current) return;
     if (!["image/jpeg", "image/png", "image/webp"].includes(f.type)) { notify("Only JPEG, PNG or WebP photos are supported.", "error"); return; }
     if (f.size > 8 * 1024 * 1024) { notify("Photo is larger than 8 MB — pick a smaller file.", "error"); return; }
     setUploading(true);
@@ -1265,39 +1496,93 @@ function JobView({ job, version, queueEvent, setJob, notify, reload, go, pending
       } else notify(msg || "Photo upload failed.", "error");
     } finally { setUploading(false); }
   }
-  async function finish() {
-    if (!job || acting) return;
+  /** Single coherent finalization: requires every step terminal, then
+   *  records the finish atomically (online) or queues it in order (offline).
+   *  Retries reuse the stable finish event id, so double-clicks and
+   *  reloads can never duplicate the finish. */
+  async function finishFinal() {
+    if (!job || actingRef.current || !allTerminal || steps.length === 0) return;
     setActing(true);
     try {
-      const outcome = doneCount === steps.length ? "completed" : "finished-with-exceptions";
-      await queueEvent({ event_id: uuid(), session_id: job.id, step_id: null, event_type: "job_finished", payload: { outcome }, occurred_at: new Date().toISOString() });
-      try { await api.post(`/api/jobs/${job.id}/finish`, { outcome, reason: "", summary: "" }); } catch { /* pending-finish sync will deliver it */ }
-      await setJob({ ...job, finished: true, finish_outcome: outcome }); await idb.del("jobs", "active"); reload();
-      notify("Job finished and saved on this device. Its finish state syncs with your queued events."); go("history");
+      const localOutcome = doneCount === steps.length ? "completed" : "finished-with-exceptions";
+      const finishId = `evt:${job.id}:finish`;
+      const existingFinish = await idb.get<JobEventRec>("events", finishId);
+      if (!existingFinish) {
+        await queueEvent({ event_id: finishId, session_id: job.id, step_id: null, event_type: "job_finished", payload: { outcome: localOutcome }, occurred_at: new Date().toISOString() });
+      }
+      let serverOutcome: string | null = null;
+      try {
+        const lastStep = steps[steps.length - 1];
+        const r = await api.post<{ ok: boolean; outcome?: string; already_finished?: boolean }>(
+          `/api/jobs/${job.id}/finalize`,
+          { step_id: lastStep.id, event_id: `evt:${job.id}:${lastStep.id}:complete`, reason: "" });
+        serverOutcome = r.outcome || null;
+      } catch (e) {
+        if (!isNetworkError(e)) { notify(e instanceof Error ? e.message : "Finalization rejected.", "error"); return; }
+        // Offline: the queued job_finished event plus the pending finish
+        // entry deliver finalization in order on the next sync.
+      }
+      const outcome = serverOutcome || localOutcome;
+      if (serverOutcome) {
+        // Server confirmed finalization: the queued finish event and any
+        // pending finish for this job are already satisfied — mark them
+        // confirmed so the next sync does not re-send or fail them.
+        try {
+          const fin = await idb.get<JobEventRec>("events", finishId);
+          if (fin) await idb.put("events", finishId, { ...fin, sync_status: "synced" });
+          const fins = await loadPending<PendingFinish>("pending-finishes");
+          await savePending("pending-finishes", fins.filter((f) => f.job_id !== job.id));
+          await refreshPending();
+        } catch { /* bookkeeping only */ }
+      }
+      await setJob({ ...job, finished: true, finish_outcome: outcome });
+      notify(outcome === "completed"
+        ? "Job finished — all steps completed."
+        : "Job finished with exceptions — skipped or blocked steps are listed in the summary.", "ok");
+      go("history");
     } finally { setActing(false); }
   }
   async function ask() {
-    if (!version) return;
+    if (!version || askBusy) return;
+    if (!askQ.trim()) { setAnswer("Type a question first."); return; }
+    setAskBusy(true);
     try { const r = await api.post<{ answer: string }>("/api/ask", { question: askQ, procedure_version_id: version.id }); setAnswer(r.answer); }
     catch { setAnswer("AI assistance is unavailable offline. The approved steps and cached manual text above remain fully usable."); }
+    finally { setAskBusy(false); }
   }
   const safety = ((version.source_evidence as { safety_notes?: string[] }).safety_notes || []).filter(Boolean);
   const hasRefs = (step.evidence_refs?.length || 0) + (step.visual_refs?.length || 0) > 0;
   const skippedCount = steps.filter((s) => job.stepStates[s.id] === "skipped").length;
   const blockedCount = steps.filter((s) => job.stepStates[s.id] === "blocked").length;
+  // Per-job sync state: local completion vs server-confirmed completion.
+  const jobSyncLabel = !online ? "Offline — saved on this device"
+    : jobPending > 0 ? `${jobPending} item${jobPending === 1 ? "" : "s"} waiting to sync`
+    : "Synced with server";
+  // Tracker reflects RECORDED states only — never the view index.
+  const segClass = (s: Step) => {
+    const st = job.stepStates[s.id];
+    if (st === "done") return "on on-done";
+    if (st === "skipped") return "on on-skip";
+    if (st === "blocked") return "on on-block";
+    return "";
+  };
+  const frontierStep = allTerminal ? undefined : steps[frontierIdx];
   return (
     <div>
       <div className="row" style={{ justifyContent: "space-between", marginBottom: 10 }}>
         <button className="btn small secondary" onClick={() => go("home")} aria-label="Exit job and return home. Progress stays saved on this device."><Icon name="back" size={17} /> Exit</button>
         <h2 style={{ margin: 0, fontSize: "1.05rem" }}>Procedure Execution</h2>
-        <span className={`sync-pill${online ? "" : " offline"}`} role="status"><span className="sync-dot" aria-hidden="true" />{online ? (pending ? `${pending} to sync` : "Synced") : "Offline"}</span>
+        <span className={`sync-pill${online ? "" : " offline"}`} role="status"><span className="sync-dot" aria-hidden="true" />{jobSyncLabel}</span>
       </div>
       <div className="job-layout"><div>
       <section className="card" aria-live="polite">
         <div className="proc-badges">
           <span className="badge ok"><Icon name="verified" size={13} /> Rev {version.version_number} (Approved)</span>
           {offlineReady && <span className="badge ok"><Icon name="cloudDone" size={13} /> Offline cache ready</span>}
-          {job.stepStates[step.id] && <span className="badge warn">Status: {job.stepStates[step.id]}</span>}
+          {job.stepStates[step.id] === "done" && <span className="badge ok">Step {step.step_order}: completed</span>}
+          {job.stepStates[step.id] === "skipped" && <span className="badge warn">Step {step.step_order}: skipped</span>}
+          {job.stepStates[step.id] === "blocked" && <span className="badge crit">Step {step.step_order}: blocked</span>}
+          {viewingPast && <span className="badge neutral">Reviewing history — actions target step {frontierStep ? frontierStep.step_order : steps.length}</span>}
         </div>
         <h2 style={{ marginTop: 8 }}>{job.title}</h2>
         <p className="muted small-text" style={{ marginTop: -6 }}>Asset job · step {step.step_order} of {steps.length}</p>
@@ -1307,8 +1592,9 @@ function JobView({ job, version, queueEvent, setJob, notify, reload, go, pending
             <span className="muted small-text">{step.title}</span>
           </div>
           <div className="seg-progress-track" aria-hidden="true">
-            {steps.map((s, i) => <span key={s.id} className={job.stepStates[s.id] === "done" || i < job.current ? "on" : ""} />)}
+            {steps.map((s) => <span key={s.id} className={segClass(s)} />)}
           </div>
+          <p className="muted small-text" style={{ margin: "6px 0 0" }} aria-hidden="true"><span className="seg-legend on-done" /> done · <span className="seg-legend on-skip" /> skipped · <span className="seg-legend on-block" /> blocked</p>
         </div>
       </section>
       <section className="card">
@@ -1362,31 +1648,50 @@ function JobView({ job, version, queueEvent, setJob, notify, reload, go, pending
       </div></div>
       <section className="card" style={{ marginTop: 12 }}>
         <h3>Job summary so far</h3>
-        <p>{doneCount} completed · {blockedCount} blocked · {skippedCount} skipped of {steps.length} steps. {pending > 0 ? `${pending} event(s) saved on this device, waiting for server confirmation.` : "Everything is confirmed by the server."}</p>
+        <p>{doneCount} completed · {blockedCount} blocked · {skippedCount} skipped of {steps.length} steps. {jobPending > 0 ? `${jobPending} item${jobPending === 1 ? "" : "s"} saved on this device, waiting for server confirmation.` : "Everything is confirmed by the server."}</p>
         <div className="row">
-          <button className="btn secondary" onClick={() => mark("skipped")} disabled={acting}>Skip step</button>
-          {!confirmFinish
-            ? <button className="btn danger" onClick={() => setConfirmFinish(true)} disabled={acting}>Finish job</button>
-            : <><span><strong>Finish with {doneCount}/{steps.length} steps complete?</strong></span><button className="btn danger" onClick={finish} disabled={acting}>Confirm finish</button><button className="btn secondary" onClick={() => setConfirmFinish(false)} disabled={acting}>Keep working</button></>}
+          {!allTerminal && !viewingPast && <button className="btn secondary" onClick={() => mark("skipped")} disabled={actingUi}>Skip step {frontierStep ? frontierStep.step_order : ""}</button>}
+          {viewingPast && frontierStep && <button className="btn secondary" onClick={() => setViewIdx(null)}>Return to step {frontierStep.step_order}</button>}
         </div>
         <p className="muted small-text" style={{ marginTop: 8 }}>If a step is blocked on anything hazardous, stop work and follow your site procedure — this app never instructs you to bypass safety steps.</p>
       </section>
       <div className="action-dock">
         <div className="aux-row">
-          <button className="btn secondary" disabled={job.current === 0 || acting} onClick={() => setJob({ ...job, current: job.current - 1 })}><Icon name="back" size={18} /> Previous</button>
+          <button className="btn secondary" disabled={effectiveIdx <= 0 || actingUi} onClick={() => setViewIdx(Math.max(effectiveIdx - 1, 0))}><Icon name="back" size={18} /> Previous</button>
           <button className="btn secondary" disabled={uploading} onClick={() => photoInputRef.current?.click()}><Icon name="camera" size={18} /> {uploading ? "Uploading…" : "Attach Photo"}</button>
           <button className="btn secondary" onClick={() => setNoteOpen(true)}><Icon name="note" size={18} /> Field Note</button>
         </div>
         <div className="action-dock-row">
-          <button className="btn danger" style={{ background: "var(--danger-bg)", borderColor: "var(--danger-bg)", color: "var(--danger)" }} onClick={() => setDrawerOpen(true)} disabled={acting}><Icon name="warning" size={20} /> Report Blocked</button>
-          <button className="btn" onClick={() => mark("done")} disabled={acting}><Icon name="check" size={20} /> Complete Step {step.step_order}</button>
+          {viewingPast ? (
+            <>
+              <button className="btn secondary" onClick={() => setDrawerOpen(true)} disabled={actingUi}><Icon name="warning" size={20} /> Report Blocked</button>
+              {job.stepStates[step.id] === "blocked"
+                ? <button className="btn" onClick={resumeStep} disabled={actingUi}><Icon name="forward" size={20} /> Resolve &amp; resume step</button>
+                : <span className="muted small-text" role="status">Reviewing a recorded step — it cannot be changed from here.{frontierStep ? ` Current work is at step ${frontierStep.step_order}.` : ""}</span>}
+            </>
+          ) : job.stepStates[step.id] === "blocked" ? (
+            <>
+              <button className="btn danger" style={{ background: "var(--danger-bg)", borderColor: "var(--danger-bg)", color: "var(--danger)" }} onClick={() => setDrawerOpen(true)} disabled={actingUi}><Icon name="warning" size={20} /> Report Blocked</button>
+              <button className="btn" onClick={resumeStep} disabled={actingUi}><Icon name="forward" size={20} /> Resolve &amp; resume step</button>
+            </>
+          ) : allTerminal ? (
+            <button className="btn" onClick={finishFinal} disabled={actingUi}><Icon name="check" size={20} /> {actingUi ? "Finishing…" : "Finish job ✓"}</button>
+          ) : (
+            <>
+              <button className="btn secondary danger-ghost" style={{ background: "var(--danger-bg)", borderColor: "var(--danger-bg)", color: "var(--danger)" }} onClick={() => setDrawerOpen(true)} disabled={actingUi} aria-label="Report this step as blocked"><Icon name="warning" size={20} /></button>
+              <button className="btn" onClick={() => mark("done")} disabled={actingUi}><Icon name="check" size={20} /> {actingUi ? "Saving…" : `Next step →`}</button>
+            </>
+          )}
         </div>
+        {!allTerminal && !viewingPast && frontierStep && (
+          <p className="muted small-text" style={{ margin: "8px 0 0" }}>Primary action records step {frontierStep.step_order} of {steps.length}.</p>
+        )}
       </div>
       <input ref={photoInputRef} className="visually-hidden" type="file" accept="image/jpeg,image/png,image/webp" aria-label="Attach a field photo to this step" onChange={(e) => { void attachPhoto(e.target.files?.[0] || undefined); e.target.value = ""; }} />
       <div className="card">
         <h3>Ask about this procedure</h3>
         <label htmlFor="ask-q">Question</label><input id="ask-q" value={askQ} onChange={(e) => setAskQ(e.target.value)} placeholder="e.g. knob" />
-        <button className="btn secondary" style={{ marginTop: 10 }} onClick={ask}>Search approved steps &amp; manuals</button>
+        <button className="btn secondary" style={{ marginTop: 10 }} onClick={ask} disabled={askBusy}>{askBusy ? "Searching…" : "Search approved steps & manuals"}</button>
         {answer && <div className="notice ok" role="status">{answer}</div>}
       </div>
       {drawerOpen && (
@@ -1406,7 +1711,7 @@ function JobView({ job, version, queueEvent, setJob, notify, reload, go, pending
             <textarea id="drawer-note" rows={2} value={note} onChange={(e) => setNote(e.target.value)} placeholder="Briefly describe physical condition or binding resistance..." />
             <div className="row" style={{ marginTop: 12 }}>
               <button className="btn secondary" style={{ flex: 1 }} onClick={() => setDrawerOpen(false)}>Cancel</button>
-              <button className="btn danger" style={{ flex: 1, background: "var(--danger)", borderColor: "var(--danger)", color: "#fff" }} onClick={recordIssue} disabled={acting}>Log incident &amp; halt</button>
+              <button className="btn danger" style={{ flex: 1, background: "var(--danger)", borderColor: "var(--danger)", color: "#fff" }} onClick={recordIssue} disabled={actingUi}>Log incident &amp; halt</button>
             </div>
           </div>
         </div>
@@ -1422,7 +1727,7 @@ function JobView({ job, version, queueEvent, setJob, notify, reload, go, pending
             <textarea id="field-note-text" rows={3} value={fieldNote} onChange={(e) => setFieldNote(e.target.value)} placeholder="e.g. Left clip needed extra force; right clip seated first try." />
             <div className="row" style={{ marginTop: 12 }}>
               <button className="btn secondary" style={{ flex: 1 }} onClick={() => setNoteOpen(false)}>Cancel</button>
-              <button className="btn" style={{ flex: 1 }} onClick={saveFieldNote} disabled={acting}>Save note</button>
+              <button className="btn" style={{ flex: 1 }} onClick={saveFieldNote} disabled={actingUi}>Save note</button>
             </div>
           </div>
         </div>
