@@ -1,7 +1,7 @@
 // Persistent Tutorial Library: the tutorial collection lives here,
 // independent of the recording phase. Stays visible while a tutorial is
 // open in Studio (the Studio is a separate view, not a replacement).
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { API, authHeaders, getIdentity } from "./api";
 import { Icon } from "./icons";
 
@@ -37,71 +37,39 @@ export function statusBadge(status: string) {
   return <span className="badge info"><span className="spinner" aria-hidden="true" style={{ width: 12, height: 12, borderWidth: 2 }} /> {status}</span>;
 }
 
-const PAGE_SIZE = 20;
-
-/** Contextual primary action: what the user should do next with this tutorial. */
-export function nextAction(t: LibraryItem): string {
-  if (t.status === "error") return "Review failure";
-  if (t.status !== "done") return "Continue processing";
-  if (t.draft_version_id) return "Review for approval";
-  if (t.has_guide) return "Continue editing";
-  return "Review guide";
-}
-
 export default function TutorialLibrary({ onOpen, refreshKey }: {
   onOpen: (t: LibraryItem) => void;
   refreshKey?: number;
 }) {
   const [items, setItems] = useState<LibraryItem[]>([]);
   const [total, setTotal] = useState(0);
-  const [offset, setOffset] = useState(0);
   const [q, setQ] = useState("");
   const [status, setStatus] = useState("");
   const [sort, setSort] = useState<"recent" | "title">("recent");
+  const [shown, setShown] = useState(20);
   const [loading, setLoading] = useState(true);
-  const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState("");
   const [deleting, setDeleting] = useState<string | null>(null);
 
-  // Mirror offset in a ref so the append path never retriggers the
-  // filter effect (which would reset the list it is extending).
-  const offsetRef = useRef(0);
-  offsetRef.current = offset;
-
-  const load = useCallback(async (opts?: { append?: boolean }) => {
-    const append = opts?.append === true;
-    if (append) setLoadingMore(true);
-    else { setLoading(true); }
+  const load = useCallback(async () => {
+    setLoading(true);
     setError("");
     try {
       const idn = getIdentity();
-      const useOffset = append ? offsetRef.current + PAGE_SIZE : 0;
-      const params = new URLSearchParams({ limit: String(PAGE_SIZE), offset: String(useOffset) });
+      const params = new URLSearchParams({ limit: "100", offset: "0" });
       if (q.trim()) params.set("q", q.trim());
       if (status) params.set("status", status);
       const res = await fetch(`${API}/api/tutorial?${params}`, { headers: authHeaders({ "X-User": idn.user, "X-Role": idn.role }) });
       if (!res.ok) throw new Error(`Library unavailable (${res.status})`);
       const body = await res.json();
       const list: LibraryItem[] = Array.isArray(body) ? body : body.items || [];
-      const nextTotal = Array.isArray(body) ? list.length : body.total ?? list.length;
-      setTotal(nextTotal);
-      if (append) {
-        // Dedupe by id: filter churn (a tutorial finishing between pages)
-        // must never duplicate or drop rows already shown.
-        setItems((cur) => {
-          const seen = new Set(cur.map((t) => t.id));
-          return [...cur, ...list.filter((t) => !seen.has(t.id))];
-        });
-        setOffset(useOffset);
-      } else {
-        setItems(list);
-        setOffset(0);
-      }
+      setItems(list);
+      setTotal(Array.isArray(body) ? list.length : body.total ?? list.length);
+      setShown((n) => Math.min(Math.max(n, 20), Math.max(list.length, 20)));
     } catch (e) {
       setError(e instanceof Error ? `Tutorial library unavailable (${e.message}). Check the connection and retry.` : "Tutorial library unavailable.");
     } finally {
       setLoading(false);
-      setLoadingMore(false);
     }
   }, [q, status]);
 
@@ -126,7 +94,8 @@ export default function TutorialLibrary({ onOpen, refreshKey }: {
   }
 
   const visible = [...items]
-    .sort((a, b) => (sort === "title" ? a.title.localeCompare(b.title) : (b.created_at || "").localeCompare(a.created_at || "")));
+    .sort((a, b) => (sort === "title" ? a.title.localeCompare(b.title) : (b.created_at || "").localeCompare(a.created_at || "")))
+    .slice(0, shown);
 
   return (
     <section aria-label="Tutorial library">
@@ -148,7 +117,7 @@ export default function TutorialLibrary({ onOpen, refreshKey }: {
         {q && <button className="btn small secondary icon-only" aria-label="Clear search" onClick={() => setQ("")}><Icon name="close" size={17} /></button>}
       </div>
       <div className="filter-tabs" role="group" aria-label="Status filter" style={{ marginBottom: 10 }}>
-        {([["", "All"], ["done", "Ready"], ["processing", "Processing"], ["error", "Failed"]] as const).map(([v, label]) => (
+        {([["", "All"], ["done", "Ready"], ["transcribing", "Processing"], ["error", "Failed"]] as const).map(([v, label]) => (
           <button key={v} className="filter-tab" aria-pressed={status === v} onClick={() => setStatus(v)}>{label}</button>
         ))}
         <button className="btn small secondary" onClick={() => void load()} disabled={loading} style={{ marginLeft: "auto" }}>
@@ -183,7 +152,7 @@ export default function TutorialLibrary({ onOpen, refreshKey }: {
               {t.origin === "uploaded" && <span className="tag" title="Created from an uploaded file rather than a fresh recording">upload</span>}
             </span>
             <span className="tut-row-actions">
-              <button className="btn small" onClick={() => onOpen(t)}>{nextAction(t)}</button>
+              <button className="btn small" onClick={() => onOpen(t)}>Open</button>
               <button className="btn small secondary danger-ghost" onClick={() => void remove(t)} disabled={deleting === t.id} aria-label={`Delete ${t.title}`}>
                 {deleting === t.id ? "…" : <Icon name="trash" size={16} />}
               </button>
@@ -191,9 +160,9 @@ export default function TutorialLibrary({ onOpen, refreshKey }: {
           </li>
         ))}
       </ul>
-      {items.length < total && (
-        <button className="btn small secondary" style={{ marginTop: 10 }} onClick={() => void load({ append: true })} disabled={loadingMore}>
-          {loadingMore ? "Loading…" : `Show more (${total - items.length} remaining)`}
+      {shown < items.length && (
+        <button className="btn small secondary" style={{ marginTop: 10 }} onClick={() => setShown((n) => n + 20)}>
+          Show more ({items.length - shown} remaining)
         </button>
       )}
     </section>

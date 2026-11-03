@@ -41,7 +41,7 @@ describe("TutorialLibrary", () => {
     expect(rows).toHaveLength(2);
     const user = userEvent.setup();
     const row = screen.getByRole("button", { name: /Open Reseat the pump seal/ }).closest("li")!;
-    await user.click(within(row).getByRole("button", { name: "Review for approval" }));
+    await user.click(within(row).getByRole("button", { name: "Open" }));
     expect(onOpen).toHaveBeenCalledWith(expect.objectContaining({ id: "t1" }));
   });
 
@@ -53,41 +53,6 @@ describe("TutorialLibrary", () => {
     await user.click(screen.getByRole("button", { name: "Failed" }));
     await waitFor(() => expect(screen.queryByText("Reseat the pump seal")).not.toBeInTheDocument());
     expect(screen.getByText("Failed upload demo")).toBeInTheDocument();
-  });
-
-  it("requests the semantic processing group, not a single status", async () => {
-    const seen: string[] = [];
-    vi.spyOn(globalThis, "fetch").mockImplementation((async (url: unknown) => {
-      seen.push(String(url));
-      return { ok: true, status: 200, json: async () => ({ total: 0, items: [] }) };
-    }) as typeof fetch);
-    render(<TutorialLibrary onOpen={() => undefined} />);
-    await screen.findByText(/No tutorials match/);
-    const user = userEvent.setup();
-    await user.click(screen.getByRole("button", { name: "Processing" }));
-    await waitFor(() => expect(seen.some((u) => u.includes("status=processing"))).toBe(true));
-    expect(seen.some((u) => u.includes("status=transcribing"))).toBe(false);
-  });
-
-  it("appends the next server page without duplicating rows", async () => {
-    const page1 = [{ ...items[0] }];
-    const page2 = [{ ...items[0] }, { ...items[1] }];
-    let calls = 0;
-    vi.spyOn(globalThis, "fetch").mockImplementation((async (url: unknown) => {
-      calls += 1;
-      const u = String(url);
-      const offset = new URL(u, "http://localhost").searchParams.get("offset") || "0";
-      const page = offset === "0" ? page1 : page2;
-      return { ok: true, status: 200, json: async () => ({ total: 2, offset: Number(offset), items: page }) };
-    }) as typeof fetch);
-    render(<TutorialLibrary onOpen={() => undefined} />);
-    await screen.findByText("Reseat the pump seal");
-    const user = userEvent.setup();
-    await user.click(await screen.findByRole("button", { name: /Show more/ }));
-    await waitFor(() => expect(screen.getByText("Failed upload demo")).toBeInTheDocument());
-    // The repeated row from page 2 is deduped: still one row per tutorial.
-    expect(screen.getAllByText("Reseat the pump seal")).toHaveLength(1);
-    expect(calls).toBe(2);
   });
 
   it("confirms before deleting and calls the API", async () => {

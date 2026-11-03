@@ -147,8 +147,8 @@ export default function TutorialStudio({ item, onBack, onOpenReview, notify }: {
           <button key={t.id} role="tab" aria-selected={tab === t.id} className="studio-tab" onClick={() => switchTab(t.id)}>{t.label}</button>
         ))}
       </div>
-      {tab === "overview" && <OverviewEditor detail={detail} onSaved={(d) => { setDetail(d); setDirty(false); }} onDirtyChange={setDirty} notify={notify} onOpenReview={onOpenReview} />}
-      {tab === "content" && <ContentEditor detail={detail} onSaved={(d) => { setDetail({ ...detail, ...d }); setDirty(false); void load(); }} onDirtyChange={setDirty} notify={notify} />}
+      {tab === "overview" && <OverviewEditor detail={detail} onSaved={(d) => { setDetail(d); setDirty(false); }} onDirty={() => setDirty(true)} notify={notify} onOpenReview={onOpenReview} />}
+      {tab === "content" && <ContentEditor detail={detail} onSaved={(d) => { setDetail({ ...detail, ...d }); setDirty(false); void load(); }} onDirty={() => setDirty(true)} notify={notify} />}
       {tab === "guide" && <GuideEditor detail={detail} onChanged={() => void load()} onOpenReview={onOpenReview} notify={notify} />}
       {tab === "video" && <VideoStudio tutorialId={detail.id} token={item.access_token} title={detail.title}
         durationSec={detail.duration_sec} jobDone={detail.status === "done"}
@@ -166,10 +166,10 @@ export default function TutorialStudio({ item, onBack, onOpenReview, notify }: {
 
 /* ---------------- Overview ---------------- */
 
-function OverviewEditor({ detail, onSaved, onDirtyChange, notify, onOpenReview }: {
+function OverviewEditor({ detail, onSaved, onDirty, notify, onOpenReview }: {
   detail: TutDetail;
   onSaved: (d: TutDetail) => void;
-  onDirtyChange: (dirty: boolean) => void;
+  onDirty: () => void;
   notify: (s: string, kind?: "ok" | "error" | "info") => void;
   onOpenReview: (versionId: string) => void;
 }) {
@@ -185,8 +185,8 @@ function OverviewEditor({ detail, onSaved, onDirtyChange, notify, onOpenReview }
     const cur = JSON.stringify([title, equipment, task, notes]);
     const isDirty = cur !== pristine.current;
     setState((s) => (s === "saving" ? s : isDirty ? "dirty" : "clean"));
-    onDirtyChange(isDirty);
-  }, [title, equipment, task, notes, onDirtyChange]);
+    if (isDirty) onDirty();
+  }, [title, equipment, task, notes, onDirty]);
 
   async function save() {
     if (!title.trim()) { setError("Title cannot be empty."); setState("error"); return; }
@@ -287,10 +287,10 @@ const blankStep = (n: number): StudioStep => ({
   objects_used: [], expected_result: "", verification_notes: "", required_tools: [],
 });
 
-function ContentEditor({ detail, onSaved, onDirtyChange, notify }: {
+function ContentEditor({ detail, onSaved, onDirty, notify }: {
   detail: TutDetail;
   onSaved: (d: Partial<TutDetail>) => void;
-  onDirtyChange: (dirty: boolean) => void;
+  onDirty: () => void;
   notify: (s: string, kind?: "ok" | "error" | "info") => void;
 }) {
   const token = detail.access_token;
@@ -304,6 +304,7 @@ function ContentEditor({ detail, onSaved, onDirtyChange, notify }: {
   const [sel, setSel] = useState(0);
   const [busy, setBusy] = useState<"none" | "transcript" | "steps" | "restore">("none");
   const [revList, setRevList] = useState<{ id: string; revision_number: number; steps: number; transcript_chars: number; actor: string; note: string; created_at: string }[]>([]);
+  const [baseline, setBaseline] = useState("");
 
   const snapshot = useCallback((c: StudioContent, st: StudioStep[]) =>
     JSON.stringify([c.transcript_corrected, c.timed_segments, st, c.materials]), []);
@@ -320,6 +321,7 @@ function ContentEditor({ detail, onSaved, onDirtyChange, notify }: {
       setSteps(st.length ? st : [blankStep(1)]);
       setMaterials((c.materials || []).join(", "));
       setSel(0);
+      setBaseline(snapshot(c, st.length ? st : [blankStep(1)]));
       const revs = await fetchContentRevisions(detail.id, token);
       setRevList(revs.revisions || []);
     } catch (e) {
@@ -327,17 +329,15 @@ function ContentEditor({ detail, onSaved, onDirtyChange, notify }: {
     } finally {
       setLoading(false);
     }
-  }, [detail.id, token]);
+  }, [detail.id, token, snapshot]);
 
   useEffect(() => { void load(); }, [load]);
 
-  // Dirty iff the editing buffer differs from the last server revision.
-  // Restoring the original values returns this to false (clean) without
-  // requiring a save — the parent Studio badge follows this boolean.
   const isDirty = !!content && JSON.stringify([corrected, segments, steps, materials.split(",").map((m) => m.trim()).filter(Boolean)]) !==
     JSON.stringify([content.transcript_corrected, content.timed_segments, content.steps, content.materials]);
+  void baseline;
 
-  useEffect(() => { onDirtyChange(isDirty); }, [isDirty, onDirtyChange]);
+  useEffect(() => { if (isDirty) onDirty(); }, [isDirty, onDirty]);
 
   async function saveTranscript() {
     if (!content) return;
