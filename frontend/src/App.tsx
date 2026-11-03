@@ -15,7 +15,7 @@ import SyncDiagnostics from "./SyncDiagnostics";
 
 const ISSUE_TYPES = ["Component not found", "Instructions unclear", "Expected result not observed", "Tool unavailable", "Manual mismatch", "Unexpected condition", "Other"];
 
-interface JobRow { id: string; procedure_title: string; status: string; outcome: string | null; started_at: string; ended_at: string | null; events: number }
+interface JobRow { id: string; procedure_id: string; procedure_version_id: string; procedure_title: string; status: string; outcome: string | null; technician_id: string; started_at: string; ended_at: string | null; events: number }
 interface ManualRow { id: string; title: string; model: string | null; chunks: number }
 
 async function loadPending<T>(key: string): Promise<T[]> {
@@ -423,8 +423,8 @@ export default function App() {
           {msg && <div className={`notice ${msgKind === "error" ? "error" : msgKind === "info" ? "info" : "ok"}`} role={msgKind === "error" ? "alert" : "status"}>{msg} <button className="btn small secondary" onClick={() => setMsg("")}>Dismiss</button></div>}
           {listsLoading && procs.length === 0 && <div className="card" aria-label="Loading procedures"><div className="skeleton" /><div className="skeleton" /><div className="skeleton" /></div>}
           {view === "home" && <Home procs={procs} jobs={jobs} activeJob={activeJob} activeVersion={activeVersion} pending={pending} online={online} storageNote={storageNote} role={role} go={setView} recentFinishes={recentFinishes} pwa={pwa} openReview={async (vid) => { const v = await openVersion(vid); if (v) { setReviewVersion(v); setView("review"); } else notify("That version is not available offline yet.", "error"); }} continueJob={() => { if (activeJob) { openVersion(activeJob.procedure_version_id).then((v) => { if (v) { setActiveVersion(v); setView("job"); } else notify("Downloaded procedure not found on this device. Reconnect and open it from Procedures.", "error"); }); } }} />}
-          {view === "library" && <Library procs={procs} cachedIds={cachedIds} reload={loadLists} startJob={startJob} openVersion={openDetail} cache={async (vid) => { const v = await openVersion(vid); notify(v ? "Saved for offline use — verified in local storage on this device." : "Download failed — check connection.", v ? "ok" : "error"); }} />}
-          {view === "detail" && <ProcedureDetail title={(detailVersion && procs.find((x) => x.id === detailVersion.procedure_id)?.title) || ""} version={detailVersion} cached={detailVersion ? cachedIds.has(detailVersion.id) : false} startJob={() => { const p = detailVersion ? procs.find((x) => x.id === detailVersion.procedure_id) : undefined; if (p) startJob(p); else if (detailVersion) notify("Procedure record unavailable — reload the library.", "error"); }} cache={async () => { if (detailVersion) { const v = await openVersion(detailVersion.id); notify(v ? "Saved for offline use — verified in local storage on this device." : "Download failed — check connection.", v ? "ok" : "error"); } }} openReview={() => { if (detailVersion) { setReviewVersion(detailVersion); setView("review"); } }} go={setView} />}
+          {view === "library" && <Library procs={procs} jobs={jobs} cachedIds={cachedIds} reload={loadLists} startJob={startJob} openVersion={openDetail} cache={async (vid) => { const v = await openVersion(vid); notify(v ? "Saved for offline use — verified in local storage on this device." : "Download failed — check connection.", v ? "ok" : "error"); }} goHistory={() => setView("history")} />}
+          {view === "detail" && <ProcedureDetail title={(detailVersion && procs.find((x) => x.id === detailVersion.procedure_id)?.title) || ""} version={detailVersion} jobs={detailVersion ? jobs.filter((j) => j.procedure_id === detailVersion.procedure_id) : []} cached={detailVersion ? cachedIds.has(detailVersion.id) : false} startJob={() => { const p = detailVersion ? procs.find((x) => x.id === detailVersion.procedure_id) : undefined; if (p) startJob(p); else if (detailVersion) notify("Procedure record unavailable — reload the library.", "error"); }} cache={async () => { if (detailVersion) { const v = await openVersion(detailVersion.id); notify(v ? "Saved for offline use — verified in local storage on this device." : "Download failed — check connection.", v ? "ok" : "error"); } }} openReview={() => { if (detailVersion) { setReviewVersion(detailVersion); setView("review"); } }} go={setView} />}
           {view === "capture" && <TutorialsView
             onOpenStudio={(t) => { setStudioItem(t); setView("studio"); }}
             refreshKey={tutRefresh} />}
@@ -791,7 +791,7 @@ function CompletionSummary({ job, go, onDismiss }: { job: LocalJob; go: (v: View
   );
 }
 
-function ProcedureDetail({ title, version, cached, startJob, cache, openReview, go }: { title: string; version: Version | null; cached: boolean; startJob: () => void; cache: () => void; openReview: () => void; go: (v: View) => void }) {
+function ProcedureDetail({ title, version, jobs, cached, startJob, cache, openReview, go }: { title: string; version: Version | null; jobs: JobRow[]; cached: boolean; startJob: () => void; cache: () => void; openReview: () => void; go: (v: View) => void }) {
   if (!version) return <div className="card"><div className="empty"><h3>No procedure selected</h3><p>Pick a procedure from the library to inspect its approved revision, steps, and tooling.</p><button className="btn" onClick={() => go("library")}>Open procedure library</button></div></div>;
   const tools = [...new Set(version.steps.flatMap((s) => s.required_tools || []))];
   const safety = ((version.source_evidence as { safety_notes?: string[] }).safety_notes || []).filter(Boolean);
@@ -825,10 +825,32 @@ function ProcedureDetail({ title, version, cached, startJob, cache, openReview, 
           </div>
         )}
         <div className="proc-actions" style={{ marginTop: 12 }}>
-          {canStart && <button className="btn" onClick={startJob}><Icon name="play" size={19} /> Start job</button>}
+          {canStart && <button className="btn" onClick={startJob}><Icon name="play" size={19} /> {jobs.some((j) => j.status === "finished") ? "Run again" : jobs.some((j) => j.status !== "finished") ? "Start additional run" : "Start job"}</button>}
           {version.status !== "approved" && <button className="btn review" onClick={openReview}><Icon name="flag" size={19} /> View revision history</button>}
           <button className="btn secondary" onClick={cache}><Icon name="download" size={19} /> {cached ? "Update offline copy" : "Save for offline use"}</button>
         </div>
+        {(() => {
+          const finished = jobs.filter((j) => j.status === "finished").slice().sort((a, b) => (b.ended_at || b.started_at).localeCompare(a.ended_at || a.started_at));
+          const open = jobs.filter((j) => j.status !== "finished");
+          if (!finished.length && !open.length) return null;
+          return (
+            <div className="panel" style={{ marginTop: 12 }} role="status" aria-label="Execution history for this procedure">
+              {open.length > 0 && <p className="small-text" style={{ margin: "0 0 6px" }}><span className="badge info">In progress · {open.length} open</span></p>}
+              {finished.length > 0 && (
+                <>
+                  <p className="small-text" style={{ margin: "0 0 6px" }}>
+                    <span className="badge ok">Completed{finished[0].ended_at ? ` · ${new Date(finished[0].ended_at).toLocaleString()}` : ""}</span>
+                    {finished.length > 1 && <span className="muted small-text"> · {finished.length} completed runs</span>}
+                  </p>
+                  <p className="muted small-text" style={{ margin: 0 }}>Completed executions stay inspectable in Activity. Starting again creates a new run — it never reopens the finished one.</p>
+                  <div className="row" style={{ marginTop: 8 }}>
+                    <button className="btn small secondary" onClick={() => go("history")}>View completed execution</button>
+                  </div>
+                </>
+              )}
+            </div>
+          );
+        })()}
         {!canStart && version.status === "approved" && <p className="muted small-text">This approved version has no steps, so a guided job cannot start. Ask a reviewer to create a revision with steps.</p>}
         {version.status !== "approved" && <p className="muted small-text">Drafts and pending versions cannot start jobs. Only human-approved versions are executable.</p>}
       </div>
@@ -848,7 +870,7 @@ function ProcedureDetail({ title, version, cached, startJob, cache, openReview, 
   );
 }
 
-function Library({ procs, cachedIds, reload, startJob, openVersion, cache }: { procs: ProcSummary[]; cachedIds: Set<string>; reload: () => void; startJob: (p: ProcSummary) => void; openVersion: (id: string) => void; cache: (id: string) => void }) {
+function Library({ procs, jobs, cachedIds, reload, startJob, openVersion, cache, goHistory }: { procs: ProcSummary[]; jobs: JobRow[]; cachedIds: Set<string>; reload: () => void; startJob: (p: ProcSummary) => void; openVersion: (id: string) => void; cache: (id: string) => void; goHistory: () => void }) {
   const [q, setQ] = useState("");
   const [filter, setFilter] = useState<"all" | "approved" | "offline" | "drafts" | "review">("all");
   const [cat, setCat] = useState<string>("all");
@@ -924,6 +946,14 @@ function Library({ procs, cachedIds, reload, startJob, openVersion, cache }: { p
         const draft = p.versions.find((v) => v.status === "draft");
         const returned = p.versions.find((v) => v.status === "rejected");
         const approvedV = p.versions.filter((v) => v.status === "approved").slice(-1)[0];
+        // Completion scoped to this execution context: jobs for this
+        // procedure (any technician看见, current user prioritized). A
+        // finished job never blocks a new run — it shows Completed with
+        // an explicit Run again, instead of looking like a pending job.
+        const related = jobs.filter((j) => j.procedure_id === p.id);
+        const finished = related.filter((j) => j.status === "finished");
+        const open = related.filter((j) => j.status !== "finished");
+        const lastDone = finished.slice().sort((a, b) => (b.ended_at || b.started_at).localeCompare(a.ended_at || a.started_at))[0];
         return (
           <article key={p.id} className="proc-card">
             <div className="proc-badges">
@@ -936,6 +966,8 @@ function Library({ procs, cachedIds, reload, startJob, openVersion, cache }: { p
               {p.approved_version_id && (offlineReady
                 ? <span className="badge ok"><Icon name="check" size={13} /> Offline cached</span>
                 : <span className="badge neutral"><Icon name="cloudDone" size={13} /> Not downloaded</span>)}
+              {open.length > 0 && <span className="badge info">In progress · {open.length} open execution{open.length === 1 ? "" : "s"}</span>}
+              {lastDone && <span className="badge ok">Completed{lastDone.ended_at ? ` · ${new Date(lastDone.ended_at).toLocaleDateString()}` : ""}{finished.length > 1 ? ` · ${finished.length} runs` : ""}</span>}
             </div>
             <div>
               <h3 style={{ marginBottom: 2 }}>{p.title}</h3>
@@ -950,7 +982,7 @@ function Library({ procs, cachedIds, reload, startJob, openVersion, cache }: { p
             )}
             <div className="proc-actions">
               {p.approved_version_id
-                ? <><button className="btn" onClick={() => startJob(p)}><Icon name="play" size={19} /> Start Job</button>
+                ? <><button className="btn" onClick={() => startJob(p)}><Icon name="play" size={19} /> {lastDone ? "Run again" : open.length > 0 ? "Start additional run" : "Start job"}</button>
                   <button className="btn secondary" aria-label={offlineReady ? `Update offline copy of ${p.title}` : `Download ${p.title} for offline use`} onClick={() => p.approved_version_id && cache(p.approved_version_id)}><Icon name="download" size={19} /></button></>
                 : review
                   ? <button className="btn review" onClick={() => openVersion(review.id)}><Icon name="flag" size={19} /> Review revision</button>
@@ -961,6 +993,9 @@ function Library({ procs, cachedIds, reload, startJob, openVersion, cache }: { p
                       : null}
               {(review || draft || returned || approvedV) && (
                 <button className="btn secondary" aria-label={`View details of ${p.title}`} onClick={() => openVersion((review || draft || returned || approvedV)!.id)}><Icon name="eye" size={19} /></button>
+              )}
+              {lastDone && (
+                <button className="btn secondary" onClick={goHistory}>View last execution</button>
               )}
             </div>
           </article>

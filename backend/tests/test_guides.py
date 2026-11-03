@@ -265,6 +265,7 @@ def test_muse_image_failure_is_honest(monkeypatch):
     monkeypatch.setattr(ai, "live_enabled", lambda: True)
     monkeypatch.setattr("time.sleep", lambda s: None)
     done = _done(b"guide-fmt-6")
+    calls["n"] = 0  # pipeline supplement calls excluded; count improve retries only
     hdr = {**TECH, "X-Tutorial-Token": done["access_token"]}
     r = c.post(f"/api/tutorial/{done['id']}/visuals/improve",
                json={"source": {"kind": "illustration", "name": "obj-1-overlay.png"}, "prompt": "x"}, headers=hdr)

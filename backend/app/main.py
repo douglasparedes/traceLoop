@@ -2964,7 +2964,9 @@ def list_jobs(db: Session = Depends(get_db)):
     for j in db.scalars(select(M.JobSession).order_by(M.JobSession.started_at.desc())).all():
         p = db.get(M.Procedure, j.procedure_id)
         n = db.scalar(select(func.count()).select_from(M.JobEvent).where(M.JobEvent.session_id == j.id)) or 0
-        out.append({"id": j.id, "procedure_title": p.title if p else "", "status": j.status, "outcome": j.outcome,
+        out.append({"id": j.id, "procedure_id": j.procedure_id,
+                    "procedure_version_id": j.procedure_version_id,
+                    "procedure_title": p.title if p else "", "status": j.status, "outcome": j.outcome,
                     "technician_id": j.technician_id, "started_at": j.started_at.isoformat(),
                     "ended_at": j.ended_at.isoformat() if j.ended_at else None, "events": n})
     return out

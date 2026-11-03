@@ -15,6 +15,9 @@ interface TutObject {
   best_bbox_norm?: number[] | null; distinct_count?: number | null; margin?: number | null;
   frames_seen?: number; frames_with_match?: number; coverage?: number;
   diagnostic_frame?: string | null;
+  alternative_names?: string[]; properties?: string; discovery_source?: string;
+  evidence_frames?: number[]; simulated?: boolean; ambiguous_match?: boolean;
+  ai_illustration?: string;
   quality?: { crop_px?: number[]; issues?: string[]; needs_review?: boolean } | null;
   track?: { frame: number; objects: { object_id: number; bbox_norm: number[]; confidence?: number | null }[] }[];
 }
@@ -794,7 +797,10 @@ export default function TutorialMode({ onOpenReview, onOpenStudio, hideLibrary, 
                 </div>
               )}
               {job.steps.map((s) => {
-                const objs = (s.objects_used || []).map((id) => job.objects.find((o) => o.obj_id === id)).filter((o): o is TutObject => !!o?.overlay);
+                // Only verified SAM segmentations (status ok) count as
+                // visual evidence in the guide. needs_tap/error overlays
+                // stay in Objects/Visuals for review, never as success.
+                const objs = (s.objects_used || []).map((id) => job.objects.find((o) => o.obj_id === id)).filter((o): o is TutObject => !!o && o.status === "ok" && !!o.overlay);
                 return (
                   <div key={s.step_number} className="card">
                     <div className="row" style={{ alignItems: "flex-start" }}>
@@ -845,23 +851,36 @@ export default function TutorialMode({ onOpenReview, onOpenStudio, hideLibrary, 
 
           {tab === "objects" && (
             <div>
-              {job.objects.length === 0 && <div className="empty">No objects were detected in the narration. Mention each object as you show it (“this is my …”).</div>}
+              {job.objects.length === 0 && <div className="empty">No objects were detected yet. Mention each object as you show it (“this is my …”) — visual analysis also picks up relevant items you handle but don't name.</div>}
               {job.objects.map((o) => (
                 <div key={o.obj_id} className="card">
                   <div className="row" style={{ alignItems: "flex-start" }}>
-                    {o.overlay && <img src={imgUrl(o.overlay)} alt={`${o.label} with segmentation overlay`} style={{ width: 160, borderRadius: 8 }} />}
-                    {o.illustration && <img src={imgUrl(o.illustration)} alt={`${o.label} isolated`} style={{ width: 160, borderRadius: 8, background: "repeating-conic-gradient(#ddd 0 25%, #fff 0 50%) 0 0/16px 16px" }} />}
-                    {!o.overlay && !o.illustration && o.diagnostic_frame && (
-                      <img src={`${API}/api/tutorial/${job.id}/diagnostics/frame/${o.obj_id}?token=${encodeURIComponent(job.access_token)}`} alt={`Frame where “${o.label}” was first mentioned`} style={{ width: 160, borderRadius: 8 }} loading="lazy" />
+                    {o.status === "ok" && o.overlay && <img src={imgUrl(o.overlay)} alt={`${o.label} with verified SAM segmentation`} style={{ width: 160, borderRadius: 8 }} />}
+                    {o.status === "ok" && !o.overlay && o.illustration && <img src={imgUrl(o.illustration)} alt={`${o.label} isolated cutout (verified segmentation)`} style={{ width: 160, borderRadius: 8, background: "repeating-conic-gradient(#ddd 0 25%, #fff 0 50%) 0 0/16px 16px" }} />}
+                    {o.status !== "ok" && o.diagnostic_frame && (
+                      <img src={`${API}/api/tutorial/${job.id}/diagnostics/frame/${o.obj_id}?token=${encodeURIComponent(job.access_token)}`} alt={`Diagnostic reference frame for “${o.label}” — not a segmentation result`} style={{ width: 160, borderRadius: 8 }} loading="lazy" />
+                    )}
+                    {!o.overlay && !o.illustration && !o.diagnostic_frame && (
+                      <span className="muted small-text">No visual yet — segmentation pending or requires a tap.</span>
                     )}
                     <div>
                       <h4 style={{ margin: "0 0 6px" }}>{o.label}</h4>
                       <p>
-                        <span className={`tag ${o.status === "ok" ? "approved" : o.status === "needs_tap" ? "warn" : ""}`}>{o.status}</span>
+                        <span className={`tag ${o.status === "ok" ? "approved" : o.status === "needs_tap" ? "warn" : ""}`}>{o.status === "ok" ? "segmented · verified" : o.status}</span>
+                        {o.simulated && <span className="tag">simulated — not a live SAM result</span>}
+                        {o.discovery_source && <span className="tag">found via {o.discovery_source}</span>}
+                        {o.ambiguous_match && <span className="tag warn">ambiguous identity — needs review</span>}
+                        {((o.quality?.needs_review) || o.status === "needs_tap") && <span className="tag warn">manual review required</span>}
                         {o.confidence != null && <span className="tag">{Math.round(o.confidence * 100)}% confidence</span>}
                         {o.prompt_used && <span className="tag">prompt: {o.prompt_used}</span>}
                         <button className="btn small secondary" onClick={() => seek(o.first_mentioned_at)}>First shown {fmt(o.first_mentioned_at)}</button>
                       </p>
+                      {(o.alternative_names?.length || o.properties) && (
+                        <p className="muted small-text">
+                          {o.alternative_names?.length ? <>Also called: {o.alternative_names.join(", ")}. </> : null}
+                          {o.properties ? <>Traits: {o.properties}</> : null}
+                        </p>
+                      )}
                       {o.note && <p className="muted">{o.note}</p>}
                       {(o.quality?.issues?.length || 0) > 0 && (
                         <p className="notice warn small-text" role="status" style={{ margin: "6px 0" }}>

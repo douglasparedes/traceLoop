@@ -35,19 +35,36 @@ MAX_PROMPT_ATTEMPTS = 3
 BASE = Path(__file__).resolve().parent.parent
 
 
-def prompt_variants(label: str) -> list[str]:
-    """Simplification ladder for SAM prompts (mirrors frontend speechPrompt)."""
+def prompt_variants(label: str, synonyms: list[str] | None = None) -> list[str]:
+    """SAM prompt candidates: canonical label, synonyms, then simplification.
+
+    Order matters (MAX_PROMPT_ATTEMPTS tries in sequence): exact phrase
+    first, then a more specific synonym, then progressively simpler
+    fallbacks. Mirrors frontend speechPrompt for consistency.
+    """
     p = re.sub(r"\s+", " ", (label or "").strip().lower())
     if not p:
         return []
+    cands: list[str] = [p]
+    for s in (synonyms or []):
+        q = re.sub(r"\s+", " ", str(s or "").strip().lower())
+        if q and len(q) >= 2 and q not in cands:
+            cands.append(q)
+        if len(cands) >= MAX_PROMPT_ATTEMPTS:
+            break
     words = p.split(" ")
-    out = [p]
+    fallbacks: list[str] = []
     if len(words) >= 3:
-        out.append(" ".join(words[1:]))  # drop leading adjective
+        fallbacks.append(" ".join(words[1:]))  # drop leading adjective
     if len(words) >= 2:
-        out.append(" ".join(words[-2:]))
-    out.append(words[-1])  # head noun
-    return [v for v in dict.fromkeys(out) if len(v) >= 2][:MAX_PROMPT_ATTEMPTS]
+        fallbacks.append(" ".join(words[-2:]))
+    fallbacks.append(words[-1])  # head noun
+    for f in fallbacks:
+        if f not in cands and len(f) >= 2:
+            cands.append(f)
+        if len(cands) >= MAX_PROMPT_ATTEMPTS:
+            break
+    return cands[:MAX_PROMPT_ATTEMPTS]
 
 
 def _ffmpeg() -> str:
@@ -259,6 +276,82 @@ def _best_track(frames: list[dict]) -> tuple[dict | None, int, float]:
     return best, distinct_best, margin_best
 
 
+def ensure_ai_step_illustrations(job_dir: Path, steps: list[dict], objects: list[dict],
+                                 max_steps: int = 5) -> tuple[dict[int, str], list[dict]]:
+    """Muse Image fallback for steps lacking verified SAM visuals.
+
+    Only called when live. Generates at most `max_steps` explanatory
+    illustrations (PNG) for steps with no ok overlay, using step text as
+    context. Returns ({step_number: filename}, provenance_records).
+    Results are ALWAYS labelled AI-generated, never as photos or SAM masks.
+    Safety: prompts describe the action generically and never invent
+    precise measurements, torque values, or safety-critical details — the
+    caption directs technicians to verify against the real equipment and
+    the original frame.
+    """
+    import base64 as _b64
+    ok_steps = set()
+    for o in objects or []:
+        if o.get("status") == "ok" and (o.get("overlay") or o.get("illustration")):
+            for s in steps or []:
+                if str(o.get("obj_id")) in {str(x) for x in (s.get("objects_used") or [])}:
+                    try:
+                        ok_steps.add(int(s.get("step_number", 0)))
+                    except (TypeError, ValueError):
+                        pass
+    out: dict[int, str] = {}
+    prov: list[dict] = []
+    if not ai.live_enabled():
+        return out, prov
+    made = 0
+    for s in steps or []:
+        try:
+            n = int(s.get("step_number", 0))
+        except (TypeError, ValueError):
+            continue
+        if n in ok_steps or made >= max_steps:
+            continue
+        title = str(s.get("title") or f"Step {n}")[:200]
+        summary = str(s.get("summary") or "")[:800]
+        if not (title.strip() or summary.strip()):
+            continue
+        prompt = (
+            f"Explanatory technical illustration for a maintenance guide step. "
+            f"Step {n}: {title}. {summary} "
+            f"Clean line-art style, neutral background, show hands/tools generically. "
+            f"Do NOT invent brand logos, precise measurements, torque values, or safety warnings. "
+            f"This is a generic visual aid, not a photo of the exact equipment."
+        )
+        try:
+            gen = ai.image_generate(prompt)
+        except Exception as e:
+            prov.append({"step_number": n, "status": "error",
+                         "note": f"Muse Image failed ({type(e).__name__})", "ai_generated": True})
+            continue
+        if not gen.get("ok") or not gen.get("image_b64"):
+            prov.append({"step_number": n, "status": gen.get("status", "error"),
+                         "note": gen.get("note", "Muse Image unavailable"),
+                         "model": gen.get("model", ai.IMAGE_MODEL),
+                         "simulated": bool(gen.get("simulated", False)),
+                         "ai_generated": True})
+            continue
+        try:
+            raw = _b64.b64decode(gen["image_b64"])
+            name = f"ai-step-{n}.png"
+            (job_dir / name).write_bytes(raw)
+            out[n] = name
+            made += 1
+            prov.append({"step_number": n, "status": "ok", "file": name,
+                         "model": gen.get("model", ai.IMAGE_MODEL),
+                         "simulated": False, "ai_generated": True,
+                         "note": "AI-generated explanatory illustration — not a photo, not a SAM mask. Verify against real equipment."})
+        except Exception as e:
+            prov.append({"step_number": n, "status": "error",
+                         "note": f"Could not persist illustration ({type(e).__name__})",
+                         "ai_generated": True})
+    return out, prov
+
+
 def inject_illustrations(md: str, steps: list[dict], objects: list[dict],
                          extra_visuals: dict[int, list[tuple[str, str]]] | None = None) -> str:
     """Deterministically embed illustration links into guide Markdown.
@@ -283,11 +376,12 @@ def inject_illustrations(md: str, steps: list[dict], objects: list[dict],
         files = [f for f in [o.get("overlay"), o.get("illustration")] if f]
         if not files:
             continue
-        # Ambiguous-identity visuals (multi-match, close margin) stay
-        # reviewable in Visuals but are NOT auto-published as step evidence:
-        # the PNG may show the wrong look-alike pile. Tap-correcting the
-        # object re-runs injection with the confirmed visual.
-        if o.get("status") != "ok" and o.get("ambiguous_match"):
+        # Only verified SAM segmentations (status ok) are auto-published as
+        # step evidence. needs_tap/error/ambiguous visuals stay reviewable
+        # in Visuals/diagnostics with their diagnostic frames — a bounding
+        # box or low-confidence crop is never presented as a successful
+        # segmentation.
+        if o.get("status") != "ok":
             continue
         for s in steps or []:
             if str(o.get("obj_id")) in {str(x) for x in (s.get("objects_used") or [])}:
@@ -350,6 +444,52 @@ def inject_illustrations(md: str, steps: list[dict], objects: list[dict],
     return "\n".join(out_lines).strip() + "\n"
 
 
+def inject_ai_illustrations(md: str, ai_files: dict[int, str]) -> str:
+    """Append AI-generated explanatory illustrations, clearly labelled.
+
+    Idempotent: previous ai-illustration blocks are stripped first. Each
+    image is captioned as AI-generated (not a photo, not a SAM mask) with
+    a verify-against-equipment note. Never invents safety-critical detail.
+    """
+    md = re.sub(r"\n?<!-- ai-illustrations:\d+:start -->.*?<!-- ai-illustrations:\d+:end -->\n?",
+                "\n", md or "", flags=re.S)
+    md = re.sub(r"[ \t]+\n", "\n", md)
+    md = re.sub(r"\n{3,}", "\n\n", md).strip() + "\n"
+    if not ai_files:
+        return md.strip() + "\n"
+    out_lines: list[str] = []
+    buf: list[str] = []
+    cur: int | None = None
+
+    def flush() -> None:
+        nonlocal buf, cur
+        out_lines.extend(buf)
+        buf = []
+        if cur in ai_files:
+            out_lines.append(f"<!-- ai-illustrations:{cur}:start -->")
+            out_lines.append(
+                f"![AI-generated explanatory illustration for step {cur} "
+                f"(not a photo of your equipment — verify against the real part)](illustrations/{ai_files[cur]})")
+            out_lines.append(f"_AI-generated visual aid — verify against the real equipment._")
+            out_lines.append(f"<!-- ai-illustrations:{cur}:end -->")
+            out_lines.append("")
+        cur = None
+
+    for line in (md.strip() + "\n").split("\n"):
+        m_step = re.match(r"^###\s+(?:Step\s+)?(\d+)(?:\s+of\s+\d+)?[\.\)\:]", line, re.I)
+        if m_step:
+            flush()
+            cur = int(m_step.group(1))
+            buf.append(line)
+        elif re.match(r"^##\s+", line):
+            flush()
+            buf.append(line)
+        else:
+            buf.append(line)
+    flush()
+    return "\n".join(out_lines).strip() + "\n"
+
+
 def _set(db, job: M.TutorialJob, **kw) -> None:
     for k, v in kw.items():
         setattr(job, k, v)
@@ -357,7 +497,7 @@ def _set(db, job: M.TutorialJob, **kw) -> None:
 
 
 def _segment_object(job_dir: Path, source: Path, tracking: Path, file_id: str, obj: dict, prompt_override: str | None = None) -> dict:
-    candidates = [prompt_override] if prompt_override is not None else prompt_variants(obj["label"])
+    candidates = [prompt_override] if prompt_override is not None else prompt_variants(obj["label"], obj.get("alternative_names"))
     frames: list[dict] = []
     result: dict = {"simulated": True, "status": "error", "note": "No SAM attempt was made."}
     tried: list[dict] = []
@@ -1117,6 +1257,132 @@ def sample_keyframes(job_dir: Path, source: Path, duration_sec: float,
     return out
 
 
+def _normalize_label(label: str) -> str:
+    """Canonical key for dedup: lowercase, collapse whitespace, strip."""
+    import re as _re
+    return _re.sub(r"\s+", " ", (label or "").strip().lower())
+
+
+def _merge_object_inventories(transcript_objs: list[dict], visual_objs: list[dict],
+                              transcript_steps: list[dict], visual_steps: list[dict],
+                              duration_sec: float) -> tuple[list[dict], list[dict], list[str]]:
+    """Unified multimodal inventory: transcript ∪ visual, deduplicated.
+
+    Two labels merge only when normalized labels match exactly — visually
+    similar but distinct instances (e.g. 'left chocolate pile' vs 'right
+    chocolate pile') stay separate. Merged objects keep the transcript
+    label, union alternative_names, earliest timestamp, union steps, and
+    discovery_source transcript|visual|both. Stable sequential obj_ids.
+    Returns (objects, steps, notes).
+    """
+    notes: list[str] = []
+    # Index transcript by normalized label.
+    t_by_norm: dict[str, dict] = {}
+    for o in transcript_objs or []:
+        n = _normalize_label(o.get("label", ""))
+        if n and n not in t_by_norm:
+            t_by_norm[n] = dict(o)
+    merged: list[dict] = [dict(o) for o in transcript_objs or []]
+    # Map label->obj for step remapping (rebuilt after merge).
+    for v in visual_objs or []:
+        lab = str(v.get("label") or "").strip()[:80]
+        if not lab:
+            continue
+        n = _normalize_label(lab)
+        if n in t_by_norm:
+            ex = t_by_norm[n]
+            # Union synonyms + properties.
+            alt = list(dict.fromkeys(
+                [*(ex.get("alternative_names") or []), *(v.get("alternative_names") or []), lab]
+            ))[:5]
+            # Drop the canonical label itself from synonyms.
+            alt = [a for a in alt if _normalize_label(a) != _normalize_label(ex.get("label", ""))][:4]
+            ex["alternative_names"] = alt
+            if v.get("first_mentioned_at") is not None:
+                try:
+                    ex["first_mentioned_at"] = round(min(float(ex.get("first_mentioned_at", 1e9)),
+                                                         float(v.get("first_mentioned_at", 1e9))), 1)
+                except (TypeError, ValueError):
+                    pass
+            # Union evidence frames.
+            ef = list(dict.fromkeys([*(ex.get("evidence_frames") or []), *(v.get("evidence_frames") or [])]))[:8]
+            if ef:
+                ex["evidence_frames"] = ef
+            if ex.get("discovery_source") != "both":
+                ex["discovery_source"] = "both" if ex.get("discovery_source") == "transcript" else (ex.get("discovery_source") or "visual")
+            if not ex.get("properties") and v.get("properties"):
+                ex["properties"] = str(v.get("properties"))[:200]
+        else:
+            oo = dict(v)
+            oo["discovery_source"] = "visual"
+            oo.setdefault("alternative_names", [])
+            merged.append(oo)
+            t_by_norm[n] = oo
+            notes.append(f"visual-only object kept: {lab}")
+    # Stable ids by earliest appearance.
+    try:
+        merged.sort(key=lambda o: float(o.get("first_mentioned_at", 0)))
+    except (TypeError, ValueError):
+        pass
+    old_to_new: dict[int, int] = {}
+    # Build mapping from old ids (both lists) — transcript ids shift, visual
+    # ids remapped by label.
+    # Simplest deterministic approach: reassign 1..N, remap steps by label.
+    label_to_new = {_normalize_label(o.get("label", "")): i + 1 for i, o in enumerate(merged)}
+    for i, o in enumerate(merged, start=1):
+        o["obj_id"] = i
+    # Remap steps: combine both step lists, remap objects_used via labels.
+    # Transcript steps reference old transcript ids; visual steps reference
+    # old visual ids. Rebuild via label lookup.
+    t_labels = {_normalize_label(o.get("label", "")): o.get("label", "") for o in transcript_objs or []}
+    # Actually simpler: keep transcript steps as primary timeline, append
+    # visual-only steps that don't overlap? For now concatenate with
+    # renumbering and remap via normalized labels of each source.
+    new_steps: list[dict] = []
+    def _remap(step_list, source_objs):
+        id_to_norm = {}
+        for o in source_objs or []:
+            try:
+                id_to_norm[int(o.get("obj_id", 0))] = _normalize_label(o.get("label", ""))
+            except (TypeError, ValueError):
+                pass
+        out = []
+        for s in step_list or []:
+            used = []
+            for x in (s.get("objects_used") or []):
+                try:
+                    norm = id_to_norm.get(int(x))
+                except (TypeError, ValueError):
+                    norm = None
+                if norm and norm in label_to_new:
+                    used.append(label_to_new[norm])
+            # Also map by direct label match for visual steps (already ids).
+            ns = dict(s)
+            ns["objects_used"] = sorted(set(used))
+            out.append(ns)
+        return out
+    # Note: after merge, source obj_ids changed; use pre-merge copies.
+    new_steps.extend(_remap(transcript_steps, transcript_objs))
+    # Append visual steps only when transcript has none (avoid duplicating
+    # the timeline); otherwise fold visual evidence into matching steps.
+    if not transcript_steps and visual_steps:
+        new_steps.extend(_remap(visual_steps, visual_objs))
+    elif visual_steps and transcript_steps:
+        notes.append(f"{len(visual_steps)} visual candidate steps folded as evidence (transcript timeline kept)")
+    for j, s in enumerate(new_steps, start=1):
+        s["step_number"] = j
+    # Cap with transparent reporting.
+    import os as _os
+    cap = int(_os.getenv("TRACELOOP_MAX_OBJECTS", "32"))
+    dropped: list[str] = []
+    if len(merged) > cap:
+        dropped.append(f"{len(merged) - cap} objects beyond cap {cap} deferred")
+        merged = sorted(merged, key=lambda o: float(o.get("first_mentioned_at", 0) or 0))[:cap]
+        for i, o in enumerate(merged, start=1):
+            o["obj_id"] = i
+    return merged, new_steps, notes + dropped
+
+
 def _visual_objects_and_steps(analysis: dict, duration_sec: float) -> tuple[list[dict], list[dict]]:
     """Map visual analysis output onto the canonical step/object schema.
 
@@ -1145,7 +1411,8 @@ def _visual_objects_and_steps(analysis: dict, duration_sec: float) -> tuple[list
     labels = sorted(label_first, key=lambda l: label_first[l])
     obj_ids = {lab: i + 1 for i, lab in enumerate(labels)}
     objects = [{"label": lab, "first_mentioned_at": label_first[lab], "obj_id": obj_ids[lab],
-                "status": "pending", "confidence": None, "illustration": "", "overlay": "", "track": []}
+                "status": "pending", "confidence": None, "illustration": "", "overlay": "", "track": [],
+                "alternative_names": [], "properties": "", "discovery_source": "visual"}
                for lab in labels]
     steps = []
     for j, s in enumerate(raw_steps):
@@ -1337,6 +1604,29 @@ def run_job(job_id: str) -> None:
                              "missing_information": analysis.get("missing_information") or [],
                              "dropped": analysis.get("dropped") or [],
                              "note": analysis.get("note", "")})
+                # Multimodal merge: transcript mentions supplement visual
+                # discovery so spoken-but-briefly-visible tools are not lost.
+                if (tr.get("segments") or tr.get("text")):
+                    try:
+                        with proc.timed() as t2:
+                            und2 = ai.understand_tutorial(tr.get("segments") or [], info["duration"])
+                        t_objs, t_steps = und2.get("objects", []), und2.get("steps", [])
+                        if t_objs:
+                            merged, m_steps, m_notes = _merge_object_inventories(
+                                t_objs, objects, t_steps, steps, info["duration"])
+                            proc.safe_record(
+                                db, "tutorial", job_id, "understand",
+                                "simulated" if und2.get("simulated") else "succeeded",
+                                operation="understand_tutorial_supplement", provider="meta",
+                                model=und2.get("model", ""), duration_ms=t2.ms, actor=actor,
+                                summary={"transcript_objects": len(t_objs),
+                                         "merged_objects": len(merged), "notes": m_notes,
+                                         "dropped": und2.get("dropped") or []})
+                            objects, steps = merged, m_steps or steps
+                    except Exception as me:
+                        proc.safe_record(db, "tutorial", job_id, "understand", "skipped",
+                                         operation="understand_tutorial_supplement", duration_ms=0, actor=actor,
+                                         summary={"note": f"transcript supplement skipped ({type(me).__name__})"})
                 _set(db, job, objects=objects, steps=steps, progress=45)
             else:
                 with proc.timed() as t:
@@ -1348,7 +1638,34 @@ def run_job(job_id: str) -> None:
                     summary={"objects": len(objects), "steps": len(steps),
                              "labels": [o.get("label") for o in objects],
                              "first_mentioned_at": [o.get("first_mentioned_at") for o in objects],
-                             "note": und.get("note", "")})
+                             "note": und.get("note", ""), "dropped": und.get("dropped") or []})
+                # Multimodal merge: visual supplement catches task-relevant
+                # objects the speaker never mentions (bounded ≤8 frames).
+                try:
+                    v_frames = sample_keyframes(job_dir, source, info["duration"])
+                    if v_frames:
+                        with proc.timed() as tv:
+                            v_analysis = ai.analyze_tutorial_frames(
+                                [{"t": f["t"], "image": f["image"]} for f in v_frames],
+                                (tr.get("text") or "")[:2000], info["duration"])
+                        v_objs, v_steps = _visual_objects_and_steps(v_analysis, duration_sec=info["duration"])
+                        if v_objs:
+                            merged_objs, _, m_notes = _merge_object_inventories(
+                                objects, v_objs, steps, [], info["duration"])
+                            proc.safe_record(
+                                db, "tutorial", job_id, "understand",
+                                "simulated" if v_analysis.get("simulated") else "succeeded",
+                                operation="analyze_frames_supplement", provider="meta",
+                                model=v_analysis.get("model", ""), duration_ms=tv.ms, actor=actor,
+                                summary={"visual_objects": len(v_objs), "merged_objects": len(merged_objs),
+                                         "notes": m_notes, "dropped": v_analysis.get("dropped") or []})
+                            # Transcript timeline stays authoritative; adopt the
+                            # merged object inventory for SAM tracking.
+                            objects = merged_objs
+                except Exception as ve:
+                    proc.safe_record(db, "tutorial", job_id, "understand", "skipped",
+                                     operation="analyze_frames_supplement", duration_ms=0, actor=actor,
+                                     summary={"note": f"visual supplement skipped ({type(ve).__name__})"})
                 _set(db, job, objects=objects, steps=steps, progress=45)
             if not objects:
                 _set(db, job, status="generating", progress=90)
@@ -1445,6 +1762,15 @@ def run_job(job_id: str) -> None:
                 guide = ai.generate_guide(job.title, steps, done_objects, tr["segments"], guide_format=fmt, source_note=_guide_source_note(job))
             md = guide.get("guide_markdown") or ai.fallback_guide_markdown(job.title, steps, done_objects, fmt, _guide_source_note(job))
             md = inject_illustrations(md, steps, done_objects)
+            # Muse Image fallback for steps still lacking verified visuals.
+            # Clearly labelled AI-generated aids; never photos or SAM masks.
+            ai_prov: list[dict] = []
+            try:
+                ai_files, ai_prov = ensure_ai_step_illustrations(job_dir, steps, done_objects)
+                if ai_files:
+                    md = inject_ai_illustrations(md, ai_files)
+            except Exception as ae:
+                ai_prov = [{"status": "error", "note": f"AI illustration fallback skipped ({type(ae).__name__})"}]
             proc.safe_record(db, "tutorial", job_id, "guide", "simulated" if guide.get("simulated") else "succeeded",
                              operation="generate_guide", provider="meta", model=guide.get("model", ""),
                              duration_ms=t.ms, actor=actor,
@@ -1452,6 +1778,7 @@ def run_job(job_id: str) -> None:
                                       "markdown_chars": len(md), "materials": len(guide.get("materials", [])),
                                       "ok_objects": sum(1 for o in done_objects if o.get("status") == "ok"),
                                       "needs_tap": sum(1 for o in done_objects if o.get("status") == "needs_tap"),
+                                      "ai_illustrations": ai_prov,
                                       "note": guide.get("note", "")})
             snapshot = snapshot_guide(db, job, "initial", md, done_objects, model=guide.get("model", ""),
                                         simulated=bool(guide.get("simulated", True)), materials=guide.get("materials", []),

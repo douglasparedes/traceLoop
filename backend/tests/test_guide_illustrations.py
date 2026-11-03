@@ -62,11 +62,16 @@ def test_ambiguous_match_stays_review_only():
             "ambiguous_match": True}]
     out = inject_illustrations(md, [{"step_number": 1, "objects_used": [1]}], amb)
     assert "illustrations/obj-1-overlay.png" not in out
-    # ...but a low-confidence single match (not ambiguous) still publishes.
+    # Verified-only rule: even a low-confidence single match stays reviewable
+    # until confirmed — unvalidated overlays are never presented as success.
     low = [{"obj_id": 1, "label": "flag", "overlay": "obj-1-overlay.png",
             "illustration": "", "status": "needs_tap"}]
     out2 = inject_illustrations(md, [{"step_number": 1, "objects_used": [1]}], low)
-    assert "illustrations/obj-1-overlay.png" in out2
+    assert "illustrations/obj-1-overlay.png" not in out2
+    ok = [{"obj_id": 1, "label": "flag", "overlay": "obj-1-overlay.png",
+           "illustration": "", "status": "ok"}]
+    out3 = inject_illustrations(md, [{"step_number": 1, "objects_used": [1]}], ok)
+    assert "illustrations/obj-1-overlay.png" in out3
 
 
 def test_fallback_generator_headings_match_injector():

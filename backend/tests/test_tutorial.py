@@ -151,7 +151,8 @@ def test_inject_illustrations_is_idempotent():
     from app.tutorial import inject_illustrations
     md = "# T\n\n## Steps\n\n### 1. Do it (0s-5s)\n\nDo the thing.\n\n### 2. Next (5s-9s)\n\nNext thing.\n"
     steps = [{"step_number": 1, "objects_used": [1]}, {"step_number": 2, "objects_used": []}]
-    objects = [{"obj_id": 1, "label": "flag", "overlay": "obj-1-overlay.png", "illustration": "obj-1.png"}]
+    objects = [{"obj_id": 1, "label": "flag", "overlay": "obj-1-overlay.png", "illustration": "obj-1.png",
+                "status": "ok"}]
     once = inject_illustrations(md, steps, objects)
     assert "![flag](illustrations/obj-1-overlay.png)" in once
     assert "![flag](illustrations/obj-1.png)" in once
@@ -159,6 +160,11 @@ def test_inject_illustrations_is_idempotent():
     assert inject_illustrations(once, steps, objects) == once
     # Objects without files never inject.
     assert inject_illustrations(md, steps, [{"obj_id": 1, "overlay": "", "illustration": ""}]) == md.strip() + "\n"
+    # Unverified results (missing status or needs_tap) never auto-publish.
+    assert inject_illustrations(md, steps, [{"obj_id": 1, "label": "flag",
+                                             "overlay": "obj-1-overlay.png", "illustration": ""}]) == md.strip() + "\n"
+    assert inject_illustrations(md, steps, [{"obj_id": 1, "label": "flag", "status": "needs_tap",
+                                             "overlay": "obj-1-overlay.png", "illustration": ""}]) == md.strip() + "\n"
 
 
 def test_refresh_guide_and_bundle_zip(monkeypatch, tmp_path):

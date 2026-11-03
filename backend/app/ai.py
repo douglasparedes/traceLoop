@@ -42,6 +42,10 @@ IMAGE_MODEL = os.getenv("MUSE_IMAGE_MODEL", "muse-image-1.0")
 # Cost control: single-image calls only, low reasoning pass (same $0.01/image price).
 IMAGE_REASONING = os.getenv("MUSE_IMAGE_REASONING", "low")
 IMAGE_TIMEOUT = int(os.getenv("MUSE_IMAGE_TIMEOUT", "180"))
+# Object inventory cap: generous enough for real maintenance tasks, still
+# bounded for provider cost. Beyond-cap items are reported in `dropped`,
+# never silently discarded without a trace.
+MAX_OBJECTS = int(os.getenv("TRACELOOP_MAX_OBJECTS", "32"))
 
 
 def live_enabled() -> bool:
@@ -904,8 +908,10 @@ _UNDERSTAND_SCHEMA = {
         "type": "object",
         "properties": {
             "objects": {"type": "array", "items": {"type": "object", "properties": {
-                "label": {"type": "string"}, "first_mentioned_at": {"type": "number"}, "obj_id": {"type": "integer"}},
-                "required": ["label", "first_mentioned_at", "obj_id"], "additionalProperties": False}},
+                "label": {"type": "string"}, "first_mentioned_at": {"type": "number"}, "obj_id": {"type": "integer"},
+                "alternative_names": {"type": "array", "items": {"type": "string"}},
+                "properties": {"type": "string"}},
+                "required": ["label", "first_mentioned_at", "obj_id"], "additionalProperties": True}},
             "steps": {"type": "array", "items": {"type": "object", "properties": {
                 "step_number": {"type": "integer"}, "title": {"type": "string"},
                 "start": {"type": "number"}, "end": {"type": "number"},
@@ -938,6 +944,8 @@ def understand_tutorial(segments: list[dict], duration_sec: float) -> dict:
         "You analyze a tutorial transcript with segment timestamps (seconds). Extract: "
         "objects = every distinct physical object/tool/part the speaker shows or uses "
         "(label = short noun phrase SAM can segment, e.g. 'red screwdriver'; "
+        "alternative_names = 1-3 synonyms or more specific descriptions, e.g. ['phillips screwdriver']; "
+        "properties = brief visual traits like color/size/material when stated; "
         "first_mentioned_at = when it first appears; obj_id sequential from 1). "
         "Resolve pronouns: 'this', 'it', 'this tool' refer to the most recent object — do not create objects for pronouns. "
         "steps = the tutorial's logical steps in order with start/end seconds inside the video duration, "
@@ -947,13 +955,19 @@ def understand_tutorial(segments: list[dict], duration_sec: float) -> dict:
     try:
         parsed = json.loads(_chat(system, f"Video duration: {duration_sec:.1f}s\nTimed transcript:\n{timed}", json_schema=_UNDERSTAND_SCHEMA))
         objects, seen = [], set()
+        dropped = []
         for i, o in enumerate(parsed.get("objects") or [], start=1):
             label = str(o.get("label") or "").strip()
             if not label or label.lower() in seen:
+                if label:
+                    dropped.append(f"duplicate label ignored: {label}")
                 continue
             seen.add(label.lower())
+            alt = [str(a).strip()[:60] for a in (o.get("alternative_names") or []) if str(a).strip()][:3]
+            props = str(o.get("properties") or "").strip()[:200]
             objects.append({"label": label, "first_mentioned_at": max(0.0, min(float(o.get("first_mentioned_at", 0)), duration_sec)),
-                            "obj_id": i, "status": "pending", "confidence": None, "illustration": "", "overlay": "", "track": []})
+                            "obj_id": i, "status": "pending", "confidence": None, "illustration": "", "overlay": "", "track": [],
+                            "alternative_names": alt, "properties": props, "discovery_source": "transcript"})
         valid_ids = {o["obj_id"] for o in objects}
         steps = []
         for j, s in enumerate(parsed.get("steps") or [], start=1):
@@ -962,7 +976,16 @@ def understand_tutorial(segments: list[dict], duration_sec: float) -> dict:
                           "end": max(0.0, min(float(s.get("end", duration_sec)), duration_sec)),
                           "summary": str(s.get("summary") or ""),
                           "objects_used": [int(x) for x in (s.get("objects_used") or []) if int(x) in valid_ids]})
-        return {"objects": objects[:8], "steps": steps, "simulated": False, "model": SPARK_MODEL}
+        if len(objects) > MAX_OBJECTS:
+            dropped.append(f"{len(objects) - MAX_OBJECTS} objects beyond cap {MAX_OBJECTS} deferred (prioritized by first appearance)")
+            # Prioritize by earliest mention so the most relevant survive.
+            objects = sorted(objects, key=lambda o: o["first_mentioned_at"])[:MAX_OBJECTS]
+            # Reassign stable sequential ids after truncation.
+            for i, o in enumerate(objects, start=1):
+                o["obj_id"] = i
+            valid_ids = {o["obj_id"] for o in objects}
+            steps = [{**s, "objects_used": [x for x in s["objects_used"] if x in valid_ids]} for s in steps]
+        return {"objects": objects, "steps": steps, "simulated": False, "model": SPARK_MODEL, "dropped": dropped}
     except Exception as e:
         return {"objects": [], "steps": [], "simulated": True, "model": SPARK_MODEL,
                 "note": f"Understanding failed ({type(e).__name__})"}
@@ -1371,7 +1394,7 @@ def _clean_visual_steps(raw_steps: list, duration_sec: float) -> tuple[list[dict
             "title": title, "instruction": instruction,
             "start_sec": round(start, 1), "end_sec": round(end, 1),
             "evidence_frames": ev,
-            "objects": [str(o)[:80] for o in (s.get("objects") or []) if str(o).strip()][:8],
+            "objects": [str(o)[:80] for o in (s.get("objects") or []) if str(o).strip()][:16],
             "confidence": conf if conf in ("low", "medium", "high") else "low",
             "uncertainties": [str(u)[:500] for u in (s.get("uncertainties") or []) if str(u).strip()][:5],
         })
