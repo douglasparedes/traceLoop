@@ -11,3 +11,8 @@ video/bundle*/
 video/tsconfig.tsbuildinfo
 video/*.mp4
 video/smoke-*.json
+*.jks
+
+node_modules/
+.vite/
+

@@ -92,7 +92,7 @@ class FinalizeJob(BaseModel):
     step_id must belong to the job's pinned procedure revision. event_id
     makes retries idempotent: re-sending the same finalization never
     duplicates the step event or the finish. The server computes the
-    outcome (completed vs completed-with-exceptions) and ignores any
+    outcome (completed vs finished-with-exceptions) and ignores any
     client-supplied outcome.
     """
     step_id: str

@@ -15,7 +15,7 @@ import SyncDiagnostics from "./SyncDiagnostics";
 
 const ISSUE_TYPES = ["Component not found", "Instructions unclear", "Expected result not observed", "Tool unavailable", "Manual mismatch", "Unexpected condition", "Other"];
 
-interface JobRow { id: string; procedure_title: string; status: string; outcome: string | null; started_at: string; events: number }
+interface JobRow { id: string; procedure_title: string; status: string; outcome: string | null; started_at: string; ended_at: string | null; events: number }
 interface ManualRow { id: string; title: string; model: string | null; chunks: number }
 
 async function loadPending<T>(key: string): Promise<T[]> {
@@ -477,9 +477,10 @@ function Home({ procs, jobs, activeJob, activeVersion, pending, online, storageN
     ? activeVersion.steps.filter((s) => activeJob.stepStates[s.id] === "blocked") : [];
   const totalSteps = activeVersion?.steps.length || 0;
   const homeNext = activeJob && activeVersion ? (() => {
-    // Resume label = first step without a recorded terminal state.
+    // Resume label = first step without a done/skipped outcome.
+    // Blocked steps halt here — they are the resume target, never skipped.
     const sts = [...activeVersion.steps].sort((a, b) => a.step_order - b.step_order);
-    const i = sts.findIndex((s) => !["done", "skipped", "blocked"].includes(activeJob.stepStates[s.id]));
+    const i = sts.findIndex((s) => !["done", "skipped"].includes(activeJob.stepStates[s.id]));
     return i === -1 ? sts.length : i + 1;
   })() : 1;
   return (
@@ -589,30 +590,74 @@ function Home({ procs, jobs, activeJob, activeVersion, pending, online, storageN
       )}
       <div>
         <div className="row" style={{ justifyContent: "space-between" }}>
-          <h3>Recent field work</h3>
-          <span className="muted small-text">Job journal</span>
+          <h3>Field work</h3>
+          <span className="muted small-text">Active · needs attention · completed</span>
         </div>
-        {jobs.length === 0 ? (
-          <div className="card"><div className="empty">No jobs yet. Start one from an approved procedure.</div></div>
-        ) : (
-          <div className="recent-grid">
-            {jobs.slice(0, 4).map((j) => (
-          <div key={j.id} className="card" style={{ marginBottom: 0 }}>
-            <div className="row" style={{ justifyContent: "space-between" }}>
-              <div style={{ minWidth: 0 }}>
-                <strong style={{ display: "block", overflow: "hidden", textOverflow: "ellipsis" }}>{j.procedure_title}</strong>
-                <span className="muted small-text num">{new Date(j.started_at).toLocaleString()} · {j.events} event{j.events === 1 ? "" : "s"} · server-confirmed</span>
-              </div>
-              {j.outcome === "completed"
-                ? <span className="badge ok"><Icon name="check" size={13} /> Pass</span>
-                : j.status === "finished"
-                  ? <span className="badge warn"><Icon name="flag" size={13} /> {j.outcome || "Finished"}</span>
-                  : <span className="badge info">Open</span>}
-            </div>
-          </div>
-            ))}
-          </div>
-        )}
+        {(() => {
+          const openJobs = jobs.filter((j) => j.status !== "finished");
+          const doneJobs = jobs.filter((j) => j.status === "finished");
+          const isBlockedLocal = (blockedSteps?.length || 0) > 0;
+          return (
+            <>
+              {activeJob && (
+                <div className="card" style={{ marginBottom: 10, borderLeft: isBlockedLocal ? "4px solid var(--danger)" : undefined }}>
+                  <div className="row" style={{ justifyContent: "space-between" }}>
+                    <strong>{isBlockedLocal ? "Needs attention" : "My active work"}</strong>
+                    {isBlockedLocal
+                      ? <span className="badge crit">Blocked — resolve issue</span>
+                      : <span className="badge info">In progress — continue job</span>}
+                  </div>
+                  <p className="muted small-text" style={{ margin: "6px 0 0" }}>
+                    {activeJob.title} · step {homeNext} of {totalSteps} · saved on this device{pending > 0 ? ` · ${pending} update${pending === 1 ? "" : "s"} pending sync` : " · synced"}
+                  </p>
+                </div>
+              )}
+              {openJobs.length > 0 && (
+                <div style={{ marginBottom: 10 }}>
+                  <p className="eyebrow" style={{ margin: "0 0 6px" }}>Ready to continue (server-confirmed open jobs)</p>
+                  <div className="recent-grid">
+                    {openJobs.slice(0, 4).map((j) => (
+                      <div key={j.id} className="card" style={{ marginBottom: 0 }}>
+                        <div className="row" style={{ justifyContent: "space-between" }}>
+                          <div style={{ minWidth: 0 }}>
+                            <strong style={{ display: "block", overflow: "hidden", textOverflow: "ellipsis" }}>{j.procedure_title}</strong>
+                            <span className="muted small-text num">{new Date(j.started_at).toLocaleString()} · {j.events} event{j.events === 1 ? "" : "s"} · server-confirmed</span>
+                          </div>
+                          <span className="badge info">In progress</span>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {doneJobs.length === 0 && recentFinishes.filter((r) => !jobs.some((j) => j.id === r.id)).length === 0 ? (
+                <div className="card"><div className="empty">
+                  <h4 style={{ margin: 0 }}>No completed jobs yet</h4>
+                  <p className="muted small-text">Finished jobs appear here with a completion summary.</p>
+                </div></div>
+              ) : (
+                <div>
+                  <p className="eyebrow" style={{ margin: "0 0 6px" }}>Recently completed</p>
+                  <div className="recent-grid">
+                    {doneJobs.slice(0, 4).map((j) => (
+                      <div key={j.id} className="card" style={{ marginBottom: 0 }}>
+                        <div className="row" style={{ justifyContent: "space-between" }}>
+                          <div style={{ minWidth: 0 }}>
+                            <strong style={{ display: "block", overflow: "hidden", textOverflow: "ellipsis" }}>{j.procedure_title}</strong>
+                            <span className="muted small-text num">{j.ended_at ? new Date(j.ended_at).toLocaleString() : new Date(j.started_at).toLocaleString()} · server-confirmed</span>
+                          </div>
+                          {j.outcome === "completed"
+                            ? <span className="badge ok">Completed — view summary</span>
+                            : <span className="badge warn">{j.outcome || "Completed"} — view summary</span>}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </>
+          );
+        })()}
         {jobs.length > 0 && <button className="btn secondary" style={{ marginTop: 12 }} onClick={() => go("activity")}>View all activity</button>}
       </div>
     </div>
@@ -752,7 +797,6 @@ function ProcedureDetail({ title, version, cached, startJob, cache, openReview, 
   const safety = ((version.source_evidence as { safety_notes?: string[] }).safety_notes || []).filter(Boolean);
   const canStart = version.status === "approved" && version.steps.length > 0;
   const guideFormat = typeof (version.source_evidence as { guide_format?: unknown }).guide_format === "string" ? (version.source_evidence as { guide_format: string }).guide_format : "";
-  const isInteractive = guideFormat === "interactive";
   return (
     <div>
       <button className="btn small secondary" onClick={() => go("library")}><Icon name="back" size={17} /> Library</button>
@@ -781,8 +825,8 @@ function ProcedureDetail({ title, version, cached, startJob, cache, openReview, 
           </div>
         )}
         <div className="proc-actions" style={{ marginTop: 12 }}>
-          {canStart && <button className="btn" onClick={startJob}><Icon name="play" size={19} /> {isInteractive ? "Start guided execution" : "Start procedure"}</button>}
-          {version.status !== "approved" && <button className="btn review" onClick={openReview}><Icon name="flag" size={19} /> Open in review</button>}
+          {canStart && <button className="btn" onClick={startJob}><Icon name="play" size={19} /> Start job</button>}
+          {version.status !== "approved" && <button className="btn review" onClick={openReview}><Icon name="flag" size={19} /> View revision history</button>}
           <button className="btn secondary" onClick={cache}><Icon name="download" size={19} /> {cached ? "Update offline copy" : "Save for offline use"}</button>
         </div>
         {!canStart && version.status === "approved" && <p className="muted small-text">This approved version has no steps, so a guided job cannot start. Ask a reviewer to create a revision with steps.</p>}
@@ -1327,21 +1371,26 @@ function JobView({ job, version, queueEvent, setJob, notify, reload, refreshPend
   const [uploading, setUploading] = useState(false);
   const photoInputRef = useRef<HTMLInputElement | null>(null);
   const steps = version ? [...version.steps].sort((a, b) => a.step_order - b.step_order) : [];
-  const isTerminal = (st: string | undefined) => st === "done" || st === "skipped" || st === "blocked";
+  // Canonical progression: only done/skipped advance the frontier.
+  // Blocked halts the job at the blocking step — it is never skipped over.
+  const isDoneOrSkipped = (st: string | undefined) => st === "done" || st === "skipped";
   const frontierIdx = (() => {
     if (!job) return 0;
-    const i = steps.findIndex((s) => !isTerminal(job.stepStates[s.id]));
+    const i = steps.findIndex((s) => !isDoneOrSkipped(job.stepStates[s.id]));
     return i === -1 ? steps.length : i;
   })();
-  const allTerminal = job !== null && steps.length > 0 && frontierIdx >= steps.length;
+  const allDone = job !== null && steps.length > 0 && frontierIdx >= steps.length;
+  const frontierStep = job && steps.length && frontierIdx < steps.length ? steps[frontierIdx] : undefined;
+  const blockedAtFrontier = !!frontierStep && job?.stepStates[frontierStep.id] === "blocked";
+  const isLastPending = !!job && steps.length > 0 && frontierIdx === steps.length - 1 && !blockedAtFrontier;
   const doneCount = job ? steps.filter((s) => job.stepStates[s.id] === "done").length : 0;
   // Viewed step (Previous navigation) vs frontier (where work happens).
   // Reviewing history never mutates it; actions always target the frontier.
   const [viewIdx, setViewIdx] = useState<number | null>(null);
   useEffect(() => { setViewIdx(null); setMediaError(""); setFinishBlocked(null); }, [job?.id]);
-  const effectiveIdx = viewIdx ?? (allTerminal ? steps.length - 1 : frontierIdx);
+  const effectiveIdx = viewIdx ?? (allDone ? steps.length - 1 : frontierIdx);
   const step = job && steps.length ? steps[Math.min(Math.max(effectiveIdx, 0), steps.length - 1)] : undefined;
-  const viewingPast = viewIdx !== null && viewIdx < frontierIdx && !allTerminal;
+  const viewingPast = viewIdx !== null && viewIdx < frontierIdx && !allDone;
   const [mediaError, setMediaError] = useState("");
   const [jobPending, setJobPending] = useState(0);
   const [askBusy, setAskBusy] = useState(false);
@@ -1366,11 +1415,13 @@ function JobView({ job, version, queueEvent, setJob, notify, reload, refreshPend
   // Returns the server state (or null offline) so finish can re-check it.
   async function pullServerState(): Promise<{
     steps: { step_id: string; state: string }[]; finished: boolean; outcome: string | null;
+    is_blocked?: boolean; can_progress?: boolean; can_finalize?: boolean;
   } | null> {
     if (!job || !online || job.finished) return null;
     try {
       const st = await api.get<{
         steps: { step_id: string; state: string }[]; finished: boolean; outcome: string | null;
+        is_blocked?: boolean; can_progress?: boolean; can_finalize?: boolean;
       }>(`/api/jobs/${job.id}/state`);
       let changed = false;
       const merged = { ...job.stepStates };
@@ -1419,7 +1470,7 @@ function JobView({ job, version, queueEvent, setJob, notify, reload, refreshPend
   /** Record a terminal state for the FRONTIER step and advance the view.
    *  Viewing history can never overwrite it: same-state repeats no-op. */
   async function mark(state: "done" | "skipped" | "blocked") {
-    if (!job || actingRef.current || allTerminal) return;
+    if (!job || actingRef.current || allDone || blockedAtFrontier) return;
     const target = steps[frontierIdx];
     if (!target) return;
     if (job.stepStates[target.id] === state) { notify("Already recorded — no duplicate event created."); return; }
@@ -1436,19 +1487,22 @@ function JobView({ job, version, queueEvent, setJob, notify, reload, refreshPend
     } finally { setActing(false); }
   }
   async function recordIssue() {
-    if (!job || !step || actingRef.current) return;
+    // Incidents always target the frontier (current work), never a
+    // history view the technician navigated back to.
+    const target = frontierStep;
+    if (!job || !target || actingRef.current) return;
     if (!note.trim()) { notify("Describe the anomaly first so the reviewer knows what to fix.", "error"); return; }
     setActing(true);
     try {
-      await queueEvent({ event_id: uuid(), session_id: job.id, step_id: step.id, event_type: "issue_recorded", payload: { issue_type: issueType, note }, occurred_at: new Date().toISOString() });
-      let halted = job.stepStates[step.id] === "blocked";
+      await queueEvent({ event_id: uuid(), session_id: job.id, step_id: target.id, event_type: "issue_recorded", payload: { issue_type: issueType, note }, occurred_at: new Date().toISOString() });
+      let halted = job.stepStates[target.id] === "blocked";
       if (!halted) {
-        await queueEvent({ event_id: `evt:${job.id}:${step.id}:blocked`, session_id: job.id, step_id: step.id, event_type: "step_blocked", payload: { step_order: step.step_order }, occurred_at: new Date().toISOString() });
+        await queueEvent({ event_id: `evt:${job.id}:${target.id}:blocked`, session_id: job.id, step_id: target.id, event_type: "step_blocked", payload: { step_order: target.step_order }, occurred_at: new Date().toISOString() });
         halted = true;
       }
-      await setJob({ ...job, stepStates: { ...job.stepStates, [step.id]: "blocked" } });
-      setNote(""); setDrawerOpen(false);
-      notify("Anomaly logged and step marked blocked. It syncs when connectivity returns — nothing is lost offline.");
+      await setJob({ ...job, stepStates: { ...job.stepStates, [target.id]: "blocked" } });
+      setNote(""); setDrawerOpen(false); setViewIdx(null);
+      notify(`Anomaly logged on step ${target.step_order} — job halted. Resolve it to resume. It syncs when connectivity returns.`);
     } catch {
       notify("Could not save the incident on this device — nothing was recorded. Retry.", "error");
     } finally { setActing(false); }
@@ -1456,13 +1510,14 @@ function JobView({ job, version, queueEvent, setJob, notify, reload, refreshPend
   /** Resume a halted step: history is preserved as events; the step simply
    *  becomes workable again (it returns to the frontier). */
   async function resumeStep() {
-    if (!job || !step || actingRef.current) return;
-    if (job.stepStates[step.id] !== "blocked") { notify("Only a blocked step can be resumed."); return; }
+    const target = frontierStep;
+    if (!job || !target || actingRef.current) return;
+    if (job.stepStates[target.id] !== "blocked") { notify("Only a blocked step can be resumed."); return; }
     setActing(true);
     try {
-      await queueEvent({ event_id: uuid(), session_id: job.id, step_id: step.id, event_type: "step_resumed", payload: { step_order: step.step_order }, occurred_at: new Date().toISOString() });
+      await queueEvent({ event_id: uuid(), session_id: job.id, step_id: target.id, event_type: "step_resumed", payload: { step_order: target.step_order }, occurred_at: new Date().toISOString() });
       const next = { ...job.stepStates };
-      delete next[step.id];
+      delete next[target.id];
       await setJob({ ...job, stepStates: next });
       setViewIdx(null); setFinishBlocked(null);
       notify("Step resumed — it is workable again. The halt stays in the audit history.", "ok");
@@ -1471,24 +1526,28 @@ function JobView({ job, version, queueEvent, setJob, notify, reload, refreshPend
     } finally { setActing(false); }
   }
   async function saveFieldNote() {
-    if (!job || !step || actingRef.current) return;
+    // Field notes attach to the frontier step (current work).
+    const target = frontierStep || step;
+    if (!job || !target || actingRef.current) return;
     if (!fieldNote.trim()) { notify("Write the note first.", "error"); return; }
     setActing(true);
     try {
-      await queueEvent({ event_id: uuid(), session_id: job.id, step_id: step.id, event_type: "field_note", payload: { note: fieldNote, step_order: step.step_order }, occurred_at: new Date().toISOString() });
+      await queueEvent({ event_id: uuid(), session_id: job.id, step_id: target.id, event_type: "field_note", payload: { note: fieldNote, step_order: target.step_order }, occurred_at: new Date().toISOString() });
       setFieldNote(""); setNoteOpen(false); notify("Field note saved on this device. It syncs with your queued events.");
     } finally { setActing(false); }
   }
   async function attachPhoto(f: File | undefined) {
-    if (!f || !job || !step || uploading || actingRef.current) return;
+    // Evidence attaches to the frontier step (current work).
+    const target = frontierStep || step;
+    if (!f || !job || !target || uploading || actingRef.current) return;
     if (!["image/jpeg", "image/png", "image/webp"].includes(f.type)) { notify("Only JPEG, PNG or WebP photos are supported.", "error"); return; }
     if (f.size > 8 * 1024 * 1024) { notify("Photo is larger than 8 MB — pick a smaller file.", "error"); return; }
     setUploading(true);
-    const desc = `Step ${step.step_order} field photo`;
+    const desc = `Step ${target.step_order} field photo`;
     try {
-      const fd = new FormData(); fd.append("file", f); fd.append("description", desc); fd.append("step_id", step.id);
+      const fd = new FormData(); fd.append("file", f); fd.append("description", desc); fd.append("step_id", target.id);
       const up = await api.upload<{ id: string }>(`/api/jobs/${job.id}/evidence`, fd);
-      await queueEvent({ event_id: uuid(), session_id: job.id, step_id: step.id, event_type: "evidence_attached", payload: { evidence_id: up.id, step_order: step.step_order, description: desc }, occurred_at: new Date().toISOString() });
+      await queueEvent({ event_id: uuid(), session_id: job.id, step_id: target.id, event_type: "evidence_attached", payload: { evidence_id: up.id, step_order: target.step_order, description: desc }, occurred_at: new Date().toISOString() });
       notify("Photo attached to this step and queued for server confirmation."); void loadPhotos(); void reload();
     } catch (e) {
       const msg = e instanceof Error ? e.message : "";
@@ -1496,23 +1555,42 @@ function JobView({ job, version, queueEvent, setJob, notify, reload, refreshPend
         const key = uuid();
         await idb.put("media", key, f);
         const pend = await loadPending<PendingPhoto>("pending-photos");
-        pend.push({ key, job_id: job.id, step_id: step.id, description: desc });
+        pend.push({ key, job_id: job.id, step_id: target.id, description: desc });
         await savePending("pending-photos", pend);
         setPendingPhotos((n) => n + 1);
         notify("Photo saved on this device — it uploads automatically on the next sync.", "info");
       } else notify(msg || "Photo upload failed.", "error");
     } finally { setUploading(false); }
   }
-  /** Single coherent finalization: requires every step terminal, then
-   *  records the finish atomically (online) or queues it in order (offline).
-   *  Retries reuse the stable finish event id, so double-clicks and
-   *  reloads can never duplicate the finish. */
+  /** Single coherent finalization: the last-step action completes the
+   *  final step AND finalizes the job in one interaction (online) or queues
+   *  both in order (offline). Blocked jobs cannot finalize until resolved.
+   *  Retries reuse stable event ids, so double-clicks never duplicate. */
   async function finishFinal() {
-    if (!job || actingRef.current || !allTerminal || steps.length === 0) return;
+    if (!job || actingRef.current || steps.length === 0) return;
+    if (blockedAtFrontier) { notify("Job blocked — resolve the blocked step before finishing.", "error"); return; }
+    if (!allDone && !isLastPending) return;
     setActing(true);
     setFinishBlocked(null);
     try {
-      const localOutcome = doneCount === steps.length ? "completed" : "finished-with-exceptions";
+      const finalStep = allDone ? steps[steps.length - 1] : steps[frontierIdx];
+      // One-click final step: record its completion locally first (unless
+      // already recorded) so the UI and the server finalize atomically.
+      const finalEventId = `evt:${job.id}:${finalStep.id}:complete`;
+      let workingJob = job;
+      if (workingJob.stepStates[finalStep.id] !== "done" && workingJob.stepStates[finalStep.id] !== "skipped") {
+        const existing = await idb.get<JobEventRec>("events", finalEventId);
+        if (!existing) {
+          await queueEvent({ event_id: finalEventId, session_id: job.id, step_id: finalStep.id,
+                             event_type: "step_completed", payload: { step_order: finalStep.step_order, final: true },
+                             occurred_at: new Date().toISOString() });
+        }
+        workingJob = { ...workingJob, stepStates: { ...workingJob.stepStates, [finalStep.id]: "done" } };
+        await setJob(workingJob);
+      }
+      const outcomeGuess = steps.every((s) => (workingJob.stepStates[s.id] || (s.id === finalStep.id ? "done" : undefined)) === "done")
+        ? "completed" : "finished-with-exceptions";
+      const localOutcome = doneCount === steps.length || outcomeGuess === "completed" ? "completed" : "finished-with-exceptions";
       // The server can only finalize what it has: sync recorded steps
       // first so an online finish never fails on work this device already
       // did. Without this, tapping fast then finishing hits a 422 for
@@ -1529,7 +1607,8 @@ function JobView({ job, version, queueEvent, setJob, notify, reload, refreshPend
         const st = await pullServerState();
         const missing = st ? steps.filter((s) => {
           const cur = st.steps.find((x) => x.step_id === s.id);
-          return !cur || (cur.state !== "done" && cur.state !== "skipped" && cur.state !== "blocked");
+          // Blocked is not terminal: it must be resolved, not skipped over.
+          return !cur || (cur.state !== "done" && cur.state !== "skipped");
         }).map((s) => s.step_order) : [];
         if (missing.length > 0) {
           // Sync ran but the server still lacks outcomes (e.g. a step the
@@ -1537,6 +1616,10 @@ function JobView({ job, version, queueEvent, setJob, notify, reload, refreshPend
           // finalize blindly — point at the exact steps instead.
           setFinishBlocked(missing);
           notify(`The server still has no outcome for step${missing.length === 1 ? "" : "s"} ${missing.join(", ")}. Complete, skip, or resolve them first — or discard the failing queue item in Activity and retry.`, "error");
+          return;
+        }
+        if (st?.is_blocked) {
+          notify("Job blocked on the server — resolve the blocked step before finishing.", "error");
           return;
         }
       }
@@ -1547,10 +1630,9 @@ function JobView({ job, version, queueEvent, setJob, notify, reload, refreshPend
       }
       let serverOutcome: string | null = null;
       try {
-        const lastStep = steps[steps.length - 1];
         const r = await api.post<{ ok: boolean; outcome?: string; already_finished?: boolean }>(
           `/api/jobs/${job.id}/finalize`,
-          { step_id: lastStep.id, event_id: `evt:${job.id}:${lastStep.id}:complete`, reason: "" });
+          { step_id: finalStep.id, event_id: finalEventId, reason: "" });
         serverOutcome = r.outcome || null;
       } catch (e) {
         if (!isNetworkError(e)) { notify(e instanceof Error ? e.message : "Finalization rejected.", "error"); return; }
@@ -1570,10 +1652,10 @@ function JobView({ job, version, queueEvent, setJob, notify, reload, refreshPend
           await refreshPending();
         } catch { /* bookkeeping only */ }
       }
-      await setJob({ ...job, finished: true, finish_outcome: outcome });
+      await setJob({ ...workingJob, finished: true, finish_outcome: outcome });
       notify(outcome === "completed"
-        ? "Job finished — all steps completed."
-        : "Job finished with exceptions — skipped or blocked steps are listed in the summary.", "ok");
+        ? "Job completed — final step recorded and job closed."
+        : "Job finished with exceptions — skipped steps are listed in the summary.", "ok");
       go("history");
     } finally { setActing(false); }
   }
@@ -1601,7 +1683,6 @@ function JobView({ job, version, queueEvent, setJob, notify, reload, refreshPend
     if (st === "blocked") return "on on-block";
     return "";
   };
-  const frontierStep = allTerminal ? undefined : steps[frontierIdx];
   return (
     <div>
       <div className="row" style={{ justifyContent: "space-between", marginBottom: 10 }}>
@@ -1685,7 +1766,7 @@ function JobView({ job, version, queueEvent, setJob, notify, reload, refreshPend
         <h3>Job summary so far</h3>
         <p>{doneCount} completed · {blockedCount} blocked · {skippedCount} skipped of {steps.length} steps. {jobPending > 0 ? `${jobPending} item${jobPending === 1 ? "" : "s"} saved on this device, waiting for server confirmation.` : "Everything is confirmed by the server."}</p>
         <div className="row">
-          {!allTerminal && !viewingPast && <button className="btn secondary" onClick={() => mark("skipped")} disabled={actingUi}>Skip step {frontierStep ? frontierStep.step_order : ""}</button>}
+          {!allDone && !blockedAtFrontier && !viewingPast && <button className="btn secondary" onClick={() => mark("skipped")} disabled={actingUi}>Skip step {frontierStep ? frontierStep.step_order : ""}</button>}
           {viewingPast && frontierStep && <button className="btn secondary" onClick={() => setViewIdx(null)}>Return to step {frontierStep.step_order}</button>}
         </div>
         <p className="muted small-text" style={{ marginTop: 8 }}>If a step is blocked on anything hazardous, stop work and follow your site procedure — this app never instructs you to bypass safety steps.</p>
@@ -1710,20 +1791,18 @@ function JobView({ job, version, queueEvent, setJob, notify, reload, refreshPend
           <button className="btn secondary" onClick={() => setNoteOpen(true)}><Icon name="note" size={18} /> Field Note</button>
         </div>
         <div className="action-dock-row">
-          {viewingPast ? (
+          {blockedAtFrontier && !viewingPast ? (
             <>
-              <button className="btn secondary" onClick={() => setDrawerOpen(true)} disabled={actingUi}><Icon name="warning" size={20} /> Report Blocked</button>
-              {job.stepStates[step.id] === "blocked"
-                ? <button className="btn" onClick={resumeStep} disabled={actingUi}><Icon name="forward" size={20} /> Resolve &amp; resume step</button>
-                : <span className="muted small-text" role="status">Reviewing a recorded step — it cannot be changed from here.{frontierStep ? ` Current work is at step ${frontierStep.step_order}.` : ""}</span>}
+              <span className="badge crit" role="status"><Icon name="warning" size={15} /> Job blocked — requires attention</span>
+              <button className="btn" onClick={resumeStep} disabled={actingUi}><Icon name="forward" size={20} /> Resolve &amp; resume step {frontierStep ? frontierStep.step_order : ""}</button>
             </>
-          ) : job.stepStates[step.id] === "blocked" ? (
+          ) : viewingPast ? (
             <>
-              <button className="btn danger" style={{ background: "var(--danger-bg)", borderColor: "var(--danger-bg)", color: "var(--danger)" }} onClick={() => setDrawerOpen(true)} disabled={actingUi}><Icon name="warning" size={20} /> Report Blocked</button>
-              <button className="btn" onClick={resumeStep} disabled={actingUi}><Icon name="forward" size={20} /> Resolve &amp; resume step</button>
+              <button className="btn secondary" onClick={() => setDrawerOpen(true)} disabled={actingUi || blockedAtFrontier}><Icon name="warning" size={20} /> Report Blocked</button>
+              <span className="muted small-text" role="status">Reviewing a recorded step — it cannot be changed from here.{frontierStep ? ` Current work is at step ${frontierStep.step_order}.` : ""}</span>
             </>
-          ) : allTerminal ? (
-            <button className="btn" onClick={finishFinal} disabled={actingUi}><Icon name="check" size={20} /> {actingUi ? "Finishing…" : "Finish job ✓"}</button>
+          ) : (allDone || isLastPending) ? (
+            <button className="btn" onClick={finishFinal} disabled={actingUi}><Icon name="check" size={20} /> {actingUi ? "Finishing…" : isLastPending ? "Finish job ✓" : "Finish job ✓"}</button>
           ) : (
             <>
               <button className="btn secondary danger-ghost" style={{ background: "var(--danger-bg)", borderColor: "var(--danger-bg)", color: "var(--danger)" }} onClick={() => setDrawerOpen(true)} disabled={actingUi} aria-label="Report this step as blocked"><Icon name="warning" size={20} /></button>
@@ -1731,8 +1810,11 @@ function JobView({ job, version, queueEvent, setJob, notify, reload, refreshPend
             </>
           )}
         </div>
-        {!allTerminal && !viewingPast && frontierStep && (
-          <p className="muted small-text" style={{ margin: "8px 0 0" }}>Primary action records step {frontierStep.step_order} of {steps.length}.</p>
+        {!allDone && !viewingPast && frontierStep && !blockedAtFrontier && (
+          <p className="muted small-text" style={{ margin: "8px 0 0" }}>{isLastPending ? `Complete this final step and close the job.` : `Primary action records step ${frontierStep.step_order} of ${steps.length}.`}</p>
+        )}
+        {blockedAtFrontier && !viewingPast && (
+          <p className="muted small-text" style={{ margin: "8px 0 0" }} role="status">Halted at step {frontierStep ? frontierStep.step_order : ""} — normal progression is paused until the incident is resolved.</p>
         )}
       </div>
       <input ref={photoInputRef} className="visually-hidden" type="file" accept="image/jpeg,image/png,image/webp" aria-label="Attach a field photo to this step" onChange={(e) => { void attachPhoto(e.target.files?.[0] || undefined); e.target.value = ""; }} />
@@ -1749,7 +1831,7 @@ function JobView({ job, version, queueEvent, setJob, notify, reload, refreshPend
               <h3><Icon name="warning" size={19} /> Report field anomaly</h3>
               <button className="btn small secondary icon-only" aria-label="Close anomaly report" onClick={() => setDrawerOpen(false)}><Icon name="close" size={18} /></button>
             </div>
-            <p className="muted">Select a blocking category for step {step.step_order}:</p>
+            <p className="muted">Select a blocking category for step {frontierStep ? frontierStep.step_order : step.step_order}:</p>
             <div className="issue-tags" role="group" aria-label="Anomaly category">
               {ISSUE_TYPES.map((t) => (
                 <button key={t} className="issue-tag" aria-pressed={issueType === t} onClick={() => setIssueType(t)}>{t}</button>
@@ -1943,10 +2025,10 @@ function History({ jobs, reload, role, onProposeRevision, notify }: { jobs: JobR
           <div className="row" style={{ justifyContent: "space-between" }}>
             <p style={{ margin: 0 }}><strong>{j.procedure_title}</strong> <span className="muted small-text num">{new Date(j.started_at).toLocaleString()}</span></p>
             {j.outcome === "completed"
-              ? <span className="badge ok"><Icon name="check" size={13} /> Pass</span>
+              ? <span className="badge ok"><Icon name="check" size={13} /> Completed</span>
               : j.status === "finished"
-                ? <span className="badge warn"><Icon name="flag" size={13} /> {j.outcome || "Finished"}</span>
-                : <span className="badge info">Open · {j.events} event{j.events === 1 ? "" : "s"}</span>}
+                ? <span className="badge warn"><Icon name="flag" size={13} /> {j.outcome || "Completed"} — view summary</span>
+                : <span className="badge info">In progress · {j.events} event{j.events === 1 ? "" : "s"}</span>}
           </div>
           <button className="btn small secondary" aria-expanded={openId === j.id} onClick={() => void toggle(j)}>{openId === j.id ? "Hide details" : "View details"}</button>
           {openId === j.id && detailError && <p className="muted">{detailError}</p>}

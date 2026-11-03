@@ -150,9 +150,14 @@ def test_sync_rejects_unknown_types_and_post_finish_events():
     last = ver["steps"][-1]
     c.post(f"/api/jobs/{job['id']}/finalize",
            json={"step_id": last["id"], "event_id": "e-fin", "reason": ""}, headers=TECH)
+    # Step outcome changes are rejected after finalization, but evidence and
+    # notes reconcile so offline photos are never lost.
     late = _sync([{"event_id": "e-late", "session_id": job["id"], "step_id": s0,
                    "event_type": "field_note", "payload": {"note": "hi"}, "occurred_at": "2026-01-01T00:00:00Z"}])
-    assert late["failed"] and "finished" in late["failed"][0]["error"]
+    assert late["acknowledged"] == ["e-late"] and not late["failed"]
+    late_step = _sync([{"event_id": "e-late-step", "session_id": job["id"], "step_id": s0,
+                        "event_type": "step_completed", "payload": {}, "occurred_at": "2026-01-01T00:00:01Z"}])
+    assert late_step["failed"] and "finished" in late_step["failed"][0]["error"]
     # Duplicates of already-synced events stay idempotent.
     dup = _sync([{"event_id": f"evt:{job['id']}:{s0}:step_completed", "session_id": job["id"],
                   "step_id": s0, "event_type": "step_completed", "payload": {},
@@ -173,7 +178,11 @@ def test_state_projection_blocked_resume_cycle():
     st = c.get(f"/api/jobs/{job['id']}/state").json()
     assert st["finished"] is False
     assert st["counts"] == {"total": 5, "completed": 1, "skipped": 0, "blocked": 1}
-    assert st["current"]["step_id"] == ver["steps"][2]["id"]
+    # A blocked step halts the job: it is the current blocker, not skipped.
+    assert st["is_blocked"] is True and st["can_progress"] is False and st["can_finalize"] is False
+    assert st["current"]["step_id"] == s1
+    assert st["blocked_step"]["step_id"] == s1
+    assert st["blocked_step_orders"] == [2]
     by_id = {s["step_id"]: s["state"] for s in st["steps"]}
     assert by_id[s1] == "blocked"
     _sync([{"event_id": "e-r1", "session_id": job["id"], "step_id": s1,
@@ -194,9 +203,49 @@ def test_start_duplicate_id_is_idempotent():
 
 
 def test_finish_requires_owner_or_reviewer():
-    p, _ = _seed()
+    p, ver = _seed()
     job = _start_job(p, headers=TECH)
     assert c.post(f"/api/jobs/{job['id']}/finish", json={"outcome": "completed", "reason": "", "summary": ""},
                   headers=TECH2).status_code == 403
+    # Reviewer passes auth but coverage still applies: empty job cannot finish.
     assert c.post(f"/api/jobs/{job['id']}/finish", json={"outcome": "completed", "reason": "", "summary": ""},
-                  headers=REV).status_code == 200
+                  headers=REV).status_code == 422
+    _sync(_step_events(job["id"], ver, [(i, "step_completed") for i in range(5)]), headers=TECH)
+    assert c.post(f"/api/jobs/{job['id']}/finish", json={"outcome": "completed", "reason": "", "summary": ""},
+                  headers=REV).json()["ok"] is True
+
+
+def test_finalize_rejects_blocked_step_until_resolved():
+    p, ver = _seed()
+    job = _start_job(p)
+    _sync(_step_events(job["id"], ver, [(0, "step_completed"), (1, "step_blocked"),
+                                        (2, "step_completed"), (3, "step_completed"),
+                                        (4, "step_completed")]))
+    last = ver["steps"][-1]
+    r = c.post(f"/api/jobs/{job['id']}/finalize",
+               json={"step_id": last["id"], "event_id": "e-blocked-fin", "reason": ""}, headers=TECH)
+    assert r.status_code == 422, r.text
+    assert "Blocked steps must be resolved" in r.json()["detail"]
+    s1 = ver["steps"][1]["id"]
+    _sync([{"event_id": "e-resume-1", "session_id": job["id"], "step_id": s1,
+            "event_type": "step_resumed", "payload": {}, "occurred_at": "2026-01-01T00:00:02Z"}])
+    _sync([{"event_id": "e-done-1", "session_id": job["id"], "step_id": s1,
+            "event_type": "step_completed", "payload": {}, "occurred_at": "2026-01-01T00:00:03Z"}])
+    r2 = c.post(f"/api/jobs/{job['id']}/finalize",
+                json={"step_id": last["id"], "event_id": "e-blocked-fin-2", "reason": ""}, headers=TECH)
+    assert r2.status_code == 200 and r2.json()["outcome"] == "completed"
+
+
+def test_finish_adapter_enforces_identical_rules():
+    p, ver = _seed()
+    job = _start_job(p)
+    # Empty job: both paths reject with 422.
+    last = ver["steps"][-1]
+    assert c.post(f"/api/jobs/{job['id']}/finish", json={"outcome": "completed"}, headers=TECH).status_code == 422
+    assert c.post(f"/api/jobs/{job['id']}/finalize",
+                  json={"step_id": last["id"], "event_id": "e-x", "reason": ""}, headers=TECH).status_code == 422
+    # Blocked job: both paths reject until resolved.
+    _sync(_step_events(job["id"], ver, [(0, "step_completed"), (1, "step_blocked")]))
+    assert c.post(f"/api/jobs/{job['id']}/finish", json={"outcome": "completed"}, headers=TECH).status_code == 422
+    assert c.post(f"/api/jobs/{job['id']}/finalize",
+                  json={"step_id": last["id"], "event_id": "e-y", "reason": ""}, headers=TECH).status_code == 422

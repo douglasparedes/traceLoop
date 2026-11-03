@@ -49,17 +49,21 @@ def _approved_procedure(title="Pump seal check"):
 
 
 def _start_finish_job(pid, vid):
+    ver = c.get(f"/api/procedure-versions/{vid}").json()
     j = c.post("/api/jobs", json={"procedure_id": pid, "procedure_version_id": vid}, headers=TECH).json()
     jid = j["id"]
-    # some events first (proves proposals see execution evidence, not just feedback)
-    c.post("/api/sync/events", json={"events": [
-        {"event_id": f"{jid}-e1", "session_id": jid, "step_id": None,
-         "event_type": "step_completed", "payload": {"step_order": 1},
-         "occurred_at": "2026-01-01T00:00:00"},
-        {"event_id": f"{jid}-e2", "session_id": jid, "step_id": None,
-         "event_type": "issue_recorded", "payload": {"issue_type": "Instructions unclear", "note": "Which screw?"},
-         "occurred_at": "2026-01-01T00:01:00"}]}, headers=TECH)
-    assert c.post(f"/api/jobs/{jid}/finish", json={"outcome": "finished-with-exceptions", "reason": "step 2 unclear"}, headers=TECH).status_code == 200
+    # Complete every pinned step so finalization enforces real coverage.
+    evs = [{"event_id": f"{jid}-step-{s['id']}", "session_id": jid, "step_id": s["id"],
+            "event_type": "step_completed", "payload": {"step_order": s["step_order"]},
+            "occurred_at": "2026-01-01T00:00:00"} for s in ver["steps"]]
+    evs.append({"event_id": f"{jid}-e2", "session_id": jid, "step_id": None,
+                "event_type": "issue_recorded", "payload": {"issue_type": "Instructions unclear", "note": "Which screw?"},
+                "occurred_at": "2026-01-01T00:01:00"})
+    c.post("/api/sync/events", json={"events": evs}, headers=TECH)
+    r = c.post(f"/api/jobs/{jid}/finish", json={"outcome": "completed", "reason": "step 2 unclear"}, headers=TECH)
+    assert r.status_code == 200, r.text
+    # Server computes the outcome: all-done jobs finish completed.
+    assert r.json().get("outcome") == "completed"
     return jid
 
 

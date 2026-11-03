@@ -209,7 +209,7 @@ export default function TutorialMode({ onOpenReview, onOpenStudio, hideLibrary, 
   const [pastTotal, setPastTotal] = useState(0);
   const [pastQ, setPastQ] = useState("");
   const [pastStatus, setPastStatus] = useState("");
-  const [pastShown, setPastShown] = useState(20);
+  const [pastLoadingMore, setPastLoadingMore] = useState(false);
   const [now, setNow] = useState(0);
   const [tapTarget, setTapTarget] = useState<number | null>(null);
   const [cameras, setCameras] = useState<CameraDevice[]>([]);
@@ -235,25 +235,27 @@ export default function TutorialMode({ onOpenReview, onOpenStudio, hideLibrary, 
   const queuedKeyRef = useRef<string | null>(null);
   const uploadRef = useRef<((blob: Blob) => void) | null>(null);
 
-  const loadPast = useCallback(async () => {
+  const loadPast = useCallback(async (opts?: { append?: boolean }) => {
+    const append = !!opts?.append;
+    if (append) setPastLoadingMore(true);
     try {
-      const idn = getIdentity();
-      const params = new URLSearchParams({ limit: "100", offset: "0" });
+      const params = new URLSearchParams({ limit: "20", offset: String(append ? past.length : 0) });
       if (pastQ.trim()) params.set("q", pastQ.trim());
       if (pastStatus) params.set("status", pastStatus);
       const res = await fetch(`${API}/api/tutorial?${params}`, { headers: authHeaders() });
       if (!res.ok) return;
       const body = await res.json();
       const items: PastItem[] = Array.isArray(body) ? body : body.items || [];
-      setPast(items);
       setPastTotal(Array.isArray(body) ? items.length : body.total ?? items.length);
-      // Keep the list paged at 20, preserving the user's expansion across
-      // reloads (capped to the new result size) — previously this always
-      // reset to items.length, so "Show more" could never appear.
-      setPastShown((n) => Math.min(Math.max(n, 20), items.length));
+      setPast((prev) => {
+        if (!append) return items;
+        const seen = new Set(prev.map((p) => p.id));
+        return [...prev, ...items.filter((p) => !seen.has(p.id))];
+      });
     } catch { /* offline */ }
-  }, [pastQ, pastStatus]);
-  useEffect(() => { void loadPast(); }, [loadPast]);
+    finally { if (append) setPastLoadingMore(false); }
+  }, [pastQ, pastStatus, past.length]);
+  useEffect(() => { void loadPast(); }, [pastQ, pastStatus]);
 
   useEffect(() => () => {
     streamRef.current?.getTracks().forEach((t) => t.stop());
@@ -368,8 +370,12 @@ export default function TutorialMode({ onOpenReview, onOpenStudio, hideLibrary, 
       audioCtxRef.current?.close().catch(() => undefined);
       audioCtxRef.current = null; analyserRef.current = null;
       setRecorded((old) => { if (old) URL.revokeObjectURL(old.url); return { blob, url: URL.createObjectURL(blob) }; });
+      // Honest review: stop → preview first. Upload starts only when the
+      // user confirms "Upload & generate guide" — never automatically.
       setPhase("review");
-      uploadRef.current?.(blob);
+      setUploadFailed(false);
+      setUploadPct(null);
+      setStatus("Recording ready for review — preview it, then upload when satisfied.");
     };
     recRef.current = rec;
     startedRef.current = Date.now();
@@ -607,6 +613,7 @@ export default function TutorialMode({ onOpenReview, onOpenStudio, hideLibrary, 
                   <option value="">All statuses</option>
                   <option value="done">Done</option>
                   <option value="error">Error</option>
+                  <option value="processing">Processing (all active stages)</option>
                   <option value="uploaded">Uploaded</option>
                   <option value="transcribing">Transcribing</option>
                   <option value="understanding">Understanding</option>
@@ -615,7 +622,7 @@ export default function TutorialMode({ onOpenReview, onOpenStudio, hideLibrary, 
                   <option value="archived">Archived</option>
                 </select>
               </div>
-              {past.slice(0, pastShown).map((p) => (
+              {past.map((p) => (
                 <p key={p.id} className="list-row">
                   <strong>{p.title}</strong> <span className={`tag ${p.status === "done" ? "approved" : p.status === "error" ? "error" : ""}`}>{p.status}</span>{" "}
                   {p.objects_unresolved > 0 && <span className="tag warn">{p.objects_unresolved} need{(p.objects_unresolved === 1 ? "s" : "")} tap</span>}{" "}
@@ -623,7 +630,7 @@ export default function TutorialMode({ onOpenReview, onOpenStudio, hideLibrary, 
                   <span className="muted small-text">{p.created_at ? new Date(p.created_at).toLocaleDateString() : ""}</span>{" "}
                   <button className="btn small secondary" onClick={() => void openPast(p)}>Open</button></p>
               ))}
-              {pastShown < past.length && <button className="btn small secondary" onClick={() => setPastShown((n) => n + 20)}>Show more ({past.length - pastShown} remaining)</button>}
+              {past.length < pastTotal && <button className="btn small secondary" onClick={() => void loadPast({ append: true })} disabled={pastLoadingMore}>{pastLoadingMore ? "Loading…" : `Load more (${pastTotal - past.length} remaining)`}</button>}
             </div>
           )}
         </div>

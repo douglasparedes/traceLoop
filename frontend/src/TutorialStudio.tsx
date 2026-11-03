@@ -87,6 +87,9 @@ export default function TutorialStudio({ item, onBack, onOpenReview, notify }: {
       });
       if (!res.ok) throw new Error(`Tutorial unavailable (${res.status})`);
       setDetail(await res.json());
+      // Successful server refresh replaces the draft: any prior unsaved
+      // state is superseded, so the dirty flag returns to clean.
+      setDirty(false);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Tutorial unavailable");
     } finally {
@@ -105,7 +108,6 @@ export default function TutorialStudio({ item, onBack, onOpenReview, notify }: {
 
   function switchTab(t: TabId) {
     if (dirty && tab !== t && !window.confirm("You have unsaved changes in this tab. Switch anyway and lose them?")) return;
-    setDirty(false);
     setTab(t);
   }
 
@@ -147,8 +149,8 @@ export default function TutorialStudio({ item, onBack, onOpenReview, notify }: {
           <button key={t.id} role="tab" aria-selected={tab === t.id} className="studio-tab" onClick={() => switchTab(t.id)}>{t.label}</button>
         ))}
       </div>
-      {tab === "overview" && <OverviewEditor detail={detail} onSaved={(d) => { setDetail(d); setDirty(false); }} onDirty={() => setDirty(true)} notify={notify} onOpenReview={onOpenReview} />}
-      {tab === "content" && <ContentEditor detail={detail} onSaved={(d) => { setDetail({ ...detail, ...d }); setDirty(false); void load(); }} onDirty={() => setDirty(true)} notify={notify} />}
+      {tab === "overview" && <OverviewEditor detail={detail} onSaved={(d) => { setDetail(d); setDirty(false); }} onDirty={(d: boolean) => setDirty(d)} notify={notify} onOpenReview={onOpenReview} />}
+      {tab === "content" && <ContentEditor detail={detail} onSaved={(d) => { setDetail({ ...detail, ...d }); setDirty(false); void load(); }} onDirty={(d: boolean) => setDirty(d)} notify={notify} />}
       {tab === "guide" && <GuideEditor detail={detail} onChanged={() => void load()} onOpenReview={onOpenReview} notify={notify} />}
       {tab === "video" && <VideoStudio tutorialId={detail.id} token={item.access_token} title={detail.title}
         durationSec={detail.duration_sec} jobDone={detail.status === "done"}
@@ -169,7 +171,7 @@ export default function TutorialStudio({ item, onBack, onOpenReview, notify }: {
 function OverviewEditor({ detail, onSaved, onDirty, notify, onOpenReview }: {
   detail: TutDetail;
   onSaved: (d: TutDetail) => void;
-  onDirty: () => void;
+  onDirty: (dirty: boolean) => void;
   notify: (s: string, kind?: "ok" | "error" | "info") => void;
   onOpenReview: (versionId: string) => void;
 }) {
@@ -185,7 +187,7 @@ function OverviewEditor({ detail, onSaved, onDirty, notify, onOpenReview }: {
     const cur = JSON.stringify([title, equipment, task, notes]);
     const isDirty = cur !== pristine.current;
     setState((s) => (s === "saving" ? s : isDirty ? "dirty" : "clean"));
-    if (isDirty) onDirty();
+    onDirty(isDirty);
   }, [title, equipment, task, notes, onDirty]);
 
   async function save() {
@@ -290,7 +292,7 @@ const blankStep = (n: number): StudioStep => ({
 function ContentEditor({ detail, onSaved, onDirty, notify }: {
   detail: TutDetail;
   onSaved: (d: Partial<TutDetail>) => void;
-  onDirty: () => void;
+  onDirty: (dirty: boolean) => void;
   notify: (s: string, kind?: "ok" | "error" | "info") => void;
 }) {
   const token = detail.access_token;
@@ -335,9 +337,8 @@ function ContentEditor({ detail, onSaved, onDirty, notify }: {
 
   const isDirty = !!content && JSON.stringify([corrected, segments, steps, materials.split(",").map((m) => m.trim()).filter(Boolean)]) !==
     JSON.stringify([content.transcript_corrected, content.timed_segments, content.steps, content.materials]);
-  void baseline;
 
-  useEffect(() => { if (isDirty) onDirty(); }, [isDirty, onDirty]);
+  useEffect(() => { onDirty(!!isDirty); }, [isDirty, onDirty]);
 
   async function saveTranscript() {
     if (!content) return;

@@ -142,13 +142,12 @@ describe("guided execution primary action", () => {
     expect(track?.children[0].className).toMatch(/on-done/);
     expect(track?.children[1].className).not.toMatch(/on/);
     await user.click(screen.getByRole("button", { name: /Next step/ }));
-    // Final step offers Finish, not another Next.
-    await user.click(screen.getByRole("button", { name: /Next step/ }));
+    // Final pending step offers one-click Finish, not another Next.
     expect(await screen.findByRole("button", { name: /Finish job/ })).toBeInTheDocument();
     expect(screen.queryByRole("button", { name: /Next step/ })).not.toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: /Finish job/ }));
     expect(finalizeCalls).toBe(1);
-    await vi.waitFor(() => expect(document.body.textContent).toMatch(/Job finished/));
+    await vi.waitFor(() => expect(document.body.textContent).toMatch(/Job finished|Job completed/));
     // Server-confirmed finalization settles the local queue immediately:
     // no stuck finish event, no duplicate finish on next sync.
     const { idb } = (await import("./db")) as unknown as {
@@ -186,13 +185,17 @@ describe("guided execution primary action", () => {
     await user.click(await screen.findByRole("button", { name: /Report this step as blocked/ }));
     await user.type(await screen.findByLabelText(/Technician notes/), "Clip jammed");
     await user.click(await screen.findByRole("button", { name: /Log incident/ }));
-    // Frontier advanced past the halted step; the summary records the block.
+    // The job halts at the blocked step: no Next, resolve action shown.
+    expect(await screen.findByRole("button", { name: /Resolve.*resume step 1/i })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Next step/ })).not.toBeInTheDocument();
     expect(await screen.findByText(/1 blocked/)).toBeInTheDocument();
     // Previous navigates back without undoing: the recorded state shows.
     await user.click(await screen.findByRole("button", { name: /Previous/ }));
     expect(await screen.findByText((_, el) => el?.textContent === "Step 1: blocked")).toBeInTheDocument();
     // Resume returns the step to the workable set with history preserved.
-    await user.click(await screen.findByRole("button", { name: /resume step/i }));
+    // Return to the frontier first (blocked step is the current work).
+    const resumeBtns = await screen.findAllByRole("button", { name: /resume step/i });
+    await user.click(resumeBtns[resumeBtns.length - 1]);
     expect(await screen.findByRole("button", { name: /Next step/ })).toBeInTheDocument();
   });
 
@@ -224,13 +227,13 @@ describe("guided execution primary action", () => {
     await user.click(await screen.findByRole("button", { name: /Resume step 1/ }));
     await user.click(await screen.findByRole("button", { name: /Next step/ }));
     await user.click(await screen.findByRole("button", { name: /Next step/ }));
-    await user.click(await screen.findByRole("button", { name: /Next step/ }));
+    // One-click final step: Next x2 then Finish (final step completes + closes).
     await user.click(await screen.findByRole("button", { name: /Finish job/ }));
     await vi.waitFor(() => expect(finalizeCalls).toBe(1));
     // All three step completions reached the server before the finalize call.
     const completed = postedEvents.filter((e) => e.event_type === "step_completed");
     expect(completed.map((e) => e.step_id).sort()).toEqual(["s1", "s2", "s3"]);
-    expect(await screen.findByText(/Job finished/)).toBeInTheDocument();
+    await vi.waitFor(() => expect(document.body.textContent).toMatch(/Job (finished|completed)/));
   });
 
   it("explains and navigates when the server still lacks outcomes", async () => {
@@ -240,7 +243,6 @@ describe("guided execution primary action", () => {
     const user = userEvent.setup();
     render(<App />);
     await user.click(await screen.findByRole("button", { name: /Resume step 1/ }));
-    await user.click(await screen.findByRole("button", { name: /Next step/ }));
     await user.click(await screen.findByRole("button", { name: /Next step/ }));
     await user.click(await screen.findByRole("button", { name: /Next step/ }));
     await user.click(await screen.findByRole("button", { name: /Finish job/ }));

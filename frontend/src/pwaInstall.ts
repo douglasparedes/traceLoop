@@ -59,7 +59,7 @@ export interface AssetLinksStatus {
  * address bar — exactly the reported symptom. */
 export async function checkAssetLinks(): Promise<AssetLinksStatus> {
   try {
-    const r = await fetch(".well-known/assetlinks.json", { headers: { Accept: "application/json" } });
+    const r = await fetch("/.well-known/assetlinks.json", { headers: { Accept: "application/json" } });
     if (!r.ok) {
       return { state: "missing", detail: `Not served (HTTP ${r.status}) — TWA installs will show the address bar.` };
     }

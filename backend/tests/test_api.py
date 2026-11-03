@@ -89,6 +89,7 @@ def test_job_evidence_attach_and_list():
     procs = c.get("/api/procedures").json()
     assert "asset_type" in procs[0]
     p = [x for x in procs if x["approved_version_id"]][0]
+    ver = c.get(f"/api/procedure-versions/{p['approved_version_id']}").json()
     job = c.post("/api/jobs", json={"procedure_id": p["id"], "procedure_version_id": p["approved_version_id"]}, headers=TECH).json()
     assert c.get(f"/api/jobs/{job['id']}/evidence").json() == {"job_id": job["id"], "evidence": []}
     assert c.get(f"/api/jobs/{job['id']}").json()["evidence"] == []
@@ -105,9 +106,21 @@ def test_job_evidence_attach_and_list():
     assert img.status_code == 200 and img.headers["content-type"] == "image/png"
     detail = c.get(f"/api/jobs/{job['id']}").json()
     assert len(detail["evidence"]) == 1
-    c.post(f"/api/jobs/{job['id']}/finish", json={"outcome": "completed", "reason": "", "summary": ""}, headers=TECH)
+    # Complete every step then finalize via the canonical path so the
+    # finished job exists; outstanding evidence must reconcile afterwards.
+    for s in ver["steps"]:
+        c.post("/api/sync/events", json={"events": [{
+            "event_id": f"evt:{job['id']}:{s['id']}:complete",
+            "session_id": job["id"], "step_id": s["id"],
+            "event_type": "step_completed", "payload": {},
+            "occurred_at": "2026-01-01T00:00:00Z"}]}, headers=TECH)
+    last = ver["steps"][-1]
+    fin = c.post(f"/api/jobs/{job['id']}/finalize",
+                 json={"step_id": last["id"], "event_id": f"evt:{job['id']}:{last['id']}:complete", "reason": ""},
+                 headers=TECH)
+    assert fin.status_code == 200, fin.text
     late = c.post(f"/api/jobs/{job['id']}/evidence", files={"file": ("b.png", png, "image/png")}, headers=TECH)
-    assert late.status_code == 409
+    assert late.status_code == 200 and late.json().get("reconciled_after_finish") is True
 
 
 def test_approval_requires_reviewer_and_approved_immutable():
@@ -156,6 +169,16 @@ def test_job_procedure_mismatch_and_finish_idempotent():
     bad = c.post("/api/jobs", json={"procedure_id": "not-the-procedure", "procedure_version_id": p["approved_version_id"]}, headers=TECH)
     assert bad.status_code == 409
     job = c.post("/api/jobs", json={"procedure_id": p["id"], "procedure_version_id": p["approved_version_id"]}, headers=TECH).json()
+    ver = c.get(f"/api/procedure-versions/{p['approved_version_id']}").json()
+    # Legacy /finish enforces the same coverage rules as /finalize:
+    # an empty job cannot finish.
+    assert c.post(f"/api/jobs/{job['id']}/finish", json={"outcome": "completed"}, headers=TECH).status_code == 422
+    for s in ver["steps"]:
+        c.post("/api/sync/events", json={"events": [{
+            "event_id": f"evt:{job['id']}:{s['id']}:complete",
+            "session_id": job["id"], "step_id": s["id"],
+            "event_type": "step_completed", "payload": {},
+            "occurred_at": "2026-01-01T00:00:00Z"}]}, headers=TECH)
     assert c.post(f"/api/jobs/{job['id']}/finish", json={"outcome": "completed"}, headers=TECH).json()["ok"] is True
     again = c.post(f"/api/jobs/{job['id']}/finish", json={"outcome": "completed"}, headers=TECH).json()
     assert again.get("already_finished") is True
