@@ -86,7 +86,7 @@ None. All persistence changes reuse existing columns/JSON extras (`reconciled_af
 
 ## 11. Remaining known issues
 
-1. `goalkings.jks` history still contains the key (committed in `6d79d92`); removal from the working index + `.gitignore` is done, but **history rewrite + rotation need explicit owner approval**. Magic bytes `30 82 0a ba` indicate a DER/PKCS#12 container — treat as signing material.
+1. ~~`goalkings.jks` history still contains the key (committed in `6d79d92`); removal from the working index + `.gitignore` is done, but **history rewrite + rotation need explicit owner approval**.~~ **RESOLVED 2026-11-03 (owner-approved):** history purged and force-pushed — see §15. **Key rotation is still an owner action** (Play Console upload-key reset + `assetlinks.json` fingerprint update) and is REQUIRED because the repo is public. Magic bytes `30 82 0a ba` indicate a DER/PKCS#12 container — treat as signing material.
 2. Real-browser and production-deployment verification not performed here; covered by the new CI `smoke` job on next push.
 3. Tutorial→procedure E2E (Scenario D) remains a documented manual demo (real recording + minutes of AI); CI covers pipeline stages with mocks + fixture media.
 4. A full-suite frontend run under heavy parallel load showed 2× 5s-timeout flakes once; clean re-run passed 121/121.
@@ -111,6 +111,19 @@ None. All persistence changes reuse existing columns/JSON extras (`reconciled_af
 ## 14. Hackathon readiness
 
 Real Meta paths (Voice/Spark/SAM/Image) are key-gated with provenance labels; deterministic fallbacks are explicitly marked. The judge demo path (capture → AI guide → review → procedures → workbench → completed job → feedback) is fully clickable with one real-data run.
+
+## 15. Signing-key purge record (owner-approved 2026-11-03)
+
+- **Finding:** `goalkings.jks` (2750 bytes, DER/PKCS#12 container) committed in `6d79d92`, reachable only from `guide-formats-muse-image`. **The repository is PUBLIC** (`github.com/douglasparedes/traceLoop`), so the key must be treated as exposed since first push — rotation is mandatory, not precautionary. No other key material ever committed (history-wide `*.(jks|keystore|pem|key|p12|pfx|p8)` scan: only this file).
+- **Safety:** full `git bundle --all` backup taken before the rewrite (kept outside the repo).
+- **Method:** `git-filter-repo --path goalkings.jks --invert-paths` (2 commits touched: add `6d79d92`, index-removal `3b17b72`). `main` and `stitch-integration` never contained the file — untouched; only `guide-formats-muse-image` rewritten (`e33efb7` → `1f7ec1f`) and force-pushed (`force-with-lease` on fresh fetch).
+- **Verified:** `git rev-list --all --objects | grep jks` empty; `git log --all -- goalkings.jks` empty; `git ls-tree origin/guide-formats-muse-image -- goalkings.jks` empty; GitHub blob URL returns 404. Worktree copy preserved on owner disk, covered by `*.jks` in `.gitignore`.
+- **Residual risk (honest):** GitHub may retain the unreferenced blob in caches until GC; anyone who cloned while it was live keeps a copy. Hence rotation below cannot be skipped.
+- **Owner rotation checklist (not done here — requires Play Console access):**
+  1. Play Console → app → Setup → App signing → request **upload key reset**; generate the new keystore offline and store it OUTSIDE version control.
+  2. Update `assetlinks.json` SHA-256 fingerprints to the new signing cert (the backend test skips while the placeholder is present — it will enforce the real fingerprint once pasted).
+  3. Rebuild/sign the APK/AAB, verify TWA serves without address bar.
+  4. Optional: ask GitHub Support to purge the cached blob for the repo.
 
 ## Summary table
 
