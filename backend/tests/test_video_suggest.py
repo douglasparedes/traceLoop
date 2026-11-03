@@ -144,6 +144,8 @@ def test_build_video_props_timing_contract():
     class _Job:
         id = "timing-job"
         title = "Timing"
+        timed_segments = []
+        guide_format = ""
 
     props = ai.plan_video_scenes("Timing", job_scenes, [], [])  # planner shape check
     assert props["scenes"]
