@@ -68,4 +68,25 @@ describe("rewritePropsForRender", () => {
     assert.equal(out.voiceover, null);
     assert.deepEqual(out.scenes, []);
   });
+
+  it("rewrites nested beat images and keeps legacy scenes rendering", () => {
+    const out = rewritePropsForRender(
+      {
+        title: "t",
+        voiceover: null,
+        scenes: [{
+          step: 1,
+          image: "/data/v/hero.png",
+          beats: [
+            { kind: "hero", image: "/data/v/hero.png", startFrame: 45, durationFrames: 30 },
+            { kind: "detail", image: null, startFrame: 75, durationFrames: 30 },
+          ],
+        }],
+      },
+      publish
+    );
+    assert.match(out.scenes[0].image, /step-0\.png$/);
+    assert.match(out.scenes[0].beats[0].image, /step-0-beat-0\.png$/);
+    assert.equal(out.scenes[0].beats[1].image, null);
+  });
 });

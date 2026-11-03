@@ -93,10 +93,19 @@ export function rewritePropsForRender(props, publish) {
     out.voiceover = publish(props.voiceover, `voiceover${path.extname(props.voiceover) || ".wav"}`);
   }
   out.scenes = (props.scenes || []).map((s, i) => {
-    if (typeof s.image === "string" && s.image && !/^(https?:|data:)/.test(s.image)) {
-      return { ...s, image: publish(s.image, `step-${i}${path.extname(s.image) || ".png"}`) };
+    const scene = { ...s };
+    if (typeof scene.image === "string" && scene.image && !/^(https?:|data:)/.test(scene.image)) {
+      scene.image = publish(scene.image, `step-${i}${path.extname(scene.image) || ".png"}`);
     }
-    return s;
+    if (Array.isArray(scene.beats)) {
+      scene.beats = scene.beats.map((b, j) => {
+        if (typeof b.image === "string" && b.image && !/^(https?:|data:)/.test(b.image)) {
+          return { ...b, image: publish(b.image, `step-${i}-beat-${j}${path.extname(b.image) || ".png"}`) };
+        }
+        return b;
+      });
+    }
+    return scene;
   });
   return out;
 }

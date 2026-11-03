@@ -10,7 +10,7 @@
 // prior MP4s are never overwritten.
 import { useCallback, useEffect, useState } from "react";
 import type { StudioVideoVersion } from "./studioApi";
-import { fetchVideoLimits, fetchVideoVersions, startVideoGuide, videoVersionFileUrl } from "./studioApi";
+import { downloadVideoVersion, fetchVideoLimits, fetchVideoVersions, startVideoGuide, videoVersionFileUrl } from "./studioApi";
 import { fetchVisuals } from "./guideFormats";
 
 const STATUS_LABEL: Record<string, string> = {
@@ -55,6 +55,26 @@ export default function VideoStudio({ tutorialId, token, title, durationSec, job
   const [error, setError] = useState("");
   const [note, setNote] = useState("");
   const [busy, setBusy] = useState(false);
+  const [mediaError, setMediaError] = useState("");
+  const [downloadingId, setDownloadingId] = useState<string | null>(null);
+
+  function versionFilename(v: StudioVideoVersion): string {
+    return `${(title || "tutorial-guide").replace(/[^\w\- ]+/g, "").trim() || "tutorial-guide"}-v${v.version_number || ""}.mp4`;
+  }
+
+  async function download(v: StudioVideoVersion) {
+    if (downloadingId) return;
+    setDownloadingId(v.id);
+    setError("");
+    try {
+      await downloadVideoVersion(tutorialId, v.id, token, versionFilename(v));
+      setNote(`Version ${v.version_number || ""} downloaded.`);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Download failed.");
+    } finally {
+      setDownloadingId(null);
+    }
+  }
 
   const load = useCallback(async (selectLatest = false) => {
     setError("");
@@ -192,11 +212,11 @@ export default function VideoStudio({ tutorialId, token, title, durationSec, job
                   <span className="muted small-text"> · {new Date(v.created_at).toLocaleString()} · {(v.scenes || []).length} scenes · {voiceLabel(v)}</span>
                 </div>
                 <span className="row">
-                  <button className="btn small secondary" aria-pressed={selectedId === v.id} onClick={() => setSelectedId(v.id)}>Preview</button>
+                  <button className="btn small secondary" aria-pressed={selectedId === v.id} onClick={() => { setSelectedId(v.id); setMediaError(""); }}>Preview</button>
                   {v.status === "ready" && (
-                    <a className="btn small secondary"
-                      href={videoVersionFileUrl(tutorialId, v.id, token)}
-                      download={`${(title || "tutorial-guide").replace(/[^\w\- ]+/g, "").trim() || "tutorial-guide"}-v${v.version_number || ""}.mp4`}>Download</a>
+                    <button className="btn small secondary" disabled={downloadingId === v.id} onClick={() => void download(v)}>
+                      {downloadingId === v.id ? "Downloading…" : "Download"}
+                    </button>
                   )}
                 </span>
               </div>
@@ -210,7 +230,10 @@ export default function VideoStudio({ tutorialId, token, title, durationSec, job
           ))}
           {selected?.status === "ready" && (
             <div style={{ marginTop: 10 }}>
-              <video key={selected.id} className="live-video" src={videoVersionFileUrl(tutorialId, selected.id, token)} controls playsInline preload="metadata" aria-label={`Video guide version ${selected.version_number}`} />
+              <video key={selected.id} className="live-video" src={videoVersionFileUrl(tutorialId, selected.id, token)} controls playsInline preload="metadata" aria-label={`Video guide version ${selected.version_number}`}
+                onError={() => setMediaError("Preview failed to load this version (the file may be missing or the session expired). Download validates the file before saving — try it to diagnose.")}
+                onPlay={() => setMediaError("")} />
+              {mediaError && <p className="notice error" role="alert" style={{ marginTop: 6 }}>{mediaError}</p>}
               <p className="muted small-text" style={{ marginTop: 6 }}>
                 {(selected.scenes || []).length} scenes · {voiceLabel(selected)} ·{" "}
                 {selected.simulated ? "deterministic fallback plan" : "Muse Spark plan"} · reproducible from the saved composition.
