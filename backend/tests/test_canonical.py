@@ -78,7 +78,7 @@ def test_simulated_pipeline_end_to_end_no_key(tmp_path):
     seen = {}
     for fmt, marker in (("work_instruction", "## What you need"),
                         ("reference_manual", "## Numbered procedure"),
-                        ("interactive", "Step 1 of")):
+                        ("interactive", "### 1.")):
         r = c.post(f"/api/tutorial/{done['id']}/guide", json={"format": fmt}, headers=hdr).json()
         assert r["format"] == fmt and r["format_source"] == "user", r
         snap = c.get(f"/api/tutorial/{done['id']}/snapshots/{r['snapshot_id']}", headers=hdr).json()
@@ -285,7 +285,14 @@ def test_fallback_formats_distinct_and_honest():
     assert len({wi, rm, ix}) == 3
     assert "## What you need" in wi and "## Scope" not in wi
     assert "## Scope" in rm and "## Numbered procedure" in rm
-    assert "Step 1 of 2" in ix and "Blocked? Record the issue" in ix
+    assert "Step 1 of 2" not in ix and "Blocked? Record the issue" in ix
+    # Canonical step headings (injectable by inject_illustrations) in all formats.
+    import re as _re
+    for md, fmt in ((wi, "work_instruction"), (rm, "reference_manual"), (ix, "interactive")):
+        headings = [l for l in md.splitlines() if l.startswith("###")]
+        assert len(headings) == 2, (fmt, headings)
+        for h in headings:
+            assert _re.match(r"^###\s+\d+\.\s+\S.*\(\d+s", h), (fmt, h)
     for md in (wi, rm, ix):
         assert "Isolate power" in md and "Remove panel" in md
         for banned in ("torque", "N·m", "voltage", "VAC", "warranty approved"):
