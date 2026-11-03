@@ -62,6 +62,8 @@ const activeJob = (states: Record<string, "done" | "skipped" | "blocked"> = {}):
 
 let finalizeCalls = 0;
 let postedEvents: { event_id: string; event_type: string; step_id: string | null }[] = [];
+const serverDoneSteps = new Set<string>();
+let failNextSync = false;
 
 function mockApi(state: "pending" | "finished" = "pending") {
   return vi.spyOn(globalThis, "fetch").mockImplementation((async (url: unknown, init?: RequestInit) => {
@@ -74,12 +76,15 @@ function mockApi(state: "pending" | "finished" = "pending") {
     else if (u.includes("/api/procedure-versions/v1/offline-grant")) body = { offline_grant: "g" };
     else if (u.includes("/api/procedure-versions/v1")) body = version();
     else if (u.includes("/api/jobs/job-1/state")) {
+      const isDone = (n: number) => serverDoneSteps.has(`s${n}`);
+      const missing = [1, 2, 3].filter((n) => !isDone(n));
       body = {
         job_id: "job-1", status: state === "finished" ? "finished" : "active", outcome: null,
-        procedure_version_id: "v1", current: null, counts: { total: 3, completed: 0, skipped: 0, blocked: 0 },
-        missing_step_orders: [1, 2, 3], events: 0, last_activity: null, finished: state === "finished",
+        procedure_version_id: "v1", current: null,
+        counts: { total: 3, completed: [1, 2, 3].filter(isDone).length, skipped: 0, blocked: 0 },
+        missing_step_orders: missing, events: 0, last_activity: null, finished: state === "finished",
         ended_at: null,
-        steps: [1, 2, 3].map((n) => ({ step_id: `s${n}`, step_order: n, title: `Step ${n}`, state: "pending" })),
+        steps: [1, 2, 3].map((n) => ({ step_id: `s${n}`, step_order: n, title: `Step ${n}`, state: isDone(n) ? "done" : "pending" })),
       };
     } else if (u.includes("/api/jobs/job-1/evidence")) body = { evidence: [] };
     else if (u.includes("/api/jobs/job-1/finalize") && method === "POST") {
@@ -87,8 +92,16 @@ function mockApi(state: "pending" | "finished" = "pending") {
       body = { ok: true, outcome: "completed" };
     } else if (u.includes("/api/sync/events")) {
       const payload = JSON.parse(String(init?.body || '{"events":[]}')) as { events: typeof postedEvents };
-      postedEvents.push(...payload.events);
-      body = { acknowledged: payload.events.map((e) => e.event_id), duplicates: [], failed: [] };
+      if (failNextSync) {
+        failNextSync = false;
+        body = { acknowledged: [], duplicates: [], failed: payload.events.map((e) => ({ event_id: e.event_id, error: "simulated sync rejection" })) };
+      } else {
+        postedEvents.push(...payload.events);
+        for (const e of payload.events) {
+          if (e.event_type === "step_completed" && e.step_id) serverDoneSteps.add(e.step_id);
+        }
+        body = { acknowledged: payload.events.map((e) => e.event_id), duplicates: [], failed: [] };
+      }
     }
     return { ok: true, status: 200, json: async () => body };
   }) as unknown as typeof fetch);
@@ -106,6 +119,8 @@ beforeEach(async () => {
   vi.restoreAllMocks();
   finalizeCalls = 0;
   postedEvents = [];
+  serverDoneSteps.clear();
+  failNextSync = false;
   const { __stores } = (await import("./db")) as unknown as { __stores: Map<string, Map<string, unknown>> };
   __stores.clear();
   try { localStorage.clear(); } catch { /* noop */ }
@@ -199,5 +214,41 @@ describe("guided execution primary action", () => {
     render(<App />);
     await user.click(await screen.findByRole("button", { name: /Resume step 3/ }));
     expect(await screen.findByRole("button", { name: /Finish job/ })).toBeInTheDocument();
+  });
+
+  it("syncs recorded steps before finalizing, in dependency order", async () => {
+    mockApi();
+    await seed();
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: /Resume step 1/ }));
+    await user.click(await screen.findByRole("button", { name: /Next step/ }));
+    await user.click(await screen.findByRole("button", { name: /Next step/ }));
+    await user.click(await screen.findByRole("button", { name: /Next step/ }));
+    await user.click(await screen.findByRole("button", { name: /Finish job/ }));
+    await vi.waitFor(() => expect(finalizeCalls).toBe(1));
+    // All three step completions reached the server before the finalize call.
+    const completed = postedEvents.filter((e) => e.event_type === "step_completed");
+    expect(completed.map((e) => e.step_id).sort()).toEqual(["s1", "s2", "s3"]);
+    expect(await screen.findByText(/Job finished/)).toBeInTheDocument();
+  });
+
+  it("explains and navigates when the server still lacks outcomes", async () => {
+    mockApi();
+    failNextSync = true;
+    await seed();
+    const user = userEvent.setup();
+    render(<App />);
+    await user.click(await screen.findByRole("button", { name: /Resume step 1/ }));
+    await user.click(await screen.findByRole("button", { name: /Next step/ }));
+    await user.click(await screen.findByRole("button", { name: /Next step/ }));
+    await user.click(await screen.findByRole("button", { name: /Next step/ }));
+    await user.click(await screen.findByRole("button", { name: /Finish job/ }));
+    // No blind finalize: a notice names the missing steps with a jump action.
+    // (The same text also appears in the toast; the inline notice is actionable.)
+    await screen.findByRole("button", { name: /Go to step 1/ });
+    expect(finalizeCalls).toBe(0);
+    await user.click(screen.getByRole("button", { name: /Go to step 1/ }));
+    expect(await screen.findByText("Step 1 of 3")).toBeInTheDocument();
   });
 });
