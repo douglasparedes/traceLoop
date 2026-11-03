@@ -141,6 +141,9 @@ export interface UploadedTutorialJob {
   progress: number;
   error?: string;
   access_token: string;
+  /** True when the server returned a previously finished tutorial for
+   *  byte-identical content instead of creating a new job. */
+  cached?: boolean;
   [k: string]: unknown;
 }
 
@@ -340,6 +343,7 @@ export async function runQueuedUpload(
   entry: QueuedTutorialUpload,
   onProgress?: (pct: number) => void,
   signal?: { cancelled: boolean },
+  opts?: { forceNew?: boolean },
 ): Promise<UploadedTutorialJob> {
   const blob = await idb.get<Blob>("media", entry.key);
   if (!blob) throw new Error("Queued file bytes are missing from this device. Re-select the file to upload it.");
@@ -407,7 +411,9 @@ export async function runQueuedUpload(
       confirmed = st.received_bytes;
     }
     // 3) Complete: server verifies size + hash, persists, creates the job.
-    const job = await apiJson<UploadedTutorialJob>(`/api/tutorial/uploads/${uploadId}/complete`, { method: "POST" });
+    // forceNew bypasses the identical-bytes cache and always creates a job.
+    const completePath = `/api/tutorial/uploads/${uploadId}/complete${opts?.forceNew ? "?force_new=1" : ""}`;
+    const job = await apiJson<UploadedTutorialJob>(completePath, { method: "POST" });
     await removeQueuedUpload(entry.key);
     return job;
   } catch (e) {
