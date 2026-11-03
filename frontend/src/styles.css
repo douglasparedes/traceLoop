@@ -224,11 +224,17 @@ label.btn:focus-within { outline: 3px solid var(--accent); outline-offset: 2px; 
 .proc-actions { display: flex; gap: 8px; padding-top: 4px; }
 .proc-actions .btn { flex: 1; min-height: 52px; }
 
-/* Segmented step progress (guided job). */
+/* Segmented step progress (guided job). Recorded states only. */
 .seg-progress { display: grid; gap: 6px; }
 .seg-progress-track { display: flex; gap: 6px; }
 .seg-progress-track span { height: 8px; flex: 1; border-radius: 999px; background: var(--surface-highest); }
 .seg-progress-track span.on { background: var(--primary-container); }
+.seg-progress-track span.on-skip { background: var(--warn); }
+.seg-progress-track span.on-block { background: var(--danger); }
+.seg-legend { display: inline-block; width: 10px; height: 10px; border-radius: 999px; background: var(--surface-highest); vertical-align: baseline; }
+.seg-legend.on-done { background: var(--primary-container); }
+.seg-legend.on-skip { background: var(--warn); }
+.seg-legend.on-block { background: var(--danger); }
 
 /* Panels. */
 .panel { background: var(--surface-2); border-radius: var(--radius); padding: 12px; }

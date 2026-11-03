@@ -61,6 +61,46 @@ function nowIso(): string {
   return new Date().toISOString();
 }
 
+export interface PendingCounts {
+  regs: number;
+  photos: number;
+  events: number;
+  finishes: number;
+  total: number;
+}
+
+/** Unified pending-work counts across every durable queue: registrations,
+ *  photo uploads, events, and finishes. Workbench/Activity status must use
+ *  this — never the events queue alone — or offline work is misreported
+ *  as "synced".
+ */
+export async function pendingCounts(): Promise<PendingCounts> {
+  const [regs, photos, evs, finishes] = await Promise.all([
+    loadPending<PendingReg>("pending-regs"),
+    loadPending<PendingPhoto>("pending-photos"),
+    idb.all<JobEventRec>("events"),
+    loadPending<PendingFinish>("pending-finishes"),
+  ]);
+  const events = evs.filter((e) => e.sync_status === "pending").length;
+  const total = regs.length + photos.length + events + finishes.length;
+  return { regs: regs.length, photos: photos.length, events, finishes: finishes.length, total };
+}
+
+/** Pending items for one job session (for per-job sync pills). */
+export async function pendingForJob(jobId: string): Promise<{ registrations: number; events: number; photos: number; finishes: number; total: number }> {
+  const [regs, photos, evs, finishes] = await Promise.all([
+    loadPending<PendingReg>("pending-regs"),
+    loadPending<PendingPhoto>("pending-photos"),
+    idb.all<JobEventRec>("events"),
+    loadPending<PendingFinish>("pending-finishes"),
+  ]);
+  const events = evs.filter((e) => e.sync_status === "pending" && e.session_id === jobId).length;
+  const ph = photos.filter((p) => p.job_id === jobId).length;
+  const fin = finishes.filter((f) => f.job_id === jobId).length;
+  const reg = regs.filter((r) => r.job_id === jobId).length;
+  return { registrations: reg, events, photos: ph, finishes: fin, total: reg + events + ph + fin };
+}
+
 export function isNetworkError(e: unknown): boolean {
   if (e instanceof TypeError) return true;
   const m = e instanceof Error ? e.message : String(e);
