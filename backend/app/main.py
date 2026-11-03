@@ -212,7 +212,7 @@ import re as _re_gate
 # mismatch). The evidence image URL is an unguessable UUID, as it was before
 # the team gate existed.
 MEDIA_GATE_EXEMPT_RE = _re_gate.compile(
-    r"^/api/(tutorial/[^/]+/(video|video-guide/file|bundle\.zip|illustrations/[^/]+|diagnostics/frame/[^/]+|keyframes/[^/]+)"
+    r"^/api/(tutorial/[^/]+/(video|video-guide/file|video-guides/[^/]+/file|bundle\.zip|illustrations/[^/]+|diagnostics/frame/[^/]+|keyframes/[^/]+)"
     r"|visuals/[^/]+/file"
     r"|live-recordings/[^/]+/chunks/[^/]+/video"
     r"|evidence/[^/]+/image)$")
@@ -1861,8 +1861,15 @@ def tutorial_video_guide_history(jid: str, x_tutorial_token: str = Header(defaul
 
 
 @app.get("/api/tutorial/{jid}/video-guides/{vgid}/file")
-def tutorial_video_guide_version_file(jid: str, vgid: str, token: str = "", db: Session = Depends(get_db)):
-    """Serve one specific rendered MP4 version (token-gated, like other media)."""
+def tutorial_video_guide_version_file(jid: str, vgid: str, token: str = "", download: int = 0, db: Session = Depends(get_db)):
+    """Serve one specific rendered MP4 version (tutorial-token gated).
+
+    Preview (default) streams `inline` for <video> playback with range
+    support; `?download=1` forces an `attachment` with a meaningful
+    filename. Status codes are explicit: 403 bad tutorial token, 404
+    unrelated/missing version or missing file, 409 render unfinished —
+    never a JSON error masquerading as video bytes.
+    """
     from fastapi.responses import FileResponse
     job = _get_tutorial(db, jid, token)
     vg = db.get(M.VideoGuide, vgid)
@@ -1872,9 +1879,18 @@ def tutorial_video_guide_version_file(jid: str, vgid: str, token: str = "", db: 
         raise HTTPException(409, "That video version is not finished rendering yet")
     path = _key_file(vg.storage_key or "")
     if path is None:
-        raise HTTPException(404, "Video guide file missing")
-    return FileResponse(path, media_type="video/mp4",
-                        filename=f"{(job.title or 'tutorial-guide').strip() or 'tutorial-guide'}-v{getattr(vg, 'version_number', 0) or 0}.mp4")
+        ver = getattr(vg, "version_number", 0) or 0
+        raise HTTPException(
+            404,
+            f"Video file missing for version {ver} (record {vg.id[:8]}). "
+            "The render finished but the MP4 is not on this volume — "
+            "check MEDIA_ROOT persistence, then regenerate.")
+    fname = f"{(job.title or 'tutorial-guide').strip() or 'tutorial-guide'}-v{getattr(vg, 'version_number', 0) or 0}.mp4"
+    if int(download or 0):
+        return FileResponse(path, media_type="video/mp4", filename=fname,
+                            content_disposition_type="attachment")
+    return FileResponse(path, media_type="video/mp4", filename=fname,
+                        content_disposition_type="inline")
 
 
 @app.put("/api/tutorial/{jid}/video-guide/scenes")

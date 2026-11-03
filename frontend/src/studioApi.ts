@@ -183,3 +183,36 @@ export async function startVideoGuide(tutorialId: string, token: string, regener
 export function videoVersionFileUrl(tutorialId: string, versionId: string, token: string): string {
   return `${API}/api/tutorial/${tutorialId}/video-guides/${versionId}/file?token=${encodeURIComponent(token)}`;
 }
+
+/** Validated MP4 download: fetches the exact version, refuses to save an
+ *  error page as a video, then triggers a real file download.
+ *
+ *  A 401/403/404 JSON body must never become `tutorial-guide-v3.mp4` on
+ *  the user's disk — the response is checked before anything is saved.
+ */
+export async function downloadVideoVersion(tutorialId: string, versionId: string, token: string, filename: string): Promise<void> {
+  const res = await fetch(`${videoVersionFileUrl(tutorialId, versionId, token)}&download=1`);
+  const ct = res.headers.get("content-type") || "";
+  if (!res.ok || !ct.includes("video/mp4")) {
+    let detail = `HTTP ${res.status}`;
+    try {
+      const body = await res.json();
+      detail = (body as { detail?: string; message?: string }).detail
+        || (body as { message?: string }).message || detail;
+    } catch { /* error page was not JSON — keep the status */ }
+    throw new Error(`Download failed (${detail}). The video file was not served — check the connection and retry.`);
+  }
+  const blob = await res.blob();
+  if (!blob.size) throw new Error("Download failed: the server returned an empty file.");
+  const href = URL.createObjectURL(blob);
+  try {
+    const a = document.createElement("a");
+    a.href = href;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  } finally {
+    setTimeout(() => URL.revokeObjectURL(href), 5000);
+  }
+}
