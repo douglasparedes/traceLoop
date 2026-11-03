@@ -276,12 +276,21 @@ def inject_illustrations(md: str, steps: list[dict], objects: list[dict],
     md = re.sub(r"[ \t]+\n", "\n", md)
     md = re.sub(r"\n{3,}", "\n\n", md).strip() + "\n"
     step_files: dict[int, list[tuple[dict, list[str]]]] = {}
+    # Step headings come in several shapes (live model output, offline
+    # fallbacks, user edits). Anything unrecognized keeps its text;
+    # matching is never guessed.
     for o in objects or []:
         files = [f for f in [o.get("overlay"), o.get("illustration")] if f]
         if not files:
             continue
+        # Ambiguous-identity visuals (multi-match, close margin) stay
+        # reviewable in Visuals but are NOT auto-published as step evidence:
+        # the PNG may show the wrong look-alike pile. Tap-correcting the
+        # object re-runs injection with the confirmed visual.
+        if o.get("status") != "ok" and o.get("ambiguous_match"):
+            continue
         for s in steps or []:
-            if o.get("obj_id") in (s.get("objects_used") or []):
+            if str(o.get("obj_id")) in {str(x) for x in (s.get("objects_used") or [])}:
                 step_files.setdefault(int(s.get("step_number", 0)), []).append((o, files))
     extra = extra_visuals or {}
     if not step_files and not extra:
@@ -311,7 +320,9 @@ def inject_illustrations(md: str, steps: list[dict], objects: list[dict],
         cur = None
 
     for line in (md.strip() + "\n").split("\n"):
-        m_step = re.match(r"^###\s+(\d+)[\.\)]", line)
+        # Step headings come in several shapes: "### 1. Title",
+        # "### 1) Title", "### Step 1: Title", "### Step 1 of 4: Title".
+        m_step = re.match(r"^###\s+(?:Step\s+)?(\d+)(?:\s+of\s+\d+)?[\.\)\:]", line, re.I)
         if m_step:
             flush()
             cur = int(m_step.group(1))
@@ -374,11 +385,14 @@ def _segment_object(job_dir: Path, source: Path, tracking: Path, file_id: str, o
         out["track"] = [{"frame": f.get("frame", 0), "objects": [
             {"object_id": o.get("object_id"), "bbox_norm": o.get("bbox_norm"), "confidence": o.get("confidence")}
             for o in (f.get("objects") or [])]} for f in result.get("frames", [])]
+    out["ambiguous_match"] = False
     if not best:
         # One bounded hi-res retry before giving up: small objects are the
         # most common miss at 512px tracking resolution. Earlier attempts are
         # kept so the timeline shows the full trail.
-        hired = _hirez_retry(job_dir, source, obj, prompt_used, prior_attempts=tried)
+        hired, hired_attempt = _hirez_retry(job_dir, source, obj, prompt_used, prior_attempts=tried)
+        tried.append(hired_attempt)
+        out["attempts"] = tried
         if hired is not None:
             return hired
         out.update({"status": "needs_tap", "confidence": None,
@@ -393,6 +407,7 @@ def _segment_object(job_dir: Path, source: Path, tracking: Path, file_id: str, o
     ill = make_illustrations(job_dir, source, obj, best)
     out.update(ill)
     ambiguous = distinct > 1 and (conf is None or margin < CLOSE_MARGIN)
+    out["ambiguous_match"] = bool(ambiguous)
     if conf is not None and conf < REVIEW_CONF:
         out["status"] = "needs_tap"
         out["note"] = f"Very low SAM confidence ({conf:.0%}) — tap the object in the guide to correct it."
@@ -425,21 +440,24 @@ GUIDE_FORMATS: dict[str, dict[str, str]] = {
 FORMAT_STRUCTURE_HINTS = {
     "work_instruction": (
         "Structure: # title, a 2-3 sentence task objective, ## Before you start (prerequisites + tools), "
-        "## Safety only if the transcript supports it, ## Steps with one ### per step including its time range like (0:45-1:10) "
+        "## Safety only if the transcript supports it, ## Steps with one ### per step shaped EXACTLY like "
+        "`### 1. Do the thing (0:45-1:10)` (number, period, title, time range — no other heading shape), "
         "and 2-4 imperative sentences starting with a verb, each step ending with an 'Expected:' verification line where supported, "
         "## If something goes wrong only if supported. Never invent tools, values, warnings, or steps."
     ),
     "reference_manual": (
         "Structure: # title plus scope, ## Equipment (only if identifiable from input, else omit), "
         "## Prerequisites, ## Tools and materials (only items named in the input), ## Safety (only transcript-supported notes), "
-        "## Procedure overview (2-3 sentences), ## Numbered procedure (same ### per step with time ranges), "
+        "## Procedure overview (2-3 sentences), ## Numbered procedure (same ### per step shaped EXACTLY like "
+        "`### 1. Do the thing (0:45-1:10)`), "
         "## Expected outcomes (only supported checkpoints), ## Troubleshooting (only supported), "
         "## Sources (transcript ranges and objects used). Never invent torque, ratings, measurements, model identities, "
         "or specifications; omit unsupported sections entirely."
     ),
     "interactive": (
         "Structure: # title, one-line objective, ## Before you start (prerequisites + tools only if in input), "
-        "## Steps with one ### per step including its time range, each step exactly: one imperative instruction paragraph, "
+        "## Steps with one ### per step shaped EXACTLY like `### 1. Do the thing (0:45-1:10)` "
+        "including its time range, each step exactly: one imperative instruction paragraph, "
         "then an 'Expected:' line only if verifiable from input, then a 'Watch for:' safety line only if transcript-supported. "
         "Keep each step self-contained for field execution. Never invent checks, values, or warnings."
     ),
@@ -526,12 +544,16 @@ def _track_stats(frames: list[dict]) -> dict:
 
 
 def _hirez_retry(job_dir: Path, source: Path, obj: dict, prompt: str,
-                 prior_attempts: list[dict] | None = None) -> dict | None:
+                 prior_attempts: list[dict] | None = None) -> tuple[dict | None, dict]:
     """One bounded re-run on a higher-res tracking copy for failed objects.
 
     Prior low-res attempts are preserved (appended, never replaced) so the
-    processing timeline shows the full diagnostic trail.
+    processing timeline shows the full diagnostic trail. Returns
+    (result_or_None, attempt_record) — the record is always populated so
+    callers can show whether hi-res was tried and what it saw.
     """
+    attempt: dict = {"prompt": prompt + " (hi-res retry)", "status": "not_run",
+                     "frames": 0, "simulated": False}
     try:
         hired = job_dir / "tracking-hirez.mp4"
         if not hired.exists():
@@ -541,11 +563,14 @@ def _hirez_retry(job_dir: Path, source: Path, obj: dict, prompt: str,
             result = ai.segment_video_clip(file_id, prompt)
         finally:
             ai.delete_video_file(file_id)
+        attempt["status"] = result.get("status")
+        attempt["frames"] = len(result.get("frames", []))
+        attempt["simulated"] = bool(result.get("simulated"))
         if result.get("simulated") or not result.get("frames"):
-            return None
+            return None, attempt
         best, distinct, margin = _best_track(result.get("frames", []))
         if not best:
-            return None
+            return None, attempt
         out = {**obj, "simulated": False, "prompt_used": prompt,
                "attempts": list(prior_attempts or []) + [
                    {"prompt": prompt + " (hi-res retry)", "status": result.get("status"),
@@ -564,14 +589,16 @@ def _hirez_retry(job_dir: Path, source: Path, obj: dict, prompt: str,
         out["margin"] = margin
         out.update(make_illustrations(job_dir, source, obj, best))
         ambiguous = distinct > 1 and (conf is None or margin < CLOSE_MARGIN)
+        out["ambiguous_match"] = bool(ambiguous)
         if (conf is not None and conf < REVIEW_CONF) or ambiguous:
             out["status"] = "needs_tap"
             out["note"] = "Matched at higher resolution but still uncertain — tap to confirm."
         else:
             out["status"] = "ok"
-        return out
-    except Exception:
-        return None
+        return out, attempt
+    except Exception as e:
+        attempt["status"] = f"failed: {type(e).__name__}"
+        return None, attempt
 
 
 def accepted_visuals_by_step(db, version_id: str) -> dict[int, list[tuple[str, str]]]:

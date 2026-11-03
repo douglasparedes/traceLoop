@@ -1106,7 +1106,7 @@ def fallback_guide_markdown(title: str, steps: list[dict], objects: list[dict],
             lines += ["## Before you start", ""] + [f"- {t}" for t in tools] + [""]
         lines += ["## Steps — do one at a time", ""]
         for s in steps:
-            lines += [f"### Step {s.get('step_number', '')} of {len(steps)}: {s.get('title', '')} ({s.get('start', 0):.0f}s–{s.get('end', 0):.0f}s)", "",
+            lines += [f"### {s.get('step_number', '')}. {s.get('title', '')} ({s.get('start', 0):.0f}s–{s.get('end', 0):.0f}s)", "",
                       (s.get("summary", "") or "_No instruction recorded._"),
                       "",
                       "Expected: confirm visually before continuing (only the recording can verify).",
