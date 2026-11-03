@@ -304,16 +304,12 @@ const BeatView: React.FC<{ scene: Scene; beat: Beat; beatIndex: number }> = ({ s
             portrait={portrait}
             zoomFrom={beat.kind === "hero" ? 1 : 1.02}
             zoomTo={beat.kind === "hero" ? 1.08 : 1.16}
-            dim={beat.kind === "caption"}
+            dim={false}
             mainW={Math.min(900, Math.round(446 * (scene.imageW || 3) / Math.max(1, scene.imageH || 4)))}
             mainH={446}
           />
           {beat.kind === "caption" ? (
-            <AbsoluteFill style={{ justifyContent: "center", alignItems: "center", padding: "0 120px" }}>
-              <div style={{ fontSize: 44, color: BRAND_TEXT, fontWeight: 700, textAlign: "center", fontFamily: FONT, opacity: useFadeIn(10) }}>
-                {beat.body}
-              </div>
-            </AbsoluteFill>
+            <CaptionBar text={beat.body || scene.caption} big />
           ) : (
             <>
               {beatIndex > 0 || beat.kind === "detail" ? (

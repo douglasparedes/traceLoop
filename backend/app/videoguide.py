@@ -223,9 +223,11 @@ def plan_visual_beats(scene: dict, segments: list[dict], duration_frames: int,
 
     Short scenes (<8s) get establish + focus; longer scenes get introduce,
     focus, explain, and verify/recap beats so no still sits unchanged for
-    20+ seconds. Beat bodies rotate the timed narration overlapping the
-    scene, so captions move with the voice instead of one static block.
-    Frame ranges are contiguous integers summing exactly to duration_frames.
+    20+ seconds. Each narrative beat's body is the transcript actually
+    overlapping that beat's own time window — on-screen text follows the
+    voiceover instead of repeating one static block. Consecutive beats
+    never share identical bodies when any alternative exists. Frame ranges
+    are contiguous integers summing exactly to duration_frames.
     """
     if duration_frames <= 0:
         return []
@@ -234,34 +236,88 @@ def plan_visual_beats(scene: dict, segments: list[dict], duration_frames: int,
         end = float(scene.get("audio_end", 0) or 0)
     except (TypeError, ValueError):
         start, end = 0.0, 0.0
-    overlapping = [str(x.get("text", "") or "").strip()
-                   for x in _segments_for_range(segments, start, end)]
-    overlapping = [t for t in overlapping if t]
+    scene_dur = max(0.0, end - start)
     scene_sec = duration_frames / max(1, VIDEO_FPS)
     expected = str(scene.get("expected_result", "") or "")[:220]
     tools = [str(x) for x in (scene.get("required_tools") or [])][:4]
+    tools_line = f"Tools: {', '.join(tools)}" if tools else ""
     caption = str(scene.get("caption", "") or "")[:220]
-    bodies = overlapping or ([caption] if caption else [])
+    title = str(scene.get("title", "") or "")
+    step_no = int(scene.get("step", scene.get("step_number", 0)) or 0)
+    recap = f"Step {step_no} of {title}" if title else caption
     if scene_sec < 8:
-        plan = [("hero", bodies[0] if bodies else caption),
-                ("detail", bodies[1] if len(bodies) > 1 else (expected or (bodies[0] if bodies else caption)))]
+        kinds = ["hero", "detail"]
         ratios = [0.55, 0.45]
     else:
-        plan = [("hero", bodies[0] if bodies else caption),
-                ("detail", bodies[1] if len(bodies) > 1 else (bodies[0] if bodies else caption)),
-                ("caption", bodies[2] if len(bodies) > 2 else (bodies[-1] if bodies else caption)),
-                ("verify", expected or (f"Tools: {', '.join(tools)}" if tools else (bodies[-1] if bodies else caption)))]
+        kinds = ["hero", "detail", "caption", "verify"]
         ratios = [0.30, 0.30, 0.25, 0.15]
-    beats, offset = [], 0
-    for i, ((kind, body), ratio) in enumerate(zip(plan, ratios)):
-        if i == len(plan) - 1:
+    # Frame ranges first (contiguous, exact sum).
+    durs: list[int] = []
+    offset = 0
+    for i, ratio in enumerate(ratios):
+        if i == len(ratios) - 1:
             dur = duration_frames - offset
         else:
             dur = max(1, int(round(duration_frames * ratio)))
-            dur = min(dur, duration_frames - offset - (len(plan) - i - 1))
+            dur = min(dur, duration_frames - offset - (len(ratios) - i - 1))
         if dur <= 0:
             continue
-        beats.append({"kind": kind, "headline": "", "body": body or "",
+        durs.append(dur)
+        offset += dur
+    kinds = kinds[:len(durs)]
+    # Bodies by time overlap with each beat's own window.
+    timed = []
+    for x in segments or []:
+        try:
+            ss, se = float(x.get("start", 0) or 0), float(x.get("end", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        text = str(x.get("text", "") or "").strip()
+        if text and se > start and ss < end:
+            timed.append((ss, se, text))
+    used: list[str] = []
+
+    def pick_timed(ws: float, we: float) -> str:
+        """The line actually spoken during [ws, we): max overlap wins.
+
+        Repeating a still-spoken line across a beat boundary is honest;
+        showing a line that is not being spoken is not.
+        """
+        best: tuple[float, str] | None = None
+        best_ov = 0.0
+        for ss, se, text in timed:
+            ov = min(se, we) - max(ss, ws)
+            if ov > 0 and (best is None or ov > best_ov or
+                           (ov == best_ov and ss < best[0])):
+                best, best_ov = (ss, text), ov
+        return best[1] if best else ""
+
+    def pick_fallback(options: list[str]) -> str:
+        for fb in options:
+            if fb and fb not in used:
+                used.append(fb)
+                return fb
+        for fb in options:
+            if fb:
+                return fb
+        return ""
+
+    beats = []
+    offset = 0
+    for i, (kind, dur) in enumerate(zip(kinds, durs)):
+        ws = start + (offset / max(1, duration_frames)) * scene_dur if scene_dur > 0 else start
+        we = start + ((offset + dur) / max(1, duration_frames)) * scene_dur if scene_dur > 0 else start
+        body = pick_timed(ws, we)
+        if not body:
+            if kind == "verify":
+                body = pick_fallback([t for t in [expected, tools_line, recap, caption] if t])
+            elif kind == "caption":
+                body = pick_fallback([t for t in [recap, caption, expected, tools_line] if t])
+            else:
+                body = pick_fallback([t for t in [caption, recap, expected, tools_line] if t])
+        if not body:
+            body = recap or caption or expected or "Follow the narration."
+        beats.append({"kind": kind, "headline": "", "body": body,
                       "startFrame": start_frame + offset, "durationFrames": dur})
         offset += dur
     return beats

@@ -855,6 +855,7 @@ async def tutorial_start(file: UploadFile = File(...), title: str = Form(default
                          equipment_name: str = Form(default=""),
                          task_description: str = Form(default=""),
                          context_notes: str = Form(default=""),
+                         force_new: bool = False,
                          db: Session = Depends(get_db), who=Depends(actor)):
     # Browsers send codec-qualified types (e.g. "video/webm;codecs=vp8,opus"):
     # compare the base media type only, with a filename-extension fallback.
@@ -907,7 +908,7 @@ async def tutorial_start(file: UploadFile = File(...), title: str = Form(default
             pass
         raise HTTPException(500, f"Upload failed while receiving the file ({type(e).__name__})")
     video_hash = digest.hexdigest()
-    existing = db.scalar(select(M.TutorialJob).where(M.TutorialJob.video_hash == video_hash, M.TutorialJob.actor == who["id"], M.TutorialJob.status == "done"))
+    existing = None if force_new else db.scalar(select(M.TutorialJob).where(M.TutorialJob.video_hash == video_hash, M.TutorialJob.actor == who["id"], M.TutorialJob.status == "done"))
     if existing is not None:
         try:
             tmp_path.unlink(missing_ok=True)
@@ -1119,13 +1120,15 @@ def upload_abort(uid: str, db: Session = Depends(get_db), who=Depends(actor)):
 
 
 @app.post("/api/tutorial/uploads/{uid}/complete")
-def upload_complete(uid: str, db: Session = Depends(get_db), who=Depends(actor)):
+def upload_complete(uid: str, force_new: bool = False, db: Session = Depends(get_db), who=Depends(actor)):
     """Verify, atomically persist, and create the TutorialJob.
 
     Verifies every received byte (size + full-file sha256) before anything
     is marked persisted; the job is created only after the file is durably
     in its final location. Identical bytes to an existing finished tutorial
-    return the cached job instead of duplicating it.
+    return the cached job instead of duplicating it — unless force_new is
+    set, in which case a genuinely new job is always created (the user
+    explicitly asked to re-process the same file, e.g. with a new title).
     """
     import hashlib as _hashlib
     import shutil as _shutil
@@ -1150,7 +1153,7 @@ def upload_complete(uid: str, db: Session = Depends(get_db), who=Depends(actor))
         db.commit()
         _shutil.rmtree(_upload_tmp_dir(s.id), ignore_errors=True)
         raise HTTPException(422, "Checksum mismatch: the received bytes do not match the file. Discard and upload again.")
-    existing = db.scalar(select(M.TutorialJob).where(
+    existing = None if force_new else db.scalar(select(M.TutorialJob).where(
         M.TutorialJob.video_hash == s.sha256, M.TutorialJob.actor == who["id"],
         M.TutorialJob.status == "done"))
     if existing is not None:
