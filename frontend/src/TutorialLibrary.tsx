@@ -5,6 +5,13 @@ import { useCallback, useEffect, useState } from "react";
 import { API, authHeaders, getIdentity } from "./api";
 import { Icon } from "./icons";
 
+interface ImpactData {
+  title: string; status: string; snapshots: number; content_revisions: number;
+  video_guides: number; visual_assets: number; processing_events: number;
+  tutorial_evidence_items: number; draft_procedure_id?: string | null;
+  draft_version_id?: string | null;
+}
+
 export interface LibraryItem {
   id: string;
   title: string;
@@ -50,7 +57,10 @@ export default function TutorialLibrary({ onOpen, refreshKey }: {
   const [loading, setLoading] = useState(true);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState("");
-  const [deleting, setDeleting] = useState<string | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [impact, setImpact] = useState<{ item: LibraryItem; data: ImpactData } | null>(null);
+  const role = getIdentity().role;
+  const canManage = role === "reviewer" || role === "admin" || role === "expert";
 
   const load = useCallback(async (opts?: { append?: boolean }) => {
     const append = !!opts?.append;
@@ -63,6 +73,7 @@ export default function TutorialLibrary({ onOpen, refreshKey }: {
       const params = new URLSearchParams({ limit: String(PAGE), offset: String(offset) });
       if (q.trim()) params.set("q", q.trim());
       if (status) params.set("status", status);
+      if (status === "archived") params.set("include_archived", "true");
       const res = await fetch(`${API}/api/tutorial?${params}`, { headers: authHeaders({ "X-User": idn.user, "X-Role": idn.role }) });
       if (!res.ok) throw new Error(`Library unavailable (${res.status})`);
       const body = await res.json();
@@ -86,21 +97,76 @@ export default function TutorialLibrary({ onOpen, refreshKey }: {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => { void load(); }, [refreshKey]);
 
-  async function remove(item: LibraryItem) {
-    if (!window.confirm(`Delete “${item.title}” and its videos and illustrations? This cannot be undone.`)) return;
-    setDeleting(item.id);
+  async function archive(item: LibraryItem) {
+    if (!window.confirm(`Remove “${item.title}” from the active library? It stays restorable under Archived.`)) return;
+    setBusy(item.id);
+    try {
+      const idn = getIdentity();
+      const res = await fetch(`${API}/api/tutorial/${item.id}/archive`, {
+        method: "POST",
+        headers: authHeaders({ "X-Tutorial-Token": item.access_token, "X-User": idn.user, "X-Role": idn.role }),
+      });
+      if (!res.ok) throw new Error(`Remove failed (${res.status}): ${(await res.text()).slice(0, 200)}`);
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Remove failed");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function restore(item: LibraryItem) {
+    setBusy(item.id);
+    try {
+      const idn = getIdentity();
+      const res = await fetch(`${API}/api/tutorial/${item.id}/unarchive`, {
+        method: "POST",
+        headers: authHeaders({ "X-Tutorial-Token": item.access_token, "X-User": idn.user, "X-Role": idn.role }),
+      });
+      if (!res.ok) throw new Error(`Restore failed (${res.status})`);
+      await load();
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Restore failed");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function askDelete(item: LibraryItem) {
+    setBusy(item.id);
+    try {
+      const idn = getIdentity();
+      const res = await fetch(`${API}/api/tutorial/${item.id}/deletion-impact`, {
+        headers: authHeaders({ "X-Tutorial-Token": item.access_token, "X-User": idn.user, "X-Role": idn.role }),
+      });
+      if (!res.ok) throw new Error(`Cannot inspect dependencies (${res.status})`);
+      setImpact({ item, data: await res.json() });
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Delete inspection failed");
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function confirmDelete() {
+    if (!impact) return;
+    const { item } = impact;
+    setBusy(item.id);
     try {
       const idn = getIdentity();
       const res = await fetch(`${API}/api/tutorial/${item.id}`, {
         method: "DELETE",
         headers: authHeaders({ "X-Tutorial-Token": item.access_token, "X-User": idn.user, "X-Role": idn.role }),
       });
-      if (!res.ok) throw new Error(`Delete failed (${res.status})`);
+      if (!res.ok) throw new Error(`Delete failed (${res.status}): ${(await res.text()).slice(0, 300)}`);
+      const body = await res.json();
+      setImpact(null);
       await load();
+      if (body?.storage_warning) setError(`Deleted, but storage cleanup was incomplete: ${body.storage_warning}`);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Delete failed");
     } finally {
-      setDeleting(null);
+      setBusy(null);
     }
   }
 
@@ -128,7 +194,7 @@ export default function TutorialLibrary({ onOpen, refreshKey }: {
         {q && <button className="btn small secondary icon-only" aria-label="Clear search" onClick={() => setQ("")}><Icon name="close" size={17} /></button>}
       </div>
       <div className="filter-tabs" role="group" aria-label="Status filter" style={{ marginBottom: 10 }}>
-        {([["", "All"], ["done", "Ready"], ["processing", "Processing"], ["error", "Failed"]] as const).map(([v, label]) => (
+        {([["", "All"], ["done", "Ready"], ["processing", "Processing"], ["error", "Failed"], ["archived", "Archived"]] as const).map(([v, label]) => (
           <button key={v} className="filter-tab" aria-pressed={status === v} onClick={() => setStatus(v)}>{label}</button>
         ))}
         <button className="btn small secondary" onClick={() => void load()} disabled={loading} style={{ marginLeft: "auto" }}>
@@ -164,9 +230,17 @@ export default function TutorialLibrary({ onOpen, refreshKey }: {
             </span>
             <span className="tut-row-actions">
               <button className="btn small" onClick={() => onOpen(t)}>Open</button>
-              <button className="btn small secondary danger-ghost" onClick={() => void remove(t)} disabled={deleting === t.id} aria-label={`Delete ${t.title}`}>
-                {deleting === t.id ? "…" : <Icon name="trash" size={16} />}
-              </button>
+              {canManage && t.status === "archived" && (
+                <button className="btn small secondary" onClick={() => void restore(t)} disabled={busy === t.id}>Restore</button>
+              )}
+              {canManage && t.status !== "archived" && (
+                <button className="btn small secondary" onClick={() => void archive(t)} disabled={busy === t.id}>Remove</button>
+              )}
+              {canManage && (
+                <button className="btn small secondary danger-ghost" onClick={() => void askDelete(t)} disabled={busy === t.id} aria-label={`Delete ${t.title} permanently`}>
+                  {busy === t.id ? "…" : <Icon name="trash" size={16} />}
+                </button>
+              )}
             </span>
           </li>
         ))}
@@ -175,6 +249,24 @@ export default function TutorialLibrary({ onOpen, refreshKey }: {
         <button className="btn small secondary" style={{ marginTop: 10 }} onClick={() => void load({ append: true })} disabled={loadingMore}>
           {loadingMore ? "Loading…" : `Load more (${total - items.length} remaining)`}
         </button>
+      )}
+      {impact && (
+        <div className="scrim" onClick={(e) => { if (e.target === e.currentTarget) setImpact(null); }}>
+          <div className="sheet" role="dialog" aria-modal="true" aria-label="Confirm permanent deletion">
+            <h3>Permanently delete “{impact.item.title}”?</h3>
+            <p className="muted">This removes the tutorial from every library view and deletes its stored media. Approved procedures and completed execution history are preserved.</p>
+            <ul className="small-text">
+              <li>Source recording, transcript, {impact.data.snapshots} guide snapshot(s), {impact.data.content_revisions} content revision(s)</li>
+              <li>{impact.data.visual_assets} visual asset(s), {impact.data.video_guides} video guide(s), {impact.data.processing_events} processing event(s), {impact.data.tutorial_evidence_items} tutorial evidence file(s)</li>
+              {impact.data.draft_version_id && <li>Linked review draft {impact.data.draft_version_id.slice(0, 8)}… is kept (approved knowledge is immutable)</li>}
+            </ul>
+            <p className="notice warn">Cannot be undone. Removing from the library (Archive) is reversible — deletion is not.</p>
+            <div className="row">
+              <button className="btn secondary" style={{ flex: 1 }} onClick={() => setImpact(null)}>Cancel</button>
+              <button className="btn danger" style={{ flex: 1 }} onClick={() => void confirmDelete()} disabled={busy === impact.item.id}>Delete permanently</button>
+            </div>
+          </div>
+        </div>
       )}
     </section>
   );

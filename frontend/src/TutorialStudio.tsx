@@ -162,6 +162,87 @@ export default function TutorialStudio({ item, onBack, onOpenReview, notify }: {
         }}
         onChanged={() => void load()} />}
       {tab === "visuals" && <VisualsEditor detail={detail} token={item.access_token} notify={notify} />}
+      <DangerZone item={item} detail={detail} dirty={dirty} notify={notify} onBack={onBack} onChanged={() => void load()} />
+    </div>
+  );
+}
+
+function DangerZone({ item, detail, dirty, notify, onBack, onChanged }: {
+  item: { id: string; access_token: string; title: string };
+  detail: { id: string; title: string; status: string };
+  dirty: boolean; notify: (s: string, kind?: "ok" | "error" | "info") => void;
+  onBack: () => void; onChanged: () => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [impact, setImpact] = useState<null | {
+    snapshots: number; content_revisions: number; video_guides: number;
+    visual_assets: number; processing_events: number; tutorial_evidence_items: number;
+    draft_version_id?: string | null;
+  }>(null);
+  const role = getIdentity().role;
+  if (role !== "reviewer" && role !== "admin" && role !== "expert") return null;
+  async function hdr() {
+    const idn = getIdentity();
+    return authHeaders({ "X-Tutorial-Token": item.access_token, "X-User": idn.user, "X-Role": idn.role });
+  }
+  async function doArchive() {
+    if (dirty && !window.confirm("You have unsaved changes. Remove from the library anyway?")) return;
+    if (!window.confirm(`Remove “${detail.title}” from the active library? Restorable under Archived.`)) return;
+    setBusy(true);
+    try {
+      const r = await fetch(`${API}/api/tutorial/${item.id}/archive`, { method: "POST", headers: await hdr() });
+      if (!r.ok) throw new Error(`Remove failed (${r.status})`);
+      notify("Removed from the active library. Restorable under Archived.", "ok");
+      onChanged(); onBack();
+    } catch (e) { notify(e instanceof Error ? e.message : "Remove failed", "error"); }
+    finally { setBusy(false); }
+  }
+  async function askDelete() {
+    setBusy(true);
+    try {
+      const r = await fetch(`${API}/api/tutorial/${item.id}/deletion-impact`, { headers: await hdr() });
+      if (!r.ok) throw new Error(`Cannot inspect dependencies (${r.status})`);
+      setImpact(await r.json());
+    } catch (e) { notify(e instanceof Error ? e.message : "Inspection failed", "error"); }
+    finally { setBusy(false); }
+  }
+  async function doDelete() {
+    setBusy(true);
+    try {
+      const r = await fetch(`${API}/api/tutorial/${item.id}`, { method: "DELETE", headers: await hdr() });
+      if (!r.ok) throw new Error(`Delete failed (${r.status}): ${(await r.text()).slice(0, 300)}`);
+      const body = await r.json();
+      notify("Tutorial permanently deleted. Approved procedures and execution history preserved.", "ok");
+      if (body?.storage_warning) notify(`Storage warning: ${body.storage_warning}`, "error");
+      setImpact(null); onBack();
+    } catch (e) { notify(e instanceof Error ? e.message : "Delete failed", "error"); }
+    finally { setBusy(false); }
+  }
+  return (
+    <div className="card" style={{ marginTop: 16, borderColor: "var(--danger-bg)" }}>
+      <h3 style={{ marginTop: 0 }}>Reviewer controls</h3>
+      <p className="muted small-text">Remove hides the tutorial from active lists (reversible). Delete destroys tutorial media permanently; approved procedures and completed job evidence are never deleted.</p>
+      <div className="row">
+        {detail.status !== "archived"
+          ? <button className="btn secondary" onClick={() => void doArchive()} disabled={busy}>Remove from library</button>
+          : <span className="tag neutral">Archived — restore from the Library Archived tab</span>}
+        <button className="btn danger" onClick={() => void askDelete()} disabled={busy}>Delete permanently…</button>
+      </div>
+      {impact && (
+        <div className="panel" style={{ marginTop: 12 }}>
+          <p><strong>Delete “{detail.title}” permanently?</strong></p>
+          <ul className="small-text">
+            <li>{impact.snapshots} snapshot(s), {impact.content_revisions} revision(s), {impact.visual_assets} visual(s), {impact.video_guides} video guide(s)</li>
+            <li>{impact.processing_events} processing event(s), {impact.tutorial_evidence_items} tutorial evidence file(s)</li>
+            {impact.draft_version_id && <li>Linked draft kept (approved knowledge immutable)</li>}
+          </ul>
+          <p className="notice warn">Cannot be undone.</p>
+          <div className="row">
+            <button className="btn secondary" style={{ flex: 1 }} onClick={() => setImpact(null)}>Cancel</button>
+            <button className="btn danger" style={{ flex: 1 }} onClick={() => void doDelete()} disabled={busy}>Delete permanently</button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

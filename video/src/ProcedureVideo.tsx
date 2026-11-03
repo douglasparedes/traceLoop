@@ -61,12 +61,14 @@ export type VideoProps = z.infer<typeof VideoPropsSchema>;
 type Scene = z.infer<typeof SceneSchema>;
 type Beat = z.infer<typeof BeatSchema>;
 
-const BRAND_BG = "#0b1f1a";
-const BRAND_PANEL = "#122b24";
-const BRAND_ACCENT = "#ffb020";
-const BRAND_TEXT = "#f2fcf2";
-const BRAND_MUTED = "#9fc3b5";
-const FONT = "system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif";
+import { TOKENS } from "./designTokens";
+
+const BRAND_BG = TOKENS.bg;
+const BRAND_PANEL = TOKENS.panel;
+const BRAND_ACCENT = TOKENS.accent;
+const BRAND_TEXT = TOKENS.text;
+const BRAND_MUTED = TOKENS.muted;
+const FONT = TOKENS.font;
 
 const FORMAT_EYEBROW: Record<string, string> = {
   work_instruction: "TRACELOOP GUIDE",
@@ -118,9 +120,11 @@ const TitleCard: React.FC<{ title: string; format?: string }> = ({ title, format
   );
 };
 
-/** 16:9-aware image treatment. Portrait sources get a blurred full-frame
- *  backdrop plus a contained main visual — the frame is always filled,
- *  important content is never cropped away. */
+/** Balanced instructional image: contained card inside the safe area.
+ *  Landscape sources render at most ~60% of the canvas width with full
+ *  aspect preserved (contain) — instructions and captions keep their own
+ *  space instead of fighting a full-bleed photo. Portrait keeps the
+ *  blurred backdrop + contained main visual. */
 const StepImage: React.FC<{ src: string | null; portrait: boolean; zoomFrom: number; zoomTo: number; dim?: boolean; mainW?: number; mainH?: number }> = ({
   src, portrait, zoomFrom, zoomTo, dim, mainW, mainH,
 }) => {
@@ -140,16 +144,26 @@ const StepImage: React.FC<{ src: string | null; portrait: boolean; zoomFrom: num
     );
   }
   if (!portrait) {
+    // Card geometry: centered, capped so text zones stay clear.
+    const cardW = Math.min(TOKENS.imageCard.maxW, TOKENS.canvas.w - TOKENS.safe.x * 2);
+    const cardH = TOKENS.imageCard.maxH;
+    const cx = Math.round((TOKENS.canvas.w - cardW) / 2);
+    const cy = Math.round((TOKENS.canvas.h - cardH) / 2) - 10;
     return (
-      <AbsoluteFill>
-        <CanvasImage
+      <AbsoluteFill style={{ backgroundColor: BRAND_BG, justifyContent: "center", alignItems: "center" }}>
+        <Img
           src={src}
           style={{
-            width: "100%",
-            height: "100%",
-            objectFit: "cover",
+            position: "absolute",
+            left: cx,
+            top: cy,
+            width: cardW,
+            height: cardH,
+            objectFit: "contain",
+            borderRadius: TOKENS.imageCard.radius,
             scale: zoom,
-            filter: dim ? "brightness(0.55)" : undefined,
+            filter: dim ? TOKENS.overlay.dim : undefined,
+            backgroundColor: BRAND_PANEL,
           }}
         />
       </AbsoluteFill>

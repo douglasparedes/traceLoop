@@ -1388,14 +1388,114 @@ def tutorial_retry(jid: str, x_tutorial_token: str = Header(default=""), db: Ses
     return {"ok": True, "status": "uploaded"}
 
 
+def _require_tutorial_manager(job: M.TutorialJob, who: dict) -> None:
+    """Reviewer-grade permission for tutorial removal/deletion.
+
+    Reviewers, admins, and experts may manage any captured knowledge;
+    other roles may only manage tutorials they created themselves.
+    Frontend hiding is never sufficient — this runs on every mutation.
+    """
+    if who.get("role") in ("reviewer", "admin", "expert"):
+        return
+    if who.get("id") and who.get("id") == (job.actor or ""):
+        return
+    raise HTTPException(403, "Reviewer permission required to remove captured knowledge")
+
+
+def _tutorial_deletion_impact(db: Session, job: M.TutorialJob) -> dict:
+    """Counts + linkage for the deletion confirmation dialog."""
+    jid = job.id
+    snaps = db.scalar(select(func.count()).select_from(M.GuideSnapshot).where(M.GuideSnapshot.tutorial_id == jid)) or 0
+    revs = db.scalar(select(func.count()).select_from(M.TutorialContentRevision).where(M.TutorialContentRevision.tutorial_id == jid)) or 0
+    vids = db.scalar(select(func.count()).select_from(M.VideoGuide).where(M.VideoGuide.tutorial_id == jid)) or 0
+    visuals = db.scalar(select(func.count()).select_from(M.VisualAsset).where(M.VisualAsset.tutorial_id == jid)) or 0
+    evs = db.scalars(select(M.ProcessingEvent).where(M.ProcessingEvent.entity_type == "tutorial",
+                                                     M.ProcessingEvent.entity_id == jid)).all()
+    tut_ev = db.scalars(select(M.Evidence).where(M.Evidence.source_reference.like(f"tutorial:{jid}%"))).all()
+    return {"tutorial_id": jid, "title": job.title, "status": job.status,
+            "snapshots": snaps, "content_revisions": revs, "video_guides": vids,
+            "visual_assets": visuals, "processing_events": len(evs),
+            "tutorial_evidence_items": len(tut_ev),
+            "draft_procedure_id": job.draft_procedure_id or None,
+            "draft_version_id": job.draft_version_id or None,
+            "approved_procedure_preserved": True,
+            "execution_history_preserved": True,
+            "reversible": job.status != "archived"}
+
+
+@app.get("/api/tutorial/{jid}/deletion-impact")
+def tutorial_deletion_impact(jid: str, x_tutorial_token: str = Header(default=""), db: Session = Depends(get_db), who=Depends(actor)):
+    job = _get_tutorial(db, jid, x_tutorial_token)
+    _require_tutorial_manager(job, who)
+    return _tutorial_deletion_impact(db, job)
+
+
+def _cleanup_tutorial_records(db: Session, job: M.TutorialJob) -> dict:
+    """Delete dependent tutorial rows/files; preserve procedures + job history.
+
+    Removes: snapshots, content revisions, video-guide rows, visual-asset
+    rows, processing events, tutorial-scoped evidence rows + files, and the
+    tutorials/{jid} media directory. Keeps: Procedure/ProcedureVersion
+    (approved knowledge immutable), JobSession/JobEvent (execution history),
+    AuditLog (this operation appends). Returns cleanup summary.
+    """
+    jid = job.id
+    cleaned = {"snapshots": 0, "revisions": 0, "video_guides": 0, "visual_assets": 0,
+               "processing_events": 0, "evidence_items": 0, "evidence_files": 0,
+               "evidence_file_errors": []}
+    for row in db.scalars(select(M.GuideSnapshot).where(M.GuideSnapshot.tutorial_id == jid)).all():
+        db.delete(row); cleaned["snapshots"] += 1
+    for row in db.scalars(select(M.TutorialContentRevision).where(M.TutorialContentRevision.tutorial_id == jid)).all():
+        db.delete(row); cleaned["revisions"] += 1
+    for row in db.scalars(select(M.VideoGuide).where(M.VideoGuide.tutorial_id == jid)).all():
+        db.delete(row); cleaned["video_guides"] += 1
+    for row in db.scalars(select(M.VisualAsset).where(M.VisualAsset.tutorial_id == jid)).all():
+        db.delete(row); cleaned["visual_assets"] += 1
+    for row in db.scalars(select(M.ProcessingEvent).where(M.ProcessingEvent.entity_type == "tutorial",
+                                                          M.ProcessingEvent.entity_id == jid)).all():
+        db.delete(row); cleaned["processing_events"] += 1
+    for row in db.scalars(select(M.Evidence).where(M.Evidence.source_reference.like(f"tutorial:{jid}%"))).all():
+        key = row.storage_key or ""
+        db.delete(row); cleaned["evidence_items"] += 1
+        if key:
+            try:
+                p = _storage.media_path(key)
+                if p.is_file():
+                    p.unlink(); cleaned["evidence_files"] += 1
+            except Exception as e:
+                cleaned["evidence_file_errors"].append(f"{row.id}: {type(e).__name__}")
+    return cleaned
+
+
 @app.delete("/api/tutorial/{jid}")
 def tutorial_delete(jid: str, x_tutorial_token: str = Header(default=""), db: Session = Depends(get_db), who=Depends(actor)):
     import shutil as _shutil
     job = _get_tutorial(db, jid, x_tutorial_token)
+    _require_tutorial_manager(job, who)
+    impact = _tutorial_deletion_impact(db, job)
+    cleaned = _cleanup_tutorial_records(db, job)
     store_dir = _storage.media_root() / "tutorials" / jid
-    if store_dir.is_dir(): _shutil.rmtree(store_dir, ignore_errors=True)
-    db.delete(job); db.commit()
-    return {"ok": True}
+    media_error = ""
+    if store_dir.is_dir():
+        try:
+            _shutil.rmtree(store_dir)
+        except Exception as e:
+            media_error = f"{type(e).__name__}: {str(e)[:200]}"
+    audit(db, who["id"], "tutorial.delete", "tutorial", jid,
+          {"title": job.title, "impact": impact, "cleaned": cleaned, "media_error": media_error})
+    db.delete(job)
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        # Record survived; files may be partially removed — surface honestly.
+        raise HTTPException(500, "Deletion failed partway; the tutorial record was preserved. Retry or inspect storage.")
+    out = {"ok": True, "cleaned": cleaned, "approved_procedure_preserved": True,
+           "execution_history_preserved": True}
+    if media_error or cleaned["evidence_file_errors"]:
+        out["storage_warning"] = (f"Media cleanup incomplete: {media_error} " +
+                                  "; ".join(cleaned["evidence_file_errors"]))[:500]
+    return out
 
 
 @app.post("/api/tutorial/{jid}/refresh-guide")
@@ -2594,21 +2694,52 @@ def visual_reject(aid: str, db: Session = Depends(get_db), who=Depends(actor)):
 
 
 @app.post("/api/tutorial/{jid}/archive")
-def tutorial_archive(jid: str, x_tutorial_token: str = Header(default=""), db: Session = Depends(get_db)):
+def tutorial_archive(jid: str, x_tutorial_token: str = Header(default=""), db: Session = Depends(get_db), who=Depends(actor)):
     job = _get_tutorial(db, jid, x_tutorial_token)
+    _require_tutorial_manager(job, who)
+    if job.status == "archived":
+        return {"ok": True, "status": job.status, "already": True}
     if job.status not in ("done", "error"):
-        raise HTTPException(409, "Only finished or failed tutorials can be archived")
-    job.status = "archived"; db.commit()
+        raise HTTPException(409, "Only finished or failed tutorials can be removed from the library")
+    job.status = "archived"
+    audit(db, who["id"], "tutorial.archive", "tutorial", jid, {"title": job.title})
+    db.commit()
     return {"ok": True, "status": job.status}
 
 
 @app.post("/api/tutorial/{jid}/unarchive")
-def tutorial_unarchive(jid: str, x_tutorial_token: str = Header(default=""), db: Session = Depends(get_db)):
+def tutorial_unarchive(jid: str, x_tutorial_token: str = Header(default=""), db: Session = Depends(get_db), who=Depends(actor)):
     job = _get_tutorial(db, jid, x_tutorial_token)
+    _require_tutorial_manager(job, who)
     if job.status != "archived":
         raise HTTPException(409, "Only archived tutorials can be restored")
-    job.status = "done" if job.guide_markdown else "error"; db.commit()
+    job.status = "done" if job.guide_markdown else "error"
+    audit(db, who["id"], "tutorial.unarchive", "tutorial", jid, {"title": job.title, "status": job.status})
+    db.commit()
     return {"ok": True, "status": job.status}
+
+
+@app.delete("/api/capture-sessions/{cid}")
+def capture_session_delete(cid: str, db: Session = Depends(get_db), who=Depends(actor)):
+    """Retract source knowledge: reviewer (or owner) only, draft-safe."""
+    cap = db.get(M.CaptureSession, cid)
+    if not cap: raise HTTPException(404, "Capture session not found")
+    if who.get("role") not in ("reviewer", "admin", "expert") and who.get("id") != (cap.created_by or ""):
+        raise HTTPException(403, "Reviewer permission required to remove captured knowledge")
+    # Conservative: block only when an approved version references this session.
+    approved_link = None
+    try:
+        for v in db.scalars(select(M.ProcedureVersion)).all():
+            if isinstance(v.source_evidence, dict) and v.source_evidence.get("capture_session_id") == cid and v.status == "approved":
+                approved_link = v.id
+                break
+    except Exception:
+        approved_link = None
+    if approved_link:
+        raise HTTPException(409, "This capture backs an approved procedure version and cannot be deleted; archive the tutorial instead")
+    audit(db, who["id"], "capture.delete", "capture_session", cid, {})
+    db.delete(cap); db.commit()
+    return {"ok": True}
 
 
 @app.get("/api/processing/events")

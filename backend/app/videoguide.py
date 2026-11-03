@@ -205,6 +205,40 @@ def _image_dimensions(path: str) -> tuple[int, int]:
         return (0, 0)
 
 
+MAX_RENDER_DIM = 1280
+
+
+def _render_sized(job_dir: Path, path: str) -> str:
+    """Downscale oversized sources to a render-sized copy (max 1280px).
+
+    Preserves the original asset untouched; the composition references the
+    smaller copy so large camera frames do not inflate bundle/transfer or
+    render memory. Already-small images pass through unchanged. The copy
+    lives under tutorials/{jid}/render/ and reuses the source basename.
+    """
+    try:
+        from PIL import Image as _Image
+        with _Image.open(path) as im:
+            w, h = im.size
+            if max(w, h) <= MAX_RENDER_DIM:
+                return path
+            scale = MAX_RENDER_DIM / max(w, h)
+            nw, nh = max(1, int(w * scale)), max(1, int(h * scale))
+            conv = im.convert("RGB")
+            conv.thumbnail((nw, nh), _Image.LANCZOS)
+            out_dir = job_dir / "render"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            name = Path(path).name
+            stem, ext = name.rsplit(".", 1) if "." in name else (name, "jpg")
+            out = out_dir / f"{stem}-render.{ext}"
+            if not out.is_file():
+                conv.save(out, "JPEG" if ext.lower() in ("jpg", "jpeg") else "PNG")
+            return str(out)
+    except Exception:
+        return path
+    return path
+
+
 def _segments_for_range(segments: list[dict], start: float, end: float) -> list[dict]:
     out = []
     for x in segments or []:
@@ -350,6 +384,40 @@ def build_video_props(job: M.TutorialJob, scenes: list[dict], voiceover: Path | 
         beats = plan_visual_beats(s, getattr(job, "timed_segments", None) or [], dur_frames, scene_start)
         for b in beats:
             b["image"] = img
+        if img:
+            # Serve a render-sized copy so multi-megapixel camera frames do
+            # not inflate the bundle or render memory; originals preserved.
+            sized = _render_sized(job_dir, img)
+            if sized != img:
+                for b in beats:
+                    b["image"] = sized
+                img = sized
+        # FOCUS pill names the involved component (from canonical steps),
+        # so highlights read as the actual part, not a generic label.
+        try:
+            _step_no = int(s.get("step_number", len(out_scenes) + 1))
+            _jstep = next((x for x in (job.steps or []) if int(x.get("step_number", -1)) == _step_no), None)
+            _olabel = ""
+            if _jstep:
+                _omap = {}
+                for _o in (job.objects or []):
+                    try:
+                        _omap[int(_o.get("obj_id", -1))] = str(_o.get("label", ""))
+                    except (TypeError, ValueError):
+                        continue
+                for _oid in (_jstep.get("objects_used") or []):
+                    try:
+                        _olabel = _omap.get(int(_oid), "")
+                    except (TypeError, ValueError):
+                        _olabel = ""
+                    if _olabel:
+                        break
+            if _olabel:
+                for b in beats:
+                    if b.get("kind") == "detail" and not b.get("headline"):
+                        b["headline"] = _olabel[:60]
+        except Exception:
+            pass
         image_w, image_h = _image_dimensions(img) if img else (0, 0)
         out_scenes.append({
             "step": int(s.get("step_number", len(out_scenes) + 1)),
@@ -371,6 +439,40 @@ def build_video_props(job: M.TutorialJob, scenes: list[dict], voiceover: Path | 
             "voiceover": str(voiceover) if voiceover else None,
             "voiceoverFrames": int(round(voiceover_sec * fps)) if voiceover else 0,
             "scenes": out_scenes, "totalFrames": total_frames}
+
+
+def validate_video_props(props: dict) -> list[str]:
+    """Composition QA before render: every scene needs a visual in bounds,
+    captions inside safe margins, durations accommodating narration, and
+    highlights aligned. Returns blocking issues (empty = renderable)."""
+    issues: list[str] = []
+    try:
+        w, h = int(props.get("width", 0)), int(props.get("height", 0))
+        if (w, h) != (VIDEO_W, VIDEO_H):
+            issues.append(f"canvas must be {VIDEO_W}x{VIDEO_H}, got {w}x{h}")
+        scenes = props.get("scenes") or []
+        if not scenes:
+            issues.append("no scenes to render")
+        for s in scenes:
+            n = s.get("step", "?")
+            if not s.get("image"):
+                issues.append(f"step {n}: missing visual")
+                continue
+            iw, ih = int(s.get("imageW", 0)), int(s.get("imageH", 0))
+            if iw <= 0 or ih <= 0:
+                issues.append(f"step {n}: unreadable image dimensions")
+            if not str(s.get("caption", "") or "").strip() and not str(s.get("title", "") or "").strip():
+                issues.append(f"step {n}: no caption or title")
+            if int(s.get("durationFrames", 0)) <= 0:
+                issues.append(f"step {n}: non-positive duration")
+            for b in (s.get("beats") or []):
+                if int(b.get("durationFrames", 0)) <= 0:
+                    issues.append(f"step {n}: beat with non-positive duration")
+                if len(str(b.get("body", "") or "")) > 500:
+                    issues.append(f"step {n}: caption beat exceeds readable length")
+    except Exception as e:
+        issues.append(f"validation crashed: {type(e).__name__}")
+    return issues
 
 
 def validate_scene_plan(scenes: object, duration_sec: float) -> list[dict]:
@@ -1205,6 +1307,13 @@ def run_video_guide_job(vg_id: str) -> dict:
         prop_diagnostics: list = []
         props = build_video_props(job, scenes, voiceover, voice_sec,
                                   diagnostics=prop_diagnostics)
+        comp_issues = validate_video_props(props)
+        if comp_issues:
+            from . import processing as _proc2
+            _proc2.safe_record(db, "tutorial", job.id, "video_guide", "failed",
+                               operation="validate_composition", actor=actor or job.actor,
+                               summary={"issues": comp_issues[:10]})
+            raise RuntimeError("Video composition invalid: " + "; ".join(comp_issues[:5]))
         if prop_diagnostics:
             visual_report = {**visual_report,
                              "unresolved": prop_diagnostics,

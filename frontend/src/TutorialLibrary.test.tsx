@@ -25,8 +25,10 @@ function mockList() {
   }) as typeof fetch);
 }
 
-beforeEach(() => {
+beforeEach(async () => {
   vi.restoreAllMocks();
+  const { setIdentity } = await import("./api");
+  setIdentity("demo-tech", "technician");
 });
 
 describe("TutorialLibrary", () => {
@@ -55,23 +57,34 @@ describe("TutorialLibrary", () => {
     expect(screen.getByText("Failed upload demo")).toBeInTheDocument();
   });
 
-  it("confirms before deleting and calls the API", async () => {
+  it("asks impact then deletes permanently as reviewer", async () => {
+    const { setIdentity } = await import("./api");
+    setIdentity("rev-1", "reviewer");
     const seen: string[] = [];
     vi.spyOn(globalThis, "fetch").mockImplementation((async (url: unknown, init?: unknown) => {
       const u = String(url);
-      if ((init as RequestInit | undefined)?.method === "DELETE") seen.push(u);
+      const method = (init as RequestInit | undefined)?.method || "GET";
+      if (method === "DELETE") seen.push(u);
+      if (u.includes("/deletion-impact")) {
+        return { ok: true, status: 200, json: async () => ({
+          title: "Reseat the pump seal", status: "done", snapshots: 1, content_revisions: 0,
+          video_guides: 0, visual_assets: 1, processing_events: 2, tutorial_evidence_items: 0,
+          draft_version_id: null }) };
+      }
       return {
         ok: true,
         status: 200,
         json: async () => (u.includes("/api/tutorial?") ? { total: 2, items } : {}),
       };
     }) as typeof fetch);
-    vi.spyOn(window, "confirm").mockReturnValue(true);
     render(<TutorialLibrary onOpen={() => undefined} />);
     await screen.findByText("Reseat the pump seal");
     const user = userEvent.setup();
     const row = screen.getByRole("button", { name: /Open Reseat the pump seal/ }).closest("li")!;
     await user.click(within(row).getByRole("button", { name: /Delete Reseat/ }));
+    // Impact dialog appears before any DELETE.
+    expect(await screen.findByRole("dialog", { name: /Confirm permanent deletion/ })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /Delete permanently/ }));
     await waitFor(() => expect(seen.some((u) => u.includes("/api/tutorial/t1"))).toBe(true));
   });
 

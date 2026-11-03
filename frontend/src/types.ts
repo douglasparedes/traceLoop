@@ -70,4 +70,4 @@ export interface LocalJob {
 }
 
 export type View = "home" | "library" | "detail" | "capture" | "tutorials" | "studio" | "review" | "job" | "history" | "manuals" | "settings" | "activity";
-export type Role = "technician" | "expert" | "reviewer";
+export type Role = "technician" | "expert" | "reviewer" | "admin";
