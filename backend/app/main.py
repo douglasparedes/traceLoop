@@ -3333,9 +3333,11 @@ def finalize_job(jid: str, body: S.FinalizeJob, db: Session = Depends(get_db), w
         missing = [s.step_order for s in order if effective.get(s.id) not in terminal]
         if missing:
             db.rollback()
-            raise HTTPException(422, "Steps still need an outcome before finishing: "
+            raise HTTPException(422, "Steps still need an outcome on the server before finishing: "
                                 + ", ".join(str(n) for n in missing)
-                                + ". Complete, skip, or resolve each listed step first.")
+                                + ". If you already recorded them on this device, sync first — "
+                                "unsynced work cannot be finalized. Otherwise complete, skip, or "
+                                "resolve each listed step first.")
         outcome = ("completed" if all(effective.get(s.id) == "done" for s in order)
                    else "finished-with-exceptions")
         j.status = "finished"; j.outcome = outcome; j.finish_reason = body.reason

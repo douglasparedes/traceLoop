@@ -1338,13 +1338,16 @@ function JobView({ job, version, queueEvent, setJob, notify, reload, refreshPend
   // Viewed step (Previous navigation) vs frontier (where work happens).
   // Reviewing history never mutates it; actions always target the frontier.
   const [viewIdx, setViewIdx] = useState<number | null>(null);
-  useEffect(() => { setViewIdx(null); setMediaError(""); }, [job?.id]);
+  useEffect(() => { setViewIdx(null); setMediaError(""); setFinishBlocked(null); }, [job?.id]);
   const effectiveIdx = viewIdx ?? (allTerminal ? steps.length - 1 : frontierIdx);
   const step = job && steps.length ? steps[Math.min(Math.max(effectiveIdx, 0), steps.length - 1)] : undefined;
   const viewingPast = viewIdx !== null && viewIdx < frontierIdx && !allTerminal;
   const [mediaError, setMediaError] = useState("");
   const [jobPending, setJobPending] = useState(0);
   const [askBusy, setAskBusy] = useState(false);
+  // Steps the server still lacks after a sync-first finish attempt.
+  // Shown with a jump-to-step action instead of a dead-end error.
+  const [finishBlocked, setFinishBlocked] = useState<number[] | null>(null);
   // actingRef is the guard (stale closures made the state check pass twice
   // on rapid clicks); actingUi only drives disabled buttons.
   const actingRef = useRef(false);
@@ -1360,35 +1363,39 @@ function JobView({ job, version, queueEvent, setJob, notify, reload, refreshPend
   // Server reconciliation on mount/resume: adopt server-terminal states we
   // lack locally, and finalize locally if the server already finished.
   // Local pending work always survives; server state never deletes it.
+  // Returns the server state (or null offline) so finish can re-check it.
+  async function pullServerState(): Promise<{
+    steps: { step_id: string; state: string }[]; finished: boolean; outcome: string | null;
+  } | null> {
+    if (!job || !online || job.finished) return null;
+    try {
+      const st = await api.get<{
+        steps: { step_id: string; state: string }[]; finished: boolean; outcome: string | null;
+      }>(`/api/jobs/${job.id}/state`);
+      let changed = false;
+      const merged = { ...job.stepStates };
+      for (const p of st.steps) {
+        if ((p.state === "done" || p.state === "skipped" || p.state === "blocked") && !merged[p.step_id]) {
+          merged[p.step_id] = p.state as "done" | "skipped" | "blocked";
+          changed = true;
+        }
+      }
+      if (st.finished) {
+        await setJob({ ...job, stepStates: merged, finished: true, finish_outcome: st.outcome || "completed" });
+        notify("The server shows this job finished — marked complete locally.", "info");
+        go("history");
+        return st;
+      }
+      if (changed) {
+        await setJob({ ...job, stepStates: merged });
+        notify("Recovered progress confirmed by the server.", "info");
+      }
+      return st;
+    } catch { return null; /* offline or gone: local state stands */ }
+  }
   useEffect(() => {
     let alive = true;
-    (async () => {
-      if (!job || !online || job.finished) return;
-      try {
-        const st = await api.get<{
-          steps: { step_id: string; state: string }[]; finished: boolean; outcome: string | null;
-        }>(`/api/jobs/${job.id}/state`);
-        if (!alive) return;
-        let changed = false;
-        const merged = { ...job.stepStates };
-        for (const p of st.steps) {
-          if ((p.state === "done" || p.state === "skipped" || p.state === "blocked") && !merged[p.step_id]) {
-            merged[p.step_id] = p.state as "done" | "skipped" | "blocked";
-            changed = true;
-          }
-        }
-        if (st.finished) {
-          await setJob({ ...job, stepStates: merged, finished: true, finish_outcome: st.outcome || "completed" });
-          notify("The server shows this job finished — marked complete locally.", "info");
-          go("history");
-          return;
-        }
-        if (changed) {
-          await setJob({ ...job, stepStates: merged });
-          notify("Recovered progress confirmed by the server.", "info");
-        }
-      } catch { /* offline or gone: local state stands */ }
-    })();
+    void (async () => { if (alive) await pullServerState(); })();
     return () => { alive = false; };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [job?.id]);
@@ -1424,7 +1431,7 @@ function JobView({ job, version, queueEvent, setJob, notify, reload, refreshPend
         await queueEvent({ event_id: eventId, session_id: job.id, step_id: target.id, event_type: state === "done" ? "step_completed" : state === "skipped" ? "step_skipped" : "step_blocked", payload: { step_order: target.step_order }, occurred_at: new Date().toISOString() });
       }
       const next = { ...job, stepStates: { ...job.stepStates, [target.id]: state }, current: Math.min(frontierIdx + 1, steps.length) };
-      await setJob(next); setViewIdx(null);
+      await setJob(next); setViewIdx(null); setFinishBlocked(null);
       notify(state === "done" ? "Step completed and saved on this device." : `Step marked ${state} and saved on this device.`);
     } finally { setActing(false); }
   }
@@ -1457,7 +1464,7 @@ function JobView({ job, version, queueEvent, setJob, notify, reload, refreshPend
       const next = { ...job.stepStates };
       delete next[step.id];
       await setJob({ ...job, stepStates: next });
-      setViewIdx(null);
+      setViewIdx(null); setFinishBlocked(null);
       notify("Step resumed — it is workable again. The halt stays in the audit history.", "ok");
     } catch {
       notify("Could not resume on this device — nothing changed. Retry.", "error");
@@ -1503,8 +1510,36 @@ function JobView({ job, version, queueEvent, setJob, notify, reload, refreshPend
   async function finishFinal() {
     if (!job || actingRef.current || !allTerminal || steps.length === 0) return;
     setActing(true);
+    setFinishBlocked(null);
     try {
       const localOutcome = doneCount === steps.length ? "completed" : "finished-with-exceptions";
+      // The server can only finalize what it has: sync recorded steps
+      // first so an online finish never fails on work this device already
+      // did. Without this, tapping fast then finishing hits a 422 for
+      // steps the server has not seen yet.
+      const pend = await pendingForJob(job.id).catch(() => ({ total: 0 }));
+      if (pend.total > 0) {
+        notify("Syncing your recorded steps before finishing…", "info");
+        try {
+          await runSync();
+          await refreshPending();
+        } catch {
+          notify("Sync failed — finishing on this device; the server confirms it on the next sync.", "info");
+        }
+        const st = await pullServerState();
+        const missing = st ? steps.filter((s) => {
+          const cur = st.steps.find((x) => x.step_id === s.id);
+          return !cur || (cur.state !== "done" && cur.state !== "skipped" && cur.state !== "blocked");
+        }).map((s) => s.step_order) : [];
+        if (missing.length > 0) {
+          // Sync ran but the server still lacks outcomes (e.g. a step the
+          // server rejected, or validation failures in the queue). Do not
+          // finalize blindly — point at the exact steps instead.
+          setFinishBlocked(missing);
+          notify(`The server still has no outcome for step${missing.length === 1 ? "" : "s"} ${missing.join(", ")}. Complete, skip, or resolve them first — or discard the failing queue item in Activity and retry.`, "error");
+          return;
+        }
+      }
       const finishId = `evt:${job.id}:finish`;
       const existingFinish = await idb.get<JobEventRec>("events", finishId);
       if (!existingFinish) {
@@ -1654,6 +1689,19 @@ function JobView({ job, version, queueEvent, setJob, notify, reload, refreshPend
           {viewingPast && frontierStep && <button className="btn secondary" onClick={() => setViewIdx(null)}>Return to step {frontierStep.step_order}</button>}
         </div>
         <p className="muted small-text" style={{ marginTop: 8 }}>If a step is blocked on anything hazardous, stop work and follow your site procedure — this app never instructs you to bypass safety steps.</p>
+        {finishBlocked && finishBlocked.length > 0 && (
+          <div className="notice warn" role="alert" style={{ marginTop: 8 }}>
+            <strong>The server still has no outcome for step{finishBlocked.length === 1 ? "" : "s"} {finishBlocked.join(", ")}.</strong>{" "}
+            Your updates may still be waiting to sync, or a queued step was rejected — check Activity → Sync diagnostics.
+            <span className="row" style={{ marginTop: 8 }}>
+              <button className="btn small" onClick={() => {
+                const target = steps.findIndex((s) => s.step_order === finishBlocked[0]);
+                if (target >= 0) { setViewIdx(target); setFinishBlocked(null); }
+              }}>Go to step {finishBlocked[0]}</button>
+              <button className="btn small secondary" onClick={() => setFinishBlocked(null)}>Dismiss</button>
+            </span>
+          </div>
+        )}
       </section>
       <div className="action-dock">
         <div className="aux-row">
