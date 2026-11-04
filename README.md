@@ -67,7 +67,7 @@ For the quickest tour, first explore any existing example tutorials and approved
 
 **Offline check:** After saving a procedure while online, use your browser's network-offline mode (or a device's airplane mode) and continue the guided job. Reconnect, open **Activity**, and use **Sync now** if needed. Only server-acknowledged events are marked synchronized.
 
-**Suggested sample:** Upload a short recording of a non-sensitive task you are authorized to share. This repository does not bundle a sample recording.
+**Suggested sample:** Upload [demostration.mp4](demostration.mp4) to try the tutorial workflow with the included demonstration recording.
 
 Processing requires network access and can take time. Do not confuse an uploaded file with a finished guide; wait for the tutorial to reach its completed state.
 
@@ -182,6 +182,7 @@ Features such as speech transcription, object segmentation and generated illustr
 | [frontend/](frontend/) | Web PWA, Tutorial Studio, Procedures, offline execution and Activity |
 | [backend/](backend/) | FastAPI, Meta adapters, tutorial processing and versioned procedure APIs |
 | [video/](video/) | Remotion renderer for versioned in-app instructional videos |
+| [demostration.mp4](demostration.mp4) | Sample input recording for the judge walkthrough |
 | [docs/video-renderer.md](docs/video-renderer.md) | In-app Remotion renderer architecture and local commands |
 | [docs/demo-runbook.md](docs/demo-runbook.md) | Detailed end-to-end judge walkthrough |
 | [docs/tutorial-mode.md](docs/tutorial-mode.md) | Video upload, narrated/visual-first processing and Studio workflow |
