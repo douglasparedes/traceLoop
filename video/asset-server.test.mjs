@@ -1,4 +1,4 @@
-// Covers docs/remotion rule: every local asset handed to the renderer must
+// Every local asset handed to the renderer must
 // be an http(s) URL the headless browser can fetch — never a bare disk path.
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";

@@ -1,4 +1,5 @@
 .env
+.env.*
 backend/.venv/
 backend/fieldguard.db
 backend/data/
@@ -12,7 +13,39 @@ video/tsconfig.tsbuildinfo
 video/*.mp4
 video/smoke-*.json
 *.jks
+*.keystore
+*.p12
+*.pfx
 
 node_modules/
 .vite/
+
+# Hackathon film production working files (preserve locally; publish only an approved master)
+/demo/assets/
+/demo/capture-tools/
+/demo/production/
+/demo/remotion/
+/demo/demostration.mp4
+/demo/demostration-visual.mp4
+/demo/output/
+
+# Local audits and development-assistant workspaces
+/docs/audit/
+/.codex/
+/.claude/
+/.cursor/
+/.continue/
+/.windsurf/
+/.cline/
+/.roo/
+/.local-work/
+/.aider*
+
+# Common temporary diagnostics
+*.log
+*.tmp
+*.bak
+*.tsbuildinfo
+.DS_Store
+Thumbs.db
 

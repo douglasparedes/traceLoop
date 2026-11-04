@@ -1,5 +1,6 @@
 .git
 .gitignore
+/demo/
 **/__pycache__
 **/*.pyc
 .venv

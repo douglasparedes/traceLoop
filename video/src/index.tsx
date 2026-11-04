@@ -1,5 +1,5 @@
 // Remotion entry: registers ProcedureVideo with dynamic duration from props.
-// Per docs/remotion/markup-SKILL.md: calculateMetadata derives duration;
+// calculateMetadata derives duration from the supplied scene props;
 // Zod schema validates server-generated props at the render boundary.
 import React from "react";
 import { Composition, registerRoot } from "remotion";

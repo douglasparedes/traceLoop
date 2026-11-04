@@ -1,4 +1,4 @@
-// Node.js render entry for TraceLoop video guides (docs/remotion: plain Node SSR).
+// Node.js render entry for TraceLoop video guides (see docs/video-renderer.md).
 // Usage: node render.mjs --bundle <dir> --project <videoDir> --props <json> --out <mp4> --progress <json>
 // Bundles on demand into <bundleDir> when missing (cached afterwards), then
 // renders composition ProcedureVideo with onProgress heartbeats for polling.
