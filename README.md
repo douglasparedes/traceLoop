@@ -8,7 +8,7 @@ Much of a company's most valuable operational knowledge lives in demonstrations,
 
 **TraceLoop turns a short recording of someone performing a real task into reusable, visual, guided work instructions.** Teams can refine the steps, approve a version, follow the procedure offline, and use feedback from the field to improve the next revision.
 
-**[Try the live application](https://app.knowloop.online/)** · **[Watch the repository demo](demo/output/traceloop-hackathon-final-180s.mp4)** · **[Meta Global AI Developer Hackathon](https://dev.meta.ai/events/global-hackathon)**
+**[Try the live application](https://app.knowloop.online/)** · **[Watch the repository demo](demo/output/traceloop-hackathon-final-180s.mp4)** · 
 
 > **For hackathon judges:** Start with the [live demo](https://app.knowloop.online/) and the [five-minute walkthrough](#judge-walkthrough). A local installation is not required to explore the hosted app. If a team passphrase is requested, obtain it from the project owner; no credentials are stored in this repository. If the hosted service is unavailable, use the [local setup](#run-locally).
 
