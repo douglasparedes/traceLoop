@@ -1,0 +1,10 @@
+import sqlite3, json
+db = sqlite3.connect('fieldguard.db')
+r = db.execute("select source_evidence, ai_model, ai_simulated from procedure_versions where id like '29a7228d%'").fetchone()
+se = json.loads(r[0] or '{}')
+p = se.get('proposal', {})
+print('simulated:', p.get('simulated'))
+print('model:', p.get('model'))
+print('job:', str(p.get('job_id', ''))[:8])
+print('note:', str(p.get('note'))[:400])
+print('changes:', json.dumps(p.get('changes'))[:800])

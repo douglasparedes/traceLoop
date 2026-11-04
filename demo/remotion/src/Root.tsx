@@ -11,7 +11,7 @@ export const RemotionRoot: React.FC = () => (
     fps={30}
     width={1920}
     height={1080}
-    defaultProps={{ voiceoverSrc: null }}
+    defaultProps={{ voiceoverSrc: null, musicOn: true }}
     calculateMetadata={() => ({ durationInFrames: 5400, fps: 30 as const, width: 1920, height: 1080 })}
   />
 );

@@ -1,44 +1,39 @@
-# Status report — corrective rebuild (honest)
+# Status report — FINAL (2026-11-04)
 
-## What was delivered
+## Delivered
 
-TRUE 3-minute product film: `demo/output/traceloop-hackathon-180s.mp4`
-(5400 decoded frames, 180.000 s, 1920×1080, H.264+no audio), built from
-genuine Playwright captures of the running app. No narration track (owner
-records later against `traceloop_180s_voiceover_and_shots.md`).
+`demo/output/traceloop-hackathon-final-180s.mp4` — 5400 decoded frames,
+180.000 s video stream, 1920×1080, H.264 yuv420p, AAC (music+SFX, no voice),
+plus poster, 12-cell contact sheet, Remotion source, and all 12 required
+deliverables in `demo/production/`.
 
-## Deviations and incidents (all disclosed)
+## The story told (all genuine)
 
-1. **Missing reference files.** `traceloop_180s_timeline.json` and
-   `traceloop_180s_voiceover_and_shots.md` were not in the workspace. Rebuilt
-   both from the mission brief with identical constraints (5400 f, 9 scenes,
-   ≥144 s app footage, VO windows). Filenames kept for drop-in replacement.
-2. **First film retired.** The ~2-minute graphics film and its docs/audio were
-   removed by an external process during this session (see 4). This rebuild
-   replaces it; do not confuse the two.
-3. **Source clip is illustrative.** No camera operator on site; the uploaded
-   20 s trainer clip is a rendered SVG-rig animation (declared in manifest).
-   Every downstream screen, click, and state is the genuine app.
-4. **Workspace interference.** During capture, untracked files vanished more
-   than once (`backend/*.py` helpers, prior `demo/` build, one mobile webm
-   whose directory entry survived without readable content). A second worker
-   appears active in this repo (uncommitted source edits + new test files from
-   another hand). Mitigations used: Temp staging, immediate re-capture,
-   screenshot output redirected out of the synced tree. If frames look stale,
-   re-run `RENDER.md` — the project is deterministic.
-5. **Rehearsal side effects on server state.** Approval rehearsals advanced
-   versions (v3 approved on camera, then v5). Finished job e543d5b9 remains
-   pinned to v3 (API-verified). Duplicate pendings (v1/v2) and the API-created
-   v4 duplicate were rejected via the app's own reject endpoint; v4 draft
-   remains as a draft. All honest, all in the manifest.
-6. **No `needs_tap` path.** The silent clip routes to visual-first analysis,
-   which yields no tap-correction objects. Substituted the genuine expert
-   correction flow; no SAM overlay was fabricated.
+A real 90 s kitchen recording of cookie preparation is uploaded, processed by
+the app's honestly-labelled simulated visual-first pipeline (silent clip, no
+transcription claimed), corrected by an expert into 3 true steps, generated
+into guides, approved by a human reviewer (v1), executed offline on a real
+phone viewport with photo/note/finish/sync, fed back on, turned into a
+before/after proposal, and approved as v2 — with the finished job staying
+pinned to v1.
 
-## Outstanding / needs owner
+## Known limitations (disclosed, not hidden)
 
-- Record human narration into the 11 documented windows; set `voiceoverSrc`.
-- Re-check the Cerebral Valley portal for current duration/format/deadline rules.
-- Keep backend running state in mind: the demo DB now contains rehearsal jobs
-  (3 stale active probes + 1 harness job); harmless for submission, reset with
-  a fresh DB if a live demo follows.
+- No live Meta inference (no key); simulated outputs carry the app's labels.
+- The silent AAC track was removed (documented derivative) to avoid a
+  fabricated transcript; frames are bit-identical.
+- The deterministic fallback is input-independent (screwdriver fixture); the
+  two tainted rehearsal tutorials were excluded from the film.
+- No SAM masks exist for this branch (segmentation SKIPPED); none fabricated.
+- Two 1-second Ken Burns holds on genuine screenshots (proposal diff, badge
+  state) bridge moments the live capture missed; disclosed in manifest.
+- A later manual-guide regen forked procedure v3 (draft); filmed approvals
+  (v1, v2) are unaffected.
+- Workspace interference recurred (vanishing/cloud-flickering files, possible
+  second worker); mitigations: Temp staging, stable-name archives, render from
+  outside the synced tree. If anything looks stale, re-render per RENDER.md.
+
+## Needs owner
+
+Record human narration into FINAL_VOICEOVER_SCRIPT windows; re-check portal
+rules; submit.

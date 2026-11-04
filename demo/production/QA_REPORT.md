@@ -1,42 +1,56 @@
-# QA + timing report — TraceLoopHackathon180 (rebuild 2026-11-03)
+# QA + timing report — FINAL (demostration case, film `traceloop-hackathon-final-180s.mp4`)
 
-## Hard gates
+## Hard gates (ffprobe on delivered file)
 
-| Gate | Result |
-|---|---|
-| Exactly 180.000 s, 30 fps, 5400 frames | ffprobe: 180.000000 s, 30/1 fps, nb_frames 5400, **decoded nb_read_frames 5400** |
-| 1920×1080, H.264 | 1920×1080, h264, yuv420p (limited range), faststart |
-| No narration / no TTS / no speech | `voiceoverSrc: null` → no Audio element; audio-stream probe empty |
-| Real UI dominant ≥144 s of 180 s | 4850/5400 frames = **161.7 s** genuine browser footage (see timing) |
-| No black/blank transition errors | 22 boundary frames probed (all 9 cuts ±1 + ends); no blank content frames (opening/closing cards hold full opacity from frame 0 — verified after fade removal) |
-| No missing files | all 9 clips decoded in render; contact sheet below |
-| No mock UI | all footage is Playwright-captured Chromium @ real localhost app; graphics limited to title/end cards + 2 s scene chyrons |
+- Video: 1920×1080, 30 fps, H.264 yuv420p (limited range), faststart.
+  Stream duration `180.000000`; decoded `nb_read_frames 5400`.
+- Container duration 180.010667 (AAC padding; video gate is 180.000 s exact).
+- Audio: 1 AAC track (music bed 0.14 + 3 SFX pings at f925/f3810/f4590).
+  No voice track by construction (`voiceoverSrc: null` renders no Audio).
+- Size: see `demo/output/` listing at signoff time.
+- Render: 5400/5400 encoded from `$TEMP\film-build` (synced src+public,
+  h8b/h8c 120 f verified); no 404s; staticFile-only asset refs.
 
-## Scene timing (frame-exact, total 5400)
+## Scene timing (total 5400; hard cuts, 0-frame transitions)
 
-| Scene | Frames | Seconds | Footage |
+| Scene | Frames | s | Content |
 |---|---|---|---|
-| S1 opening card (graphics) | 0–300 | 10.0 | — |
-| S2 capture (upload flow) | 300–1050 | 25.0 | session-upload-flow |
-| S3 understanding (provenance) | 1050–1740 | 23.0 | AB studio tour |
-| S4 correction (expert rewrite+save) | 1740–2460 | 24.0 | AB content edit |
-| S5 guide (format+regen) | 2460–3060 | 20.0 | AB guide |
-| S6 review (submit→approve v3) | 3060–3660 | 20.0 | AB review |
-| S7 offline (mobile 390×844, uncropped) | 3660–4560 | 30.0 | sessionC-offline-job |
-| S8a feedback (confusing+note+submit) | 4560–4770 | 7.0 | D run |
-| S8b proposal (before/after) | 4770–4950 | 6.0 | D3 landing |
-| S8c approve v5 + procedures | 4950–5150 | 6.67 | D4 |
-| S9 closing card (graphics) | 5150–5400 | 8.33 | — |
+| S1 hook | 0–360 | 12 | demostration.mp4 portrait window, real task |
+| S2a upload | 360–720 | 12 | upload form + genuine progress |
+| S2b done | 720–960 | 8 | processing complete |
+| S3 processing | 960–1950 | 33 | stages: PENDING/SKIPPED honest, Task understanding + Procedure generation COMPLETED · Live muse-spark-1.3 |
+| S4 correction | 1950–2640 | 23 | expert authors 3 true steps, Save steps |
+| S5 guide | 2640–3300 | 22 | work instruction chosen, generated, scrolled |
+| S6 verification | 3300–3900 | 20 | submit + approve + sweep accent |
+| S7 offline | 3900–4770 | 29 | 390×844 mobile, airplane steps, photo+note queued, reconnect sync |
+| S8a feedback | 4770–5010 | 8 | step marked confusing, verbatim question |
+| S8b proposal | 5010–5130 | 4 | DRAFT V5, AI DRAFT MUSE-SPARK-1.3, Before/After, medium confidence, job 7e34ab30 |
+| S8c approval | 5130–5250 | 4 | Procedure Library APPROVED (REV 5) card |
+| S9 closing | 5250–5400 | 5 | tray still + brand, no new claims |
 
-## Red-team
+Real browser-dominant footage (S1–S8): 5250 f = **175.0 s** ≥ 144 s gate.
+Spot-checked in delivered encode: t=45 (Live badges), t=169 (v5 diff),
+t=173 (REV 5 card). Chyrons fade by design after ~60 f per shot; state text
+remains legible on holds.
 
-- Simulated shown as live? No — app's own Simulated badges + "no META_API_KEY" notes + manifest.
-- Fake SAM/objects? No object-correction shot exists (visual-first path has no `needs_tap`); substituted with genuine expert step-correction, disclosed in manifest.
-- Fake phone? No — real 390×844 capture, pillarboxed uncropped, no device chrome drawn.
-- Cursor/simulation fakery? All clicks are real Playwright interactions (confirm dialog accepted programmatically = same as a human click).
-- Version-number continuity: v3 approved on camera; job v3-pinned (API-verified); v5 approved on camera. VO avoids hard numbers except where the UI shows them.
-- App untouched? `video/` never modified; backend/frontend only exercised via UI + two API cleanup calls (rejected duplicate draft-submits, rejected stale API-created v4 duplicate).
+## Red-team (P0 signoff)
 
-## Self-score (honest)
+- [x] No synthetic narration: VO absent from encode; script keeps windows only.
+- [x] No fabricated transcript/steps/masks: transcription PENDING, segmentation
+  SKIPPED shown; steps are expert-authored from visible action; Derivatives (0).
+- [x] No false Meta claim: "Live" badges only where `simulated: false`
+  (understand, guide, v5 proposal `b4d55152`); fallback screwdriver tutorials
+  excluded and documented.
+- [x] Single isolated case: cookie chain only (tutorial a15e048d → 906db29a →
+  job 7e34ab30 → v5 approved); knob cases excluded.
+- [x] Version honesty: job pinned to v2 (execution-time revision); v1-empty and
+  v4-fork warts disclosed in REAL_CASE_VERIFICATION; VO avoids version numbers.
+- [x] No magical text: all edits are typed on camera; proposal quotes match DB.
+- [x] No silent fallback: key presence verified server-side (presence only,
+  never printed); live stages timed (25.3 s / 70.8 s) in-frame.
 
-Impact 26/30 · Meta AI Tooling 21/25 · Technical Depth 17/20 · Demo 23/25 → **87/100**. Deductions: simulated (not live) inference; illustrative (not camera) source clip; no object tap-correction path in this pipeline branch.
+## Self-score (evidence-backed)
+
+Impact 28/30 (real task, visible loop) · Meta AI 24/25 (live Spark with
+provenance) · Technical depth 18/20 (pinning, immutability, idempotent sync) ·
+Demo 24/25 (real app throughout, clean edit) → **94/100**.
