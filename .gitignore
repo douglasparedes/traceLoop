@@ -32,21 +32,5 @@ node_modules/
 # Local audits and development-assistant workspaces
 /docs/audit/
 /docs/remotion/
-/.codex/
-/.claude/
-/.cursor/
-/.continue/
-/.windsurf/
-/.cline/
-/.roo/
 /.local-work/
-/.aider*
-
-# Common temporary diagnostics
-*.log
-*.tmp
-*.bak
-*.tsbuildinfo
-.DS_Store
-Thumbs.db
 
