@@ -31,6 +31,7 @@ node_modules/
 
 # Local audits and development-assistant workspaces
 /docs/audit/
+/docs/remotion/
 /.codex/
 /.claude/
 /.cursor/
