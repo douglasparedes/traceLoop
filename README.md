@@ -50,7 +50,7 @@ flowchart LR
 
 **Open https://app.knowloop.online/** in a desktop browser. A phone browser also works for the field-execution portion.
 
-The hosted environment may require a **team passphrase**. If prompted, request access from the project owner. Demo roles are selected within the app through **Settings**; they are not separate production-grade user accounts.
+The hosted environment may require a **team passphrase** you can use "meta". Demo roles are selected within the app through **Settings**; they are not separate production-grade user accounts.
 
 For the quickest tour, first explore any existing example tutorials and approved procedures. To experience the whole loop with your own input:
 
@@ -67,7 +67,7 @@ For the quickest tour, first explore any existing example tutorials and approved
 
 **Offline check:** After saving a procedure while online, use your browser's network-offline mode (or a device's airplane mode) and continue the guided job. Reconnect, open **Activity**, and use **Sync now** if needed. Only server-acknowledged events are marked synchronized.
 
-**Suggested sample:** The repository includes [demo/demostration.mp4](demo/demostration.mp4), a silent recording of cookie preparation. Choose **Visual-First** for this file; it does not contain genuine spoken narration and should not be used to test speech transcription. To evaluate Muse Voice Transcribe, upload a recording with actual spoken instructions.
+**Suggested sample:** The repository includes [demo/demostration.mp4](demo/demostration.mp4), a recording of cookie preparation. 
 
 Processing requires network access and can take time. Do not confuse an uploaded file with a finished guide; wait for the tutorial to reach its completed state.
 
