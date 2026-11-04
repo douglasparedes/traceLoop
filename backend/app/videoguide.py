@@ -349,6 +349,23 @@ def _scenes_from_guide_steps(job_title: str, guide_steps: list[dict],
         instruction = _concise_instruction(s)
         narration = (f"{title}. {summary}".strip())[:1200] or title
         caption_chunks = _split_caption_chunks(narration) or [narration[:90]]
+        if any(c.strip() == instruction for c in caption_chunks if str(c).strip()):
+            # No transcript to differentiate caption from panel (e.g. silent
+            # tutorials): the validator forbids a static instruction that
+            # reproduces a caption chunk verbatim, so shorten the static
+            # panel. Truncation always appends "…", which caption chunks
+            # never contain, so equality becomes impossible. Narration and
+            # captions keep the full verbatim wording.
+            shortened = instruction
+            for _budget in (60, 40, 24):
+                shortened = _concise_instruction(s, max_len=_budget)
+                if not any(c.strip() == shortened for c in caption_chunks if str(c).strip()):
+                    break
+            else:
+                shortened = (title[:60] or instruction[:60]).rstrip() + "…"
+            if shortened != instruction:
+                warnings.append(f"step {n}: static instruction shortened to avoid caption duplication")
+                instruction = shortened
         scenes.append({
             "step": n, "step_number": n,
             "title": title, "instruction": instruction,

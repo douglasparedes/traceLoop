@@ -1,3 +1,10 @@
+# Status report — SUPERSEDED by the recovery production (kept for audit)
+
+> The film below was replaced. The current deliverable is
+> `demo/output/traceloop-hackathon-final-180s.mp4` (rebuilt this session) with
+> docs `demo/production/FINAL_*.md|json`. This file describes the previous
+> cut (archived as `…-PREV.mp4`) and stays as history.
+
 # Status report — FINAL (2026-11-04)
 
 ## Delivered

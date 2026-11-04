@@ -1,0 +1,152 @@
+{
+  "approvedLatest": {
+    "id": "0b6943b3",
+    "status": "approved",
+    "version": 6,
+    "note": "interactive-format regen, same 3 steps WITHOUT the v5 feedback fix (format regens source tutorial content, not proposals); submit+approve filmed live this session (take 48c73e98)"
+  },
+  "case": "home-kitchen chocolate-chip-cookie preparation",
+  "chain": {
+    "approvedRevisionInForceAtExecution": {
+      "id": "aacb11e0",
+      "status": "superseded",
+      "version": 2
+    },
+    "feedback": {
+      "eventType": "field_feedback",
+      "jobId": "7e34ab30-eb4e-430a-b72c-8a55ba1e6a27",
+      "overall": "Whisking in the video is brief - how do I know when the mixture is ready?",
+      "stepOutcomes": [
+        {
+          "status": "ok"
+        },
+        {
+          "note": "",
+          "status": "confusing"
+        },
+        {
+          "status": "ok"
+        }
+      ],
+      "supportingEvents": 6
+    },
+    "fieldJob": {
+      "eventCount": 7,
+      "events": [
+        "step_completed x3",
+        "field_note x1",
+        "evidence_attached x1",
+        "job_finished x1",
+        "field_feedback x1"
+      ],
+      "id": "7e34ab30-eb4e-430a-b72c-8a55ba1e6a27",
+      "pinnedVersionId": "aacb11e0-c4a7-4887-901d-cc7df5f226ef",
+      "procedureId": "906db29a-1464-4b37-85fd-e3681ca9374c",
+      "status": "finished"
+    },
+    "improvementProposal": {
+      "after": "Combine the ingredients and whisk the mixture in the steel bowl until evenly mixed, with no dry pockets visible.",
+      "baseVersion": 3,
+      "before": "Combine the ingredients and whisk the mixture in the steel bowl until evenly mixed.",
+      "confidence": "medium",
+      "field": "instruction",
+      "jobId": "7e34ab30-eb4e-430a-b72c-8a55ba1e6a27",
+      "model": "muse-spark-1.3",
+      "simulated": false,
+      "step": 2,
+      "versionId": "b4d55152"
+    },
+    "procedure": {
+      "approvedVersion": 5,
+      "id": "906db29a-1464-4b37-85fd-e3681ca9374c",
+      "title": "Chocolate chip cookie preparation (tutorial)",
+      "versions": [
+        {
+          "id": "4b3aaaf4",
+          "note": "approved empty (sequencing wart); superseded, never shown as content",
+          "status": "superseded",
+          "version": 1
+        },
+        {
+          "id": "aacb11e0",
+          "note": "3 expert-authored true steps; start_sec=end_sec=0.0 (no time citations allowed)",
+          "status": "superseded",
+          "version": 2
+        },
+        {
+          "id": "ba2b8fb5",
+          "note": "same fix from earlier job loop",
+          "status": "superseded",
+          "version": 3
+        },
+        {
+          "id": "29a7228d",
+          "note": "manual regen fork, no proposal",
+          "status": "superseded",
+          "version": 4
+        },
+        {
+          "id": "b4d55152",
+          "note": "live-Spark proposal from 7e34ab30, approved latest",
+          "status": "approved",
+          "version": 5
+        },
+        {
+          "id": "0b6943b3",
+          "status": "approved",
+          "version": 6,
+          "note": "interactive-format revision; approval filmed live; does not carry the v5 feedback fix (see audit)"
+        }
+      ]
+    },
+    "sourceVideo": {
+      "derivative": "demo/demostration-visual.mp4",
+      "derivativeNote": "ffmpeg -c:v copy -an; frames bit-identical; drops noise-only AAC track so the speech gate routes to visual-first",
+      "durationSec": 89.631622,
+      "height": 720,
+      "original": "demo/demostration.mp4",
+      "originalAudio": "AAC stereo; ambient noise only (max -5.5dB, mean -33.9dB); no intelligible speech",
+      "sha256": "c61d82f5a95d302fc671e1de032d1cd10270934475113108d4fe60820b37690d",
+      "width": 406
+    },
+    "tutorial": {
+      "analysisStrategy": "visual_first",
+      "guideSnapshots": [
+        "initial reference_manual (live)",
+        "work_instruction x3 regens (live, user-selected)"
+      ],
+      "id": "a15e048d-7317-430c-864c-5d9a66d5dbd5",
+      "inputMode": "visual_first",
+      "liveStages": {
+        "guide": {
+          "model": "muse-spark-1.3",
+          "simulated": false
+        },
+        "proposal_v5": {
+          "model": "muse-spark-1.3",
+          "simulated": false
+        },
+        "understand": {
+          "model": "muse-spark-1.3",
+          "observations": 5,
+          "simulated": false
+        }
+      },
+      "skippedHonestly": [
+        "extract_audio (no audio track)",
+        "transcribe (never ran, 0 events)",
+        "segment (0 objects; segmentation_results empty)"
+      ],
+      "status": "done",
+      "title": "Chocolate chip cookie preparation"
+    },
+    "v5note": "v5 b4d55152 (live-Spark proposal, incl. dry-pockets fix) was approved then superseded by v6 approval. The film S8 shows the v5 proposal diff (archival take 2a9ddad) and the v5 APPROVED badge (archival h8c, filmed when true); S6 shows the live v6 submit+approve. VO names no versions; order disclosed here."
+  },
+  "excluded": [
+    "3c210b9d LIVE probe (audit only)",
+    "f2908097/3b6fefbd screwdriver-fixture rehearsals",
+    "knob cases 48509395/687481c1/8e70bcc3",
+    "77eea958 bcfe9e8b older cookie chain"
+  ],
+  "filmRule": "Every scene derives from this mapping. No footage from excluded tutorials. No invented transcript/steps/masks; step time ranges shown as unavailable (0.0-0.0 in DB)."
+}
