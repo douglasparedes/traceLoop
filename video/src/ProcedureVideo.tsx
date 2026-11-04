@@ -1,6 +1,6 @@
 // TraceLoop procedure video guide — Remotion composition.
 //
-// Written against docs/remotion/markup-SKILL.md:
+// Composition implementation notes:
 // - interpolate()/spring() + useCurrentFrame() only (no CSS transitions/
 //   animations, no randomness, no Date.now — same props, same pixels)
 // - fps from useVideoConfig() for every seconds<->frames conversion

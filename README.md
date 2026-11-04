@@ -8,9 +8,9 @@ Much of a company's most valuable operational knowledge lives in demonstrations,
 
 **TraceLoop turns a short recording of someone performing a real task into reusable, visual, guided work instructions.** Teams can refine the steps, approve a version, follow the procedure offline, and use feedback from the field to improve the next revision.
 
-**[Try the live application](https://app.knowloop.online/)** · **[Watch the repository demo](demo/output/traceloop-hackathon-final-180s.mp4)** · 
+**[Try the live application](https://app.knowloop.online/)**
 
-> **For hackathon judges:** Start with the [live demo](https://app.knowloop.online/) and the [five-minute walkthrough](#judge-walkthrough). A local installation is not required to explore the hosted app. If a team passphrase is requested, obtain it from the project owner; no credentials are stored in this repository. If the hosted service is unavailable, use the [local setup](#run-locally).
+> **For hackathon judges:** Start with the [live application](https://app.knowloop.online/) and the [five-minute walkthrough](#judge-walkthrough). The three-minute submission video is awaiting owner approval and is not included yet. A local installation is not required to explore the hosted app. The hosted demo may request the shared passphrase `meta`; this is a demo gate, not protection for confidential data. No production credentials are stored here. If the hosted service is unavailable, use the [local setup](#run-locally).
 
 ![TraceLoop procedure library](frontend/public/screenshots/desktop-library.png)
 
@@ -18,7 +18,7 @@ Much of a company's most valuable operational knowledge lives in demonstrations,
 
 Imagine a technician assembling a machine component. They record their hands working and explain the task aloud. Instead of spending hours writing a manual from scratch, they use TraceLoop to build a procedure from the source recording. A colleague can then follow the approved instructions, record a problem, and help improve the procedure for the next person.
 
-The same workflow works for other physical tasks. The repository includes a simple kitchen recording as a reproducible, non-sensitive demonstration of the product mechanics; TraceLoop is designed around broader knowledge-transfer use cases, particularly hands-on work.
+The same workflow works for other physical tasks. TraceLoop is designed around broader knowledge-transfer use cases, particularly hands-on work.
 
 **Business value:** Preserve practical expertise, reduce dependence on individual employees, standardize knowledge transfer, support new team members, and keep instructions useful as practices change. These are product goals, not claims of measured customer savings.
 
@@ -50,7 +50,7 @@ flowchart LR
 
 **Open https://app.knowloop.online/** in a desktop browser. A phone browser also works for the field-execution portion.
 
-The hosted environment may require a **team passphrase** you can use "meta". Demo roles are selected within the app through **Settings**; they are not separate production-grade user accounts.
+Demo roles are selected within the app through **Settings**; they are not separate production-grade user accounts.
 
 For the quickest tour, first explore any existing example tutorials and approved procedures. To experience the whole loop with your own input:
 
@@ -67,7 +67,7 @@ For the quickest tour, first explore any existing example tutorials and approved
 
 **Offline check:** After saving a procedure while online, use your browser's network-offline mode (or a device's airplane mode) and continue the guided job. Reconnect, open **Activity**, and use **Sync now** if needed. Only server-acknowledged events are marked synchronized.
 
-**Suggested sample:** The repository includes [demo/demostration.mp4](demo/demostration.mp4), a recording of cookie preparation. 
+**Suggested sample:** Upload a short recording of a non-sensitive task you are authorized to share. This repository does not bundle a sample recording.
 
 Processing requires network access and can take time. Do not confuse an uploaded file with a finished guide; wait for the tutorial to reach its completed state.
 
@@ -182,7 +182,7 @@ Features such as speech transcription, object segmentation and generated illustr
 | [frontend/](frontend/) | Web PWA, Tutorial Studio, Procedures, offline execution and Activity |
 | [backend/](backend/) | FastAPI, Meta adapters, tutorial processing and versioned procedure APIs |
 | [video/](video/) | Remotion renderer for versioned in-app instructional videos |
-| [demo/](demo/) | Demonstration source footage, capture artifacts and submission-video project |
+| [docs/video-renderer.md](docs/video-renderer.md) | In-app Remotion renderer architecture and local commands |
 | [docs/demo-runbook.md](docs/demo-runbook.md) | Detailed end-to-end judge walkthrough |
 | [docs/tutorial-mode.md](docs/tutorial-mode.md) | Video upload, narrated/visual-first processing and Studio workflow |
 | [docs/review.md](docs/review.md) | Evidence, tests and known technical constraints |

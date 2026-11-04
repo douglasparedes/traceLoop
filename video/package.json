@@ -2,7 +2,7 @@
   "name": "traceloop-video-guide",
   "version": "1.0.0",
   "private": true,
-  "description": "Remotion project rendering TraceLoop procedure video guides from canonical steps (see docs/remotion/).",
+  "description": "Remotion project rendering TraceLoop procedure video guides from canonical steps (see docs/video-renderer.md).",
   "scripts": {
     "bundle": "remotion bundle src/index.tsx --out-dir bundle",
     "studio": "remotion studio",

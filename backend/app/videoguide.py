@@ -5,8 +5,7 @@ slices are cut from the user's own recorded audio with ffmpeg (never
 synthesized, never invented), step cards and captions are rendered from the
 canonical procedure, and visuals reuse real object illustrations.
 
-Follows docs/remotion (remotion-saas skill): plain Node.js SSR via
-@remotion/renderer on our long-running server — no Lambda, no extra cloud.
+Uses the production Node.js SSR renderer documented in docs/video-renderer.md.
 """
 import os
 import threading
@@ -1565,7 +1564,7 @@ def _video_project_dir() -> Path:
 
 
 def _render_video(props_path: Path, paths: dict) -> Path | None:
-    """Render via the vendored Remotion project (Node.js SSR, per remotion-saas skill).
+    """Render via the production Remotion project in video/.
 
     Uses a prebuilt bundle when VIDEO_BUNDLE_DIR (or repo video/bundle) exists;
     otherwise bundles on demand (slower first run, then cached). Raises on failure.
